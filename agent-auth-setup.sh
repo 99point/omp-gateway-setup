@@ -79,7 +79,9 @@ case "${key_choice}" in
 esac
 
 command -v curl >/dev/null 2>&1 || fail 'curl is required'
-command -v omp >/dev/null 2>&1 || fail 'omp is required; install OMP first'
+command -v env >/dev/null 2>&1 || fail 'env is required'
+omp_bin="$(command -v omp)" || fail 'omp is required; install OMP first'
+[[ "${omp_bin}" == /* ]] || fail 'omp must resolve to an absolute executable path'
 [[ -n "${gateway_url}" ]] || fail 'set AGENT_AUTH_URL or pass --url'
 [[ "${gateway_url}" != *[$' \t\r\n']* ]] || fail 'gateway URL must not contain whitespace'
 [[ "${gateway_url}" != *'?'* && "${gateway_url}" != *'#'* ]] || fail 'gateway URL must not contain a query or fragment'
@@ -100,7 +102,7 @@ fi
 
 omp_args=()
 if [[ -n "${profile}" ]]; then omp_args=(--profile "${profile}"); fi
-agent_dir="$(omp "${omp_args[@]}" config path)" || fail 'could not resolve the OMP config path'
+agent_dir="$("${omp_bin}" "${omp_args[@]}" config path)" || fail 'could not resolve the OMP config path'
 [[ "${agent_dir}" == /* && "${agent_dir}" != *$'\n'* ]] || fail 'omp config path did not return one absolute path'
 
 umask 077
@@ -411,6 +413,7 @@ if (( models_existed == 1 )); then
 fi
 
 config_state='unchanged'
+config_to_validate="${models}"
 if (( config_needs_update == 1 )); then
   source_file="${models}"
   if (( models_existed == 0 )); then
@@ -425,7 +428,7 @@ if (( config_needs_update == 1 )); then
           OMP_PROFILE='' PI_PROFILE='' \
           XDG_CONFIG_HOME="${legacy_home}/.config" XDG_DATA_HOME="${legacy_home}/.local/share" \
           XDG_STATE_HOME="${legacy_home}/.local/state" XDG_CACHE_HOME="${legacy_home}/.cache" \
-          omp models --json > "${scratch_dir}/legacy-models.json"
+          "${omp_bin}" models --json > "${scratch_dir}/legacy-models.json"
       ); then
         fail "OMP could not migrate ${legacy_models/#${HOME}/\~}"
       fi
@@ -445,6 +448,7 @@ if (( config_needs_update == 1 )); then
   '
   if (( has_openai == 1 )); then
     merge_expression+=' |
+      explode(.providers."openai-codex") |
       select(.providers."openai-codex" == null or (.providers."openai-codex" | type) == "!!map") |
       .providers."openai-codex" = ((.providers."openai-codex" // {}) * {
         "baseUrl": strenv(GATEWAY_URL),
@@ -455,6 +459,7 @@ if (( config_needs_update == 1 )); then
   fi
   if (( has_anthropic == 1 )); then
     merge_expression+=' |
+      explode(.providers.anthropic) |
       select(.providers.anthropic == null or (.providers.anthropic | type) == "!!map") |
       .providers.anthropic = ((.providers.anthropic // {}) * {
         "baseUrl": strenv(GATEWAY_URL),
@@ -470,34 +475,34 @@ if (( config_needs_update == 1 )); then
     fail "could not merge gateway settings into ${models/#${HOME}/\~}"
   fi
   chmod 0600 "${candidate}"
-
-  if (( models_existed == 1 )); then
-    stamp="$(date -u +%Y%m%dT%H%M%SZ)"
-    backup_path="${models}.pre-agent-auth.${stamp}.$$"
-    cp -p "${models}" "${backup_path}"
-    chmod 0600 "${backup_path}"
-  fi
-  mv -f "${candidate}" "${models}"
-  candidate=''
-  config_applied=1
-  config_state='updated'
-else
-  chmod 0600 "${models}"
+  config_to_validate="${candidate}"
 fi
 
 for provider in "${providers[@]}"; do
   if ! PROVIDER="${provider}" GATEWAY_URL="${gateway_url}" GATEWAY_TOKEN="${token}" \
     AGENT_AUTH_YQ_ACTION='verify-config' "${yq_bin}" eval -e \
-    "${route_expression}" "${models}" >/dev/null; then
-    fail "gateway settings did not survive the write for ${provider}"
+    "${route_expression}" "${config_to_validate}" >/dev/null; then
+    fail "gateway settings are invalid for ${provider}"
   fi
 done
 
-# Exercise OMP's real loader after the atomic write. This catches schema or
-# version mismatches that a YAML parser alone cannot see.
+# Validate with the user's real OMP binary but no ambient auth, config, cache,
+# or project state. OMP may exit zero after rejecting models.yml; requiring the
+# gateway providers in this isolated result proves this exact candidate loaded.
+validation_home="${scratch_dir}/validation-home"
+validation_agent_dir="${validation_home}/.omp/agent"
+mkdir -p "${validation_agent_dir}"
+cp -p "${config_to_validate}" "${validation_agent_dir}/models.yml"
+chmod 0600 "${validation_agent_dir}/models.yml"
 omp_models_file="${scratch_dir}/omp-models.json"
-if ! omp "${omp_args[@]}" models --json > "${omp_models_file}"; then
-  fail 'OMP could not load the merged models config; update OMP and rerun'
+if ! env -i \
+  HOME="${validation_home}" PATH="${PATH}" TMPDIR="${scratch_dir}" \
+  PI_CONFIG_DIR='.omp' PI_CODING_AGENT_DIR="${validation_agent_dir}" \
+  OMP_PROFILE='' PI_PROFILE='' \
+  XDG_CONFIG_HOME="${validation_home}/.config" XDG_DATA_HOME="${validation_home}/.local/share" \
+  XDG_STATE_HOME="${validation_home}/.local/state" XDG_CACHE_HOME="${validation_home}/.cache" \
+  "${omp_bin}" models --json > "${omp_models_file}" 2> "${scratch_dir}/omp-models.stderr"; then
+  fail 'OMP could not inspect the merged models config; update OMP and rerun'
 fi
 listed_providers_file="${scratch_dir}/omp-providers"
 if ! AGENT_AUTH_YQ_ACTION='omp-providers' "${yq_bin}" eval -r \
@@ -510,8 +515,30 @@ for provider in "${providers[@]}"; do
   while IFS= read -r listed; do
     if [[ "${listed}" == "${provider}" ]]; then found=1; break; fi
   done < "${listed_providers_file}"
-  (( found == 1 )) || fail "OMP did not load any ${provider} models through the gateway config"
+  (( found == 1 )) || fail "OMP rejected the merged config for ${provider}"
 done
+
+if (( config_needs_update == 1 )); then
+  if (( models_existed == 1 )); then
+    stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+    backup_path="${models}.pre-agent-auth.${stamp}.$$"
+    mv "${models}" "${backup_path}"
+    if ! mv -f "${candidate}" "${models}"; then
+      if ! mv -f "${backup_path}" "${models}"; then
+        fail "could not replace ${models/#${HOME}/\~}; original remains at ${backup_path/#${HOME}/\~}"
+      fi
+      backup_path=''
+      fail "could not replace ${models/#${HOME}/\~}"
+    fi
+  else
+    mv -f "${candidate}" "${models}"
+  fi
+  candidate=''
+  config_applied=1
+  config_state='updated'
+else
+  chmod 0600 "${models}"
+fi
 
 mkdir -p "${token_dir}"
 chmod 0700 "${token_dir}"
