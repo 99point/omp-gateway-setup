@@ -448,7 +448,10 @@ if (( config_needs_update == 1 )); then
   '
   if (( has_openai == 1 )); then
     merge_expression+=' |
-      explode(.providers."openai-codex") |
+      (
+        select((.providers."openai-codex" | kind) != "alias"),
+        (select((.providers."openai-codex" | kind) == "alias") | explode(.providers."openai-codex"))
+      ) |
       select(.providers."openai-codex" == null or (.providers."openai-codex" | type) == "!!map") |
       .providers."openai-codex" = ((.providers."openai-codex" // {}) * {
         "baseUrl": strenv(GATEWAY_URL),
@@ -459,7 +462,10 @@ if (( config_needs_update == 1 )); then
   fi
   if (( has_anthropic == 1 )); then
     merge_expression+=' |
-      explode(.providers.anthropic) |
+      (
+        select((.providers.anthropic | kind) != "alias"),
+        (select((.providers.anthropic | kind) == "alias") | explode(.providers.anthropic))
+      ) |
       select(.providers.anthropic == null or (.providers.anthropic | type) == "!!map") |
       .providers.anthropic = ((.providers.anthropic // {}) * {
         "baseUrl": strenv(GATEWAY_URL),
@@ -495,13 +501,17 @@ mkdir -p "${validation_agent_dir}"
 cp -p "${config_to_validate}" "${validation_agent_dir}/models.yml"
 chmod 0600 "${validation_agent_dir}/models.yml"
 omp_models_file="${scratch_dir}/omp-models.json"
-if ! env -i \
-  HOME="${validation_home}" PATH="${PATH}" TMPDIR="${scratch_dir}" \
-  PI_CONFIG_DIR='.omp' PI_CODING_AGENT_DIR="${validation_agent_dir}" \
-  OMP_PROFILE='' PI_PROFILE='' \
-  XDG_CONFIG_HOME="${validation_home}/.config" XDG_DATA_HOME="${validation_home}/.local/share" \
-  XDG_STATE_HOME="${validation_home}/.local/state" XDG_CACHE_HOME="${validation_home}/.cache" \
-  "${omp_bin}" models --json > "${omp_models_file}" 2> "${scratch_dir}/omp-models.stderr"; then
+if ! (
+  cd "${validation_home}"
+  env -i \
+    HOME="${validation_home}" PATH="${PATH}" TMPDIR="${scratch_dir}" \
+    PI_CONFIG_DIR='.omp' PI_CODING_AGENT_DIR="${validation_agent_dir}" \
+    OMP_PROFILE='' PI_PROFILE='' \
+    XDG_CONFIG_HOME="${validation_home}/.config" XDG_DATA_HOME="${validation_home}/.local/share" \
+    XDG_STATE_HOME="${validation_home}/.local/state" XDG_CACHE_HOME="${validation_home}/.cache" \
+    "${omp_bin}" models --json --no-extensions \
+      > "${omp_models_file}" 2> "${scratch_dir}/omp-models.stderr"
+); then
   fail 'OMP could not inspect the merged models config; update OMP and rerun'
 fi
 listed_providers_file="${scratch_dir}/omp-providers"
