@@ -567,10 +567,10 @@ setup_committed=1
 printf '\nOMP gateway ready\n'
 printf '  gateway    %s\n' "${gateway_url}"
 printf '  providers  %s\n' "$(IFS=', '; printf '%s' "${providers[*]}")"
-printf '  models     %s (%s)\n' "${models/#${HOME}/~}" "${config_state}"
-printf '  key        %s (0600)\n' "${token_file/#${HOME}/~}"
+printf '  models     %s (%s)\n' "${models/#${HOME}/\~}" "${config_state}"
+printf '  key        %s (0600)\n' "${token_file/#${HOME}/\~}"
 if [[ -n "${backup_path}" ]]; then
-  printf '  backup     %s\n' "${backup_path/#${HOME}/~}"
+  printf '  backup     %s\n' "${backup_path/#${HOME}/\~}"
 fi
 if [[ -n "${profile}" ]]; then
   printf '\nRun: omp --profile %s\n' "${profile}"
