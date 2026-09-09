@@ -118,8 +118,9 @@ choose_harness() {
 
 # --- setup/transaction.sh ---
 # One owner stages every file, installs tokens before references, and rolls back
-# handled failures in reverse order. Renames are atomic per file, not crash-atomic
-# across files. Backups copy original bytes/mode/mtime without a rename gap.
+# handled failures in reverse order. Renames are atomic per file, not across files.
+# Private backups preserve bytes/mtime; private scratch snapshots retain the
+# original mode as well so rollback can restore it exactly.
 init_transaction() {
   tx_paths=(); tx_candidates=(); tx_originals=(); tx_backups=(); tx_kinds=(); tx_order=()
   tx_count=0
@@ -210,10 +211,12 @@ commit_transaction() {
         continue
       fi
       if [[ -n "${original}" && "${pass}" != token ]]; then
-        backup="${target}.pre-agent-auth.$(date -u +%Y%m%dT%H%M%SZ).$$"
-        [[ ! -e "${backup}" && ! -L "${backup}" ]] || fail "backup already exists: ${backup}"
+        # Create privately before copying: cp -p followed by chmod would expose
+        # embedded keys at the original mode until chmod completes.
+        backup="$(mktemp "${target}.pre-agent-auth.$(date -u +%Y%m%dT%H%M%SZ).XXXXXXXX")"
         tx_backups[index]="${backup}"
-        cp -p "${original}" "${backup}"
+        cp "${original}" "${backup}"
+        touch -r "${original}" "${backup}"
       fi
       mark_applied "${index}"
       mv -f "${staged}" "${target}"
@@ -493,17 +496,20 @@ validate_gateway() {
     "${node_bin}" "${scratch_dir}/native/catalog.cjs" normalize "${harness}" "${catalog_file}" "${scratch_dir}" > "${scratch_dir}/native-catalog.json"
   else
     model_ids_file="${scratch_dir}/model-ids"
+    catalog_ids_file="${scratch_dir}/catalog-model-ids"
     if ! AGENT_AUTH_YQ_ACTION='catalog-model-ids' "${yq_bin}" eval -r \
-      '.data[] | select((.id | type) == "!!str") | .id' "${catalog_file}" > "${model_ids_file}"; then
+      '.data[] | select((.id | type) == "!!str") | .id' "${catalog_file}" > "${catalog_ids_file}"; then
       fail 'gateway model catalog is not valid JSON'
     fi
     providers=(); seen_providers=' '
+    : > "${model_ids_file}"
     while IFS= read -r model_id; do
       [[ -n "${model_id}" && "${model_id}" == */* ]] || continue
       provider="${model_id%%/*}"
-      case "${provider}" in anthropic|openai-codex) ;; *) fail 'gateway advertised an unsupported provider';; esac
+      case "${provider}" in anthropic|openai-codex) ;; *) continue;; esac
+      printf '%s\n' "${model_id}" >> "${model_ids_file}"
       if [[ "${seen_providers}" != *" ${provider} "* ]]; then providers+=("${provider}"); seen_providers+="${provider} "; fi
-    done < "${model_ids_file}"
+    done < "${catalog_ids_file}"
     (( ${#providers[@]} > 0 )) || fail 'gateway advertises no supported providers'
     printf '{}\n' > "${scratch_dir}/probe.json"
     if [[ "${omp_transport}" != pi-native ]]; then
@@ -1028,25 +1034,32 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { object } = require('./config-io.cjs');
 
-function cards(file) {
+function loadCatalog(file) {
   let value;
   try { value = JSON.parse(fs.readFileSync(file, 'utf8')); }
   catch { throw new Error('gateway catalog is not valid JSON'); }
   if (!object(value) || !Array.isArray(value.data) || value.data.length > 4096) throw new Error('invalid or oversized gateway catalog');
-  return value.data;
+  return value;
 }
 function selected(harness, catalog) {
   const wanted = harness === 'claude-code' ? ['anthropic'] : harness === 'codex' ? ['openai-codex'] : ['anthropic', 'openai-codex'];
   return wanted.filter(provider => catalog.some(card => card.owned_by === provider));
 }
 function normalize(harness, catalog, directory) {
-  const providers = selected(harness, catalog);
+  const providers = selected(harness, catalog.data);
   if (!providers.length) throw new Error('gateway advertises no models for the selected client');
+  if (!object(catalog.default_models)) throw new Error('gateway catalog is missing explicit provider defaults');
   const result = {};
   for (const provider of providers) {
-    const native = cards(path.join(directory, `${provider}-catalog.json`));
+    const defaultModel = catalog.default_models[provider];
+    if (typeof defaultModel !== 'string' || !defaultModel.startsWith(`${provider}/`)) {
+      throw new Error(`gateway catalog has no qualified default model for ${provider}`);
+    }
+    const native = loadCatalog(path.join(directory, `${provider}-catalog.json`)).data;
     const seen = new Set();
-    result[provider] = catalog.filter(card => card.owned_by === provider).map(card => {
+    let defaultIndex = -1;
+    result[provider] = catalog.data.filter(card => card.owned_by === provider).map((card, index) => {
+      if (card.id === defaultModel) defaultIndex = index;
       const id = card.request_model_id ?? card.id?.replace(new RegExp(`^${provider}/`), '');
       if (typeof id !== 'string' || !/^[\x21-\x7e]{1,256}$/.test(id) || seen.has(id)) throw new Error('invalid or duplicate raw gateway model ID');
       seen.add(id);
@@ -1062,15 +1075,17 @@ function normalize(harness, catalog, directory) {
       return { ...card, id };
     });
     if (native.length !== result[provider].length) throw new Error('native and authoritative catalog counts disagree');
+    if (defaultIndex === -1) throw new Error(`gateway default model ${defaultModel} is not in its provider catalog`);
+    if (defaultIndex > 0) result[provider].unshift(result[provider].splice(defaultIndex, 1)[0]);
   }
   return result;
 }
 if (require.main === module) {
   try {
     const [action, harness, file, directory] = process.argv.slice(2);
-    const catalog = cards(file);
+    const catalog = loadCatalog(file);
     if (action === 'providers') {
-      const providers = selected(harness, catalog);
+      const providers = selected(harness, catalog.data);
       if (!providers.length) throw new Error('gateway advertises no models for the selected client');
       process.stdout.write(providers.join('\n') + '\n');
     } else if (action === 'normalize') process.stdout.write(JSON.stringify(normalize(harness, catalog, directory)) + '\n');
@@ -1156,13 +1171,19 @@ try {
     if (value && value !== '0' && value !== 'false') throw new Error('existing Claude credentials or cloud routing conflict with gateway setup; choose an isolated CLAUDE_CONFIG_DIR');
   }
   if (current.forceLoginOrgUUID) throw new Error('Claude organization login policy conflicts with gateway credentials');
-  const model = catalog.find(card => card.id === current.model)?.id ?? catalog[0].id;
+  const previousModel = current.model ?? current.env?.ANTHROPIC_MODEL;
+  const model = catalog.find(card => card.id === previousModel)?.id ?? catalog[0].id;
+  if (previousModel && previousModel !== model) console.error(`Claude Code: replacing unsupported model ${previousModel} with ${model}.`);
+  const previousSmall = current.env?.ANTHROPIC_DEFAULT_HAIKU_MODEL;
+  const small = catalog.find(card => card.id === previousSmall)?.id ?? catalog.find(card => card.id.includes('haiku'))?.id ?? model;
+  if (previousSmall && previousSmall !== small) console.error(`Claude Code: replacing unsupported background model ${previousSmall} with ${small}.`);
+  if (!previousSmall && small === model) console.error(`Claude Code: no Haiku model is advertised; background requests will use ${model}.`);
   patch(source, destination, [
     [['apiKeyHelper'], command(cat, tokenFile)],
     [['model'], model],
     [['env', 'ANTHROPIC_BASE_URL'], `${gateway}/anthropic`],
     [['env', 'ANTHROPIC_MODEL'], model],
-    [['env', 'ANTHROPIC_DEFAULT_HAIKU_MODEL'], model],
+    [['env', 'ANTHROPIC_DEFAULT_HAIKU_MODEL'], small],
     [['env', 'CLAUDE_CODE_MAX_RETRIES'], '0'],
     [['env', 'CLAUDE_CODE_RETRY_WATCHDOG'], '0'],
     [['env', 'CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK'], '1'],
@@ -1192,27 +1213,62 @@ try {
   // gateway card is not a Codex ModelInfo and contains no replacement prompt.
   const nativeModels = new Map(bundled.models.map(model => [model.slug, model]));
   const models = [];
-  let skipped = 0;
+  const skipped = [];
   for (const card of catalog) {
     const native = nativeModels.get(card.id);
-    if (!native) { skipped++; continue; }
+    if (!native) { skipped.push(card.id); continue; }
     const efforts = card.thinking?.efforts;
+    if (!card.reasoning || !Array.isArray(efforts)) {
+      throw new Error(`Codex model ${card.id}: gateway does not advertise compatible reasoning metadata; cannot retain installed defaults`);
+    }
+    // Only advertise efforts the installed client actually implements, keeping
+    // its descriptions and default unless the gateway explicitly chooses one.
+    const supported = native.supported_reasoning_levels?.filter(level => efforts.includes(level.effort)) ?? [];
+    const defaultLevel = card.thinking.defaultLevel ?? native.default_reasoning_level;
+    if (!supported.some(level => level.effort === defaultLevel)) {
+      const source = card.thinking.defaultLevel === undefined ? 'native' : 'gateway';
+      throw new Error(`Codex model ${card.id}: ${source} default reasoning effort ${defaultLevel} is not supported by both the gateway and installed client (allowed: ${supported.map(level => level.effort).join(', ') || 'none'}); choose an explicit compatible gateway default or update the client`);
+    }
+    if (supported.length < efforts.length) {
+      const unavailable = efforts.filter(effort => !supported.some(level => level.effort === effort));
+      console.error(`Codex model ${card.id}: gateway reasoning efforts ${unavailable.join(', ')} are unavailable in the installed client; exposing only ${supported.map(level => level.effort).join(', ')} with default ${defaultLevel}.`);
+    }
+    const reasoning = { supported_reasoning_levels: supported, default_reasoning_level: defaultLevel };
     models.push({
       ...native, slug: card.id, display_name: card.display_name ?? card.id,
-      context_window: card.context_length, max_context_window: card.context_length,
+      context_window: Math.min(native.context_window, card.context_length),
+      max_context_window: Math.min(native.max_context_window ?? native.context_window, card.context_length),
       input_modalities: card.input_modalities, supported_in_api: true,
-      ...(Array.isArray(efforts) ? {
-        supported_reasoning_levels: efforts.map(effort => ({ effort, description: effort })),
-        default_reasoning_level: card.thinking.defaultLevel ?? efforts[0],
-      } : {}),
+      ...reasoning,
     });
   }
   if (!models.length) throw new Error('installed Codex has no native metadata for any gateway model; update the client before setup');
-  if (skipped) console.error(`Codex: excluded ${skipped} gateway models without installed metadata; ${models.length} supported models remain.`);
-  const model = models.find(model => model.slug === current.model)?.slug ?? models[0].slug;
+  if (skipped.length) console.error(`Codex: excluded gateway models without installed native metadata: ${skipped.join(', ')}; ${models.length} supported models remain.`);
+  let selected = models.find(model => model.slug === current.model);
+  const gatewayDefault = models.find(model => model.slug === catalog[0].id);
+  if (!selected) {
+    selected = gatewayDefault;
+    if (!selected) {
+      for (const candidate of models) {
+        if (!Number.isFinite(candidate.priority)) {
+          throw new Error(`Codex model ${candidate.slug} has no native numeric priority; cannot choose a compatible default`);
+        }
+        if (!selected || candidate.priority < selected.priority) selected = candidate;
+      }
+    }
+  }
+  if (current.model && current.model !== selected.slug) console.error(`Codex: replacing unsupported model ${current.model} with ${selected.slug}.`);
+  if (!gatewayDefault) {
+    const reason = selected.slug === current.model ? 'keeping the existing supported selection' : `using the best installed native priority (${selected.priority})`;
+    console.error(`Codex: gateway default ${catalog[0].id} has no installed native metadata; ${reason}: ${selected.slug}. A client release containing that model's native metadata is required to select it.`);
+  }
+  if (current.model_reasoning_effort !== undefined &&
+      !selected.supported_reasoning_levels?.some(level => level.effort === current.model_reasoning_effort)) {
+    throw new Error(`Codex model ${selected.slug}: configured reasoning effort ${current.model_reasoning_effort} is not supported by both the gateway and installed client; resolve the explicit effort before setup`);
+  }
   save(modelsFile, { models });
   save(patchFile, {
-    model, model_provider: 'agent_auth', model_catalog_json: finalModelsFile,
+    model: selected.slug, model_provider: 'agent_auth', model_catalog_json: finalModelsFile,
     features: { enable_request_compression: false },
     model_providers: { agent_auth: {
       name: 'Agent Auth', base_url: baseUrl, wire_api: 'responses',
@@ -1318,8 +1374,12 @@ try {
     }]);
   }
   const available = Object.entries(catalog).flatMap(([provider, cards]) => cards.map(card => `agent-auth-${provider}/${card.id}`));
-  changes.push([['model'], available.includes(current.model) ? current.model : available[0]]);
-  changes.push([['small_model'], available.includes(current.small_model) ? current.small_model : available[0]]);
+  for (const key of ['model', 'small_model']) {
+    const previous = current[key];
+    const selected = available.find(value => value === previous || value === `agent-auth-${previous}`) ?? available[0];
+    if (previous && selected !== previous && selected !== `agent-auth-${previous}`) console.error(`OpenCode: replacing unsupported ${key} ${previous} with ${selected}.`);
+    changes.push([[key], selected]);
+  }
   if (Array.isArray(current.enabled_providers)) changes.push([['enabled_providers'], [...new Set([...current.enabled_providers, ...ids])]]);
   patch(source, destination, changes);
 } catch (error) { console.error(`setup failed: ${error.message}`); process.exitCode = 1; }
@@ -1347,9 +1407,7 @@ function model(card, provider) {
     value.samplingParams = { instructions: '', store: false, include: ['reasoning.encrypted_content'] };
   } else {
     // Copy only controls implemented by Pi's Anthropic API, not OMP's compat schema.
-    const keys = ['supportsEagerToolInputStreaming', 'supportsLongCacheRetention', 'sendSessionAffinityHeaders',
-      'supportsCacheControlOnTools', 'supportsTemperature', 'forceAdaptiveThinking', 'allowEmptySignature',
-      'supportsStrictTools', 'supportsMidConvoEffort', 'supportsToolReferences'];
+    const keys = ['supportsEagerToolInputStreaming', 'supportsLongCacheRetention'];
     value.compat = Object.fromEntries(keys.filter(key => typeof card.compat?.[key] === 'boolean').map(key => [key, card.compat[key]]));
     if (card.thinking?.mode === 'anthropic-adaptive') value.compat.forceAdaptiveThinking = true;
   }
@@ -1377,8 +1435,12 @@ try {
     }
     patch(source, destination, changes);
   } else if (kind === 'settings') {
-    const provider = Object.keys(catalog).find(key => current.defaultProvider === `agent-auth-${key}`) ?? selected;
+    const provider = Object.keys(catalog).find(key => current.defaultProvider === key || current.defaultProvider === `agent-auth-${key}`) ?? selected;
     const selectedModel = catalog[provider].find(card => card.id === current.defaultModel)?.id ?? catalog[provider][0].id;
+    if (current.defaultProvider && current.defaultProvider !== provider && current.defaultProvider !== `agent-auth-${provider}`
+      || current.defaultModel && current.defaultModel !== selectedModel) {
+      console.error(`Pi: replacing unsupported selection ${current.defaultProvider ?? ''}/${current.defaultModel ?? ''} with agent-auth-${provider}/${selectedModel}.`);
+    }
     patch(source, destination, [
       [['defaultProvider'], `agent-auth-${provider}`], [['defaultModel'], selectedModel],
       [['retry', 'enabled'], false], [['retry', 'maxRetries'], 0], [['retry', 'provider', 'maxRetries'], 0],
