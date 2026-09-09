@@ -100,41 +100,7 @@ if [[ -n "${profile}" && ! "${profile}" =~ ^[a-z0-9][a-z0-9._-]{0,63}$ ]]; then
   fail 'profile names are [a-z0-9][a-z0-9._-]{0,63}'
 fi
 
-if [[ -n "${profile}" ]]; then
-  agent_dir="$("${omp_bin}" --profile "${profile}" config path)" || fail 'could not resolve the OMP config path'
-else
-  agent_dir="$("${omp_bin}" config path)" || fail 'could not resolve the OMP config path'
-fi
-[[ "${agent_dir}" == /* && "${agent_dir}" != *$'\n'* ]] || fail 'omp config path did not return one absolute path'
-
 umask 077
-mkdir -p "${agent_dir}"
-
-models="${agent_dir}/models.yml"
-if [[ ! -e "${models}" && ! -L "${models}" && -e "${agent_dir}/models.yaml" ]]; then
-  models="${agent_dir}/models.yaml"
-fi
-legacy_models=''
-if [[ ! -e "${models}" && ! -L "${models}" \
-  && ( -e "${agent_dir}/models.json" || -L "${agent_dir}/models.json" ) ]]; then
-  [[ -f "${agent_dir}/models.json" ]] || fail "legacy models config is not a regular file: ${agent_dir}/models.json"
-  legacy_models="${agent_dir}/models.json"
-fi
-
-# Preserve a caller's final symlink rather than replacing it with a regular file.
-symlink_hops=0
-while [[ -L "${models}" ]]; do
-  ((symlink_hops += 1))
-  (( symlink_hops <= 16 )) || fail 'models config has a symlink loop'
-  link_target="$(readlink "${models}")" || fail "could not read symlink ${models}"
-  if [[ "${link_target}" == /* ]]; then
-    models="${link_target}"
-  else
-    models="$(cd -P "$(dirname "${models}")" && pwd)/${link_target}"
-  fi
-done
-[[ ! -e "${models}" || -f "${models}" ]] || fail "models config is not a regular file: ${models}"
-
 cache_home="${XDG_CACHE_HOME:-${HOME}/.cache}"
 if [[ "${cache_home}" != /* ]]; then cache_home="${HOME}/.cache"; fi
 cache_dir="${cache_home}/omp-agent-auth"
@@ -149,7 +115,6 @@ backup_path=''
 models_existed=0
 config_applied=0
 setup_committed=0
-if [[ -f "${models}" ]]; then models_existed=1; fi
 
 cleanup() {
   status=$?
@@ -240,6 +205,88 @@ resolve_yq() {
 
 yq_bin="$(resolve_yq)"
 
+# `omp config path` may initialize the installed client's database. Check its
+# transport schema in scratch FIRST so an unsupported binary changes no user
+# config, auth state, key file, or backup.
+validate_omp_config() {
+  local config="$1"
+  shift
+  local validation_home validation_agent_dir omp_models_file listed_providers_file provider found listed
+  validation_home="$(mktemp -d "${scratch_dir}/validation-home.XXXXXX")"
+  validation_agent_dir="${validation_home}/.omp/agent"
+  mkdir -p "${validation_agent_dir}"
+  cp -p "${config}" "${validation_agent_dir}/models.yml"
+  chmod 0600 "${validation_agent_dir}/models.yml"
+  omp_models_file="${validation_home}/omp-models.json"
+  if ! (
+    cd "${validation_home}"
+    env -i \
+      HOME="${validation_home}" PATH="${PATH}" TMPDIR="${scratch_dir}" \
+      PI_CONFIG_DIR='.omp' PI_CODING_AGENT_DIR="${validation_agent_dir}" \
+      OMP_PROFILE='' PI_PROFILE='' \
+      XDG_CONFIG_HOME="${validation_home}/.config" XDG_DATA_HOME="${validation_home}/.local/share" \
+      XDG_STATE_HOME="${validation_home}/.local/state" XDG_CACHE_HOME="${validation_home}/.cache" \
+      "${omp_bin}" models --json --no-extensions \
+        > "${omp_models_file}" 2> "${validation_home}/omp-models.stderr"
+  ); then
+    fail 'OMP could not inspect the provider-wire config; a native provider-wire-capable OMP release is required'
+  fi
+  listed_providers_file="${validation_home}/omp-providers"
+  if ! AGENT_AUTH_YQ_ACTION='omp-providers' "${yq_bin}" eval -r \
+    '.models[] | select((.provider | type) == "!!str") | .provider' \
+    "${omp_models_file}" > "${listed_providers_file}"; then
+    fail 'OMP returned an unreadable model list'
+  fi
+  for provider in "$@"; do
+    found=0
+    while IFS= read -r listed; do
+      if [[ "${listed}" == "${provider}" ]]; then found=1; break; fi
+    done < "${listed_providers_file}"
+    (( found == 1 )) || fail "OMP did not load provider-wire routing for ${provider}; a native provider-wire-capable OMP release and valid models config are required"
+  done
+}
+schema_probe="${scratch_dir}/schema-probe.yml"
+printf '%s\n' 'providers:' \
+  '  anthropic: {baseUrl: "http://127.0.0.1:9", apiKey: schema-probe-only, transport: provider-wire}' \
+  '  openai-codex: {baseUrl: "http://127.0.0.1:9", apiKey: schema-probe-only, transport: provider-wire}' \
+  > "${schema_probe}"
+validate_omp_config "${schema_probe}" anthropic openai-codex
+
+if [[ -n "${profile}" ]]; then
+  agent_dir="$("${omp_bin}" --profile "${profile}" config path)" || fail 'could not resolve the OMP config path'
+else
+  agent_dir="$("${omp_bin}" config path)" || fail 'could not resolve the OMP config path'
+fi
+[[ "${agent_dir}" == /* && "${agent_dir}" != *$'\n'* ]] || fail 'omp config path did not return one absolute path'
+
+mkdir -p "${agent_dir}"
+
+models="${agent_dir}/models.yml"
+if [[ ! -e "${models}" && ! -L "${models}" && -e "${agent_dir}/models.yaml" ]]; then
+  models="${agent_dir}/models.yaml"
+fi
+legacy_models=''
+if [[ ! -e "${models}" && ! -L "${models}" \
+  && ( -e "${agent_dir}/models.json" || -L "${agent_dir}/models.json" ) ]]; then
+  [[ -f "${agent_dir}/models.json" ]] || fail "legacy models config is not a regular file: ${agent_dir}/models.json"
+  legacy_models="${agent_dir}/models.json"
+fi
+
+# Preserve a caller's final symlink rather than replacing it with a regular file.
+symlink_hops=0
+while [[ -L "${models}" ]]; do
+  ((symlink_hops += 1))
+  (( symlink_hops <= 16 )) || fail 'models config has a symlink loop'
+  link_target="$(readlink "${models}")" || fail "could not read symlink ${models}"
+  if [[ "${link_target}" == /* ]]; then
+    models="${link_target}"
+  else
+    models="$(cd -P "$(dirname "${models}")" && pwd)/${link_target}"
+  fi
+done
+[[ ! -e "${models}" || -f "${models}" ]] || fail "models config is not a regular file: ${models}"
+if [[ -f "${models}" ]]; then models_existed=1; fi
+
 token_dir="${agent_dir}/agent-auth"
 token_file="${token_dir}/token"
 [[ ! -e "${token_file}" || -f "${token_file}" ]] || fail "stored gateway key is not a regular file: ${token_file}"
@@ -252,8 +299,8 @@ if [[ -f "${token_file}" ]]; then
   if [[ -n "${stored_token}" ]]; then stored_source="${token_file/#${HOME}/\~}"; fi
 fi
 
-# Recover a key embedded by an earlier setup only when its route already points
-# at this exact gateway. A personal provider key is never treated as reusable.
+# Recover an embedded gateway key only from this exact gateway. Reading the
+# retired transport here migrates its key, never reinstalls its model-call route.
 config_token=''
 if [[ -z "${stored_token}" && -f "${models}" ]]; then
   config_token="$(
@@ -263,7 +310,7 @@ if [[ -z "${stored_token}" && -f "${models}" ]]; then
         map(select(
           (type == "!!map") and
           (.baseUrl == strenv(GATEWAY_URL)) and
-          (.transport == "pi-native") and
+          ((.transport == "provider-wire") or (.transport == "pi-native")) and
           ((.apiKey // "") | type == "!!str") and
           ((.apiKey // "") | test("^!") | not)
         )) |
@@ -382,24 +429,28 @@ if (( has_openai == 1 )); then providers+=('openai-codex'); fi
 if (( has_anthropic == 1 )); then providers+=('anthropic'); fi
 (( ${#providers[@]} > 0 )) || fail 'gateway advertises no supported providers'
 
-# An invalid body must get past bearer auth and reach the OMP gateway's body
-# validator. This proves the key can use the model-call route before config moves.
+# Deliberately omit x-omp-model-id: native routing validates this metadata after
+# bearer auth, before resolving any OAuth grant or forwarding provider bytes.
+# Check both advertised routes; {} is not a provider request to execute.
 probe_body="${scratch_dir}/probe.json"
 printf '{}\n' > "${probe_body}"
-if ! probe_status="$(curl --silent --show-error --output "${scratch_dir}/probe-response" --write-out '%{http_code}' \
-  --request POST --header "@${header_file}" --header 'Content-Type: application/json' \
-  --data-binary "@${probe_body}" --connect-timeout 10 --max-time 30 \
-  "${gateway_url}/v1/pi/stream")"; then
-  fail 'could not reach the gateway model-call route'
-fi
-[[ "${probe_status}" == 400 ]] || fail "gateway model-call route returned HTTP ${probe_status}; expected its 400 body validation"
+for provider in "${providers[@]}"; do
+  if ! probe_status="$(curl --silent --show-error --output "${scratch_dir}/probe-response" --write-out '%{http_code}' \
+    --request POST --header "@${header_file}" --header 'Content-Type: application/json' \
+    --header 'x-omp-provider-wire-version: 1' \
+    --data-binary "@${probe_body}" --connect-timeout 10 --max-time 30 \
+    "${gateway_url}/v1/provider-wire/${provider}")"; then
+    fail "could not reach the gateway provider-wire route for ${provider}"
+  fi
+  [[ "${probe_status}" == 400 ]] || fail "gateway provider-wire route for ${provider} returned HTTP ${probe_status}; expected its 400 metadata validation"
+done
 rm -f "${header_file}"
 
 route_expression='
   (.providers[strenv(PROVIDER)] | type) == "!!map" and
   .providers[strenv(PROVIDER)].baseUrl == strenv(GATEWAY_URL) and
   .providers[strenv(PROVIDER)].apiKey == strenv(GATEWAY_TOKEN) and
-  .providers[strenv(PROVIDER)].transport == "pi-native"
+  .providers[strenv(PROVIDER)].transport == "provider-wire"
 '
 config_needs_update=1
 if (( models_existed == 1 )); then
@@ -458,7 +509,7 @@ if (( config_needs_update == 1 )); then
       .providers."openai-codex" = ((.providers."openai-codex" // {}) * {
         "baseUrl": strenv(GATEWAY_URL),
         "apiKey": strenv(GATEWAY_TOKEN),
-        "transport": "pi-native"
+        "transport": "provider-wire"
       })
     '
   fi
@@ -472,7 +523,7 @@ if (( config_needs_update == 1 )); then
       .providers.anthropic = ((.providers.anthropic // {}) * {
         "baseUrl": strenv(GATEWAY_URL),
         "apiKey": strenv(GATEWAY_TOKEN),
-        "transport": "pi-native"
+        "transport": "provider-wire"
       })
     '
   fi
@@ -494,41 +545,9 @@ for provider in "${providers[@]}"; do
   fi
 done
 
-# Validate with the user's real OMP binary but no ambient auth, config, cache,
-# or project state. OMP may exit zero after rejecting models.yml; requiring the
-# gateway providers in this isolated result proves this exact candidate loaded.
-validation_home="${scratch_dir}/validation-home"
-validation_agent_dir="${validation_home}/.omp/agent"
-mkdir -p "${validation_agent_dir}"
-cp -p "${config_to_validate}" "${validation_agent_dir}/models.yml"
-chmod 0600 "${validation_agent_dir}/models.yml"
-omp_models_file="${scratch_dir}/omp-models.json"
-if ! (
-  cd "${validation_home}"
-  env -i \
-    HOME="${validation_home}" PATH="${PATH}" TMPDIR="${scratch_dir}" \
-    PI_CONFIG_DIR='.omp' PI_CODING_AGENT_DIR="${validation_agent_dir}" \
-    OMP_PROFILE='' PI_PROFILE='' \
-    XDG_CONFIG_HOME="${validation_home}/.config" XDG_DATA_HOME="${validation_home}/.local/share" \
-    XDG_STATE_HOME="${validation_home}/.local/state" XDG_CACHE_HOME="${validation_home}/.cache" \
-    "${omp_bin}" models --json --no-extensions \
-      > "${omp_models_file}" 2> "${scratch_dir}/omp-models.stderr"
-); then
-  fail 'OMP could not inspect the merged models config; update OMP and rerun'
-fi
-listed_providers_file="${scratch_dir}/omp-providers"
-if ! AGENT_AUTH_YQ_ACTION='omp-providers' "${yq_bin}" eval -r \
-  '.models[] | select((.provider | type) == "!!str") | .provider' \
-  "${omp_models_file}" > "${listed_providers_file}"; then
-  fail 'OMP returned an unreadable model list'
-fi
-for provider in "${providers[@]}"; do
-  found=0
-  while IFS= read -r listed; do
-    if [[ "${listed}" == "${provider}" ]]; then found=1; break; fi
-  done < "${listed_providers_file}"
-  (( found == 1 )) || fail "OMP rejected the merged config for ${provider}"
-done
+# Validate the exact candidate in a fresh isolated registry too. Built-in or
+# ambient providers cannot mask a rejected custom config or unsupported schema.
+validate_omp_config "${config_to_validate}" "${providers[@]}"
 
 if (( config_needs_update == 1 )); then
   if (( models_existed == 1 )); then
