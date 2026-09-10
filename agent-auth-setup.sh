@@ -13,9 +13,11 @@ usage() {
 Usage: agent-auth-setup.sh [--harness NAME] [--unattended] [--url URL]
                            [--profile NAME] [--reuse-key|--new-key] [--overwrite]
                            [--transport auto|provider-wire|pi-native]
+                           [--action configure|disable|enable|unset]
 
   --harness NAME  omp (default), claude-code, codex, opencode, or pi
   --unattended    Never prompt; default to OMP unless --harness is given
+  --action       Configure (default), disable locally, re-enable, or remove setup
   --url URL       Gateway base URL (or AGENT_AUTH_URL); otherwise prompt on /dev/tty
   --profile NAME  OMP profile or Codex NAME.config.toml overlay
   --reuse-key     Explicitly choose the stored gateway key
@@ -25,30 +27,35 @@ Usage: agent-auth-setup.sh [--harness NAME] [--unattended] [--url URL]
 
 Other scopes use the client's own environment: CLAUDE_CONFIG_DIR, CODEX_HOME,
 OPENCODE_CONFIG (explicit file), XDG_CONFIG_HOME, or PI_CODING_AGENT_DIR.
-Only the selected client must be installed. Native setup additionally needs
-Node.js >=18 and Python >=3.10; Claude/Codex/OpenCode need Python jsonschema >=4.18.
-OMP and Codex use checksum-pinned yq v4.53.6. No client or OAuth login is installed.
+Disable/enable/unset need no endpoint or new key and never contact the gateway.
+Only configure requires the selected client (OMP also resolves switch scopes).
+All actions need Node.js >=18. Native configure additionally needs Python >=3.10;
+Claude/Codex/OpenCode configure need Python jsonschema >=4.18.
+OMP and Codex use checksum-pinned yq v4.53.6 (cached/local for switching).
+No client or OAuth login is installed or removed.
 EOF
 }
 parse_options() {
   gateway_url="${AGENT_AUTH_URL:-}"
   profile=''
   harness=''
+  action=''
   unattended=0
   overwrite=0
   omp_transport='auto'
   key_choice="${AGENT_AUTH_KEY_CHOICE:-}"
   while (( $# > 0 )); do
     case "$1" in
-      --url|--profile|--harness|--transport)
+      --url|--profile|--harness|--transport|--action)
         (( $# >= 2 )) || fail "$1 needs a value"
-        case "$1" in --url) gateway_url="$2";; --profile) profile="$2";; --harness) harness="$2";; --transport) omp_transport="$2";; esac
+        case "$1" in --url) gateway_url="$2";; --profile) profile="$2";; --harness) harness="$2";; --transport) omp_transport="$2";; --action) action="$2";; esac
         [[ -n "$2" ]] || fail "$1 needs a nonempty value"
         shift 2 ;;
       --url=*) gateway_url="${1#*=}"; shift ;;
       --profile=*) profile="${1#*=}"; shift ;;
       --harness=*) harness="${1#*=}"; [[ -n "${harness}" ]] || fail '--harness needs a value'; shift ;;
       --unattended) unattended=1; shift ;;
+      --action=*) action="${1#*=}"; [[ -n "${action}" ]] || fail '--action needs a value'; shift ;;
       --overwrite) overwrite=1; shift ;;
       --transport=*) omp_transport="${1#*=}"; shift ;;
       --reuse-key)
@@ -72,12 +79,19 @@ parse_options() {
     if (( has_tty == 1 )); then choose_harness; fi
   fi
   case "${harness}" in omp|claude-code|codex|opencode|pi) ;; *) fail 'harness must be omp, claude-code, codex, opencode, or pi';; esac
+  if [[ -z "${action}" ]]; then
+    action='configure'
+    if (( has_tty == 1 )); then choose_action; fi
+  fi
+  case "${action}" in configure|disable|enable|unset) ;; *) fail '--action must be configure, disable, enable, or unset';; esac
   case "${omp_transport}" in auto|provider-wire|pi-native) ;; *) fail '--transport must be auto, provider-wire, or pi-native';; esac
   [[ "${harness}" == omp || "${omp_transport}" == auto ]] || fail '--transport is OMP-only; other clients use their native provider endpoints'
   if [[ -n "${profile}" ]]; then
     [[ "${profile}" =~ ^[a-z0-9][a-z0-9._-]{0,63}$ ]] || fail 'profile names are [a-z0-9][a-z0-9._-]{0,63}'
     case "${harness}" in omp|codex) ;; *) fail '--profile is only supported by OMP and Codex; use the selected client config-directory environment for other scopes';; esac
   fi
+  # Local switches must work even if a stale endpoint/key environment is present.
+  [[ "${action}" == configure ]] || return 0
   if [[ -z "${gateway_url}" ]]; then
     (( has_tty == 1 )) || fail 'set AGENT_AUTH_URL or pass --url when no interactive terminal is available'
     printf 'Gateway endpoint URL (HTTPS, or HTTP on loopback): ' >/dev/tty
@@ -115,6 +129,21 @@ choose_harness() {
     printf '\033[5A' >/dev/tty
   done
 }
+choose_action() {
+  local answer
+  printf 'Select action for %s:\n  1) Configure gateway\n  2) Disable gateway (keep reversible state)\n  3) Enable saved gateway\n  4) Unset gateway (remove saved state/key)\n' "${harness}" >/dev/tty
+  while true; do
+    printf 'Action [1-4, default 1]: ' >/dev/tty
+    IFS= read -r answer </dev/tty || fail 'could not read action choice'
+    case "${answer}" in
+      ''|1|configure) action=configure; return ;;
+      2|disable) action=disable; return ;;
+      3|enable) action=enable; return ;;
+      4|unset) action=unset; return ;;
+      *) printf 'Enter 1, 2, 3, or 4.\n' >/dev/tty ;;
+    esac
+  done
+}
 
 # --- setup/transaction.sh ---
 # One owner stages every file, installs tokens before references, and rolls back
@@ -123,6 +152,8 @@ choose_harness() {
 # original mode as well so rollback can restore it exactly.
 init_transaction() {
   tx_paths=(); tx_candidates=(); tx_originals=(); tx_backups=(); tx_kinds=(); tx_order=()
+  tx_formats=(); tx_roles=(); tx_restore_sources=(); tx_operations=(); tx_backup_allowed=(); tx_applied_sources=()
+  switch_lock=''
   tx_count=0
   tx_order_count=0
   setup_committed=0
@@ -151,6 +182,19 @@ confirm_existing_setup() {
     esac
   done
 }
+resolve_config_directory() {
+  local parent="$1" suffix=''
+  [[ "${parent}" == /* && "${parent}" != *[$'\t\r\n']* ]] || fail 'config directory must be one absolute path'
+  while [[ ! -d "${parent}" ]]; do
+    suffix="/$(basename "${parent}")${suffix}"
+    parent="$(dirname "${parent}")"
+  done
+  printf '%s%s\n' "$(cd -P "${parent}" && pwd)" "${suffix}"
+}
+resolve_token_directory() {
+  [[ ! -L "$1" ]] || fail 'gateway state/key paths must not be symlinks'
+  resolve_config_directory "$1"
+}
 resolve_config_target() {
   local path="$1" link_target hops=0
   [[ "${path}" == /* && "${path}" != *[$'\t\r\n']* ]] || fail 'config path must be one absolute path'
@@ -162,10 +206,11 @@ resolve_config_target() {
     else path="$(cd -P "$(dirname "${path}")" && pwd)/${link_target}"; fi
   done
   [[ ! -e "${path}" || -f "${path}" ]] || fail "config is not a regular file: ${path}"
-  printf '%s\n' "${path}"
+  printf '%s/%s\n' "$(resolve_config_directory "$(dirname "${path}")")" "$(basename "${path}")"
 }
 register_file() {
   local target="$1" source="$2" kind="$3" index original staged
+  [[ "${target}" == /* && "${target}" != *[$'\t\r\n']* ]] || fail 'transaction target must be one absolute path'
   for ((index=0; index<tx_count; index++)); do
     [[ "${tx_paths[index]}" != "${target}" ]] || fail "duplicate transaction target: ${target}"
   done
@@ -180,6 +225,12 @@ register_file() {
   tx_originals[tx_count]="${original}"
   tx_backups[tx_count]=''
   tx_kinds[tx_count]="${kind}"
+  tx_formats[tx_count]=''
+  tx_roles[tx_count]=''
+  tx_restore_sources[tx_count]=''
+  tx_operations[tx_count]=write
+  tx_backup_allowed[tx_count]=1
+  tx_applied_sources[tx_count]=''
   ((tx_count += 1))
   cp "${source}" "${staged}"
   chmod 0600 "${staged}"
@@ -191,6 +242,7 @@ mark_applied() {
 commit_transaction() {
   local pass index target original backup staged
   # Precheck every snapshot before any replacement; don't overwrite concurrent edits.
+  check_switch_scope
   for ((index=0; index<tx_count; index++)); do
     target="${tx_paths[index]}"; original="${tx_originals[index]}"
     [[ ! -L "${target}" ]] || fail "config changed during setup: ${target}"
@@ -200,17 +252,33 @@ commit_transaction() {
       [[ ! -e "${target}" ]] || fail "config appeared during setup: ${target}"
     fi
   done
-  for pass in token asset config; do
+  for pass in token asset config cleanup state; do
     for ((index=0; index<tx_count; index++)); do
       [[ "${tx_kinds[index]}" == "${pass}" ]] || continue
+      [[ "${tx_operations[index]}" != keep ]] || continue
       target="${tx_paths[index]}"; original="${tx_originals[index]}"; staged="${tx_candidates[index]}"
+      # Recheck at the mutation boundary too: earlier replacements may take time.
+      check_switch_scope
+      [[ ! -L "${target}" ]] || fail "config changed during setup: ${target}"
+      if [[ -n "${original}" ]]; then
+        [[ -f "${target}" ]] && cmp -s "${original}" "${target}" || fail "config changed during setup: ${target}"
+      else
+        [[ ! -e "${target}" ]] || fail "config appeared during setup: ${target}"
+      fi
+      if [[ "${tx_operations[index]}" == delete ]]; then
+        mark_applied "${index}"
+        rm -f "${target}"
+        continue
+      fi
+      tx_applied_sources[index]="${scratch_dir}/applied-${index}"
+      cp "${staged}" "${tx_applied_sources[index]}"
       if [[ -n "${original}" ]] && cmp -s "${staged}" "${target}"; then
         # Keep the original mtime on idempotent runs. Snapshot also covers chmod rollback.
         mark_applied "${index}"
         chmod 0600 "${target}"
         continue
       fi
-      if [[ -n "${original}" && "${pass}" != token ]]; then
+      if [[ -n "${original}" && "${pass}" == config && "${action}" == configure && "${tx_backup_allowed[index]}" == 1 ]]; then
         # Create privately before copying: cp -p followed by chmod would expose
         # embedded keys at the original mode until chmod completes.
         backup="$(mktemp "${target}.pre-agent-auth.$(date -u +%Y%m%dT%H%M%SZ).XXXXXXXX")"
@@ -233,6 +301,13 @@ cleanup() {
     for ((order=tx_order_count-1; order>=0; order--)); do
       index="${tx_order[order]}"
       target="${tx_paths[index]}"; original="${tx_originals[index]}"
+      # Never roll an unrelated writer back to our snapshot after a failed commit.
+      if [[ -L "${target}" ]] || { [[ -e "${target}" ]] &&
+        ! { [[ -n "${original}" ]] && cmp -s "${original}" "${target}"; } &&
+        ! { [[ -n "${tx_applied_sources[index]}" ]] && cmp -s "${tx_applied_sources[index]}" "${target}"; }; }; then
+        printf 'setup rollback refused a concurrent edit; originals remain at %s; lock remains at %s\n' "${scratch_dir}" "${switch_lock}" >&2
+        exit "${status}"
+      fi
       if [[ -n "${original}" ]]; then
         restore="$(mktemp "${target}.rollback.XXXXXXXX")"
         if [[ -z "${restore}" ]] || ! cp -p "${original}" "${restore}" || ! mv -f "${restore}" "${target}"; then
@@ -251,13 +326,19 @@ cleanup() {
   for ((index=0; index<tx_count; index++)); do
     [[ -z "${tx_candidates[index]}" ]] || rm -f "${tx_candidates[index]}"
   done
+  if [[ -n "${switch_lock}" ]]; then rmdir "${switch_lock}"; fi
   rm -rf "${scratch_dir}"
   exit "${status}"
 }
 report_transaction() {
   local index
   for ((index=0; index<tx_count; index++)); do
-    printf '  %-8s %s (0600)\n' "${tx_kinds[index]}" "${tx_paths[index]/#${HOME}/\~}"
+    [[ "${tx_operations[index]}" != keep ]] || continue
+    if [[ "${tx_operations[index]}" == delete ]]; then
+      printf '  removed  %s\n' "${tx_paths[index]/#${HOME}/\~}"
+    else
+      printf '  %-8s %s (0600)\n' "${tx_kinds[index]}" "${tx_paths[index]/#${HOME}/\~}"
+    fi
     if [[ -n "${tx_backups[index]}" ]]; then printf '  backup   %s\n' "${tx_backups[index]/#${HOME}/\~}"; fi
   done
 }
@@ -267,12 +348,12 @@ report_transaction() {
 readonly YQ_VERSION='v4.53.6'
 require_executable() {
   local value
-  value="$(command -v "$1")" || fail "$1 is required; install the selected client/prerequisite first"
+  value="$(command -v "$1")" || fail "${2:-$1 is required; install the selected client/prerequisite first}"
   [[ "${value}" == /* && -x "${value}" ]] || fail "$1 must resolve to an absolute executable path"
   printf '%s\n' "${value}"
 }
 init_scratch() {
-  command -v curl >/dev/null 2>&1 || fail 'curl is required'
+  if [[ "${action}" == configure ]]; then command -v curl >/dev/null 2>&1 || fail 'curl is required'; fi
   command -v env >/dev/null 2>&1 || fail 'env is required'
   cat_bin="$(require_executable cat)"
   umask 077
@@ -282,16 +363,21 @@ init_scratch() {
   scratch_dir="$(mktemp -d /var/tmp/agent-auth-setup.XXXXXXXX)"
   init_transaction
 }
+require_switch_tools() {
+  [[ "${switch_tools_ready:-0}" == 0 ]] || return 0
+  node_bin="$(require_executable node 'Node.js >=18 is required by the installer, including OMP setup and local switching')"
+  "${node_bin}" -e 'if (Number(process.versions.node.split(".")[0]) < 18) process.exit(1)' || fail 'Node.js >=18 is required'
+  unpack_native_payload
+  switch_tools_ready=1
+}
 require_native_tools() {
   validation_home="${scratch_dir}/client-home"
-  node_bin="$(require_executable node)"
+  require_switch_tools
   python_bin="$(require_executable python3)"
-  "${node_bin}" -e 'if (Number(process.versions.node.split(".")[0]) < 18) process.exit(1)' || fail 'Node.js >=18 is required'
   "${python_bin}" -c 'import sys; assert sys.version_info >= (3, 10)' || fail 'Python >=3.10 is required'
   if [[ "${harness}" != pi ]]; then
     "${python_bin}" -c 'from jsonschema import Draft7Validator; from referencing import Registry' >/dev/null 2>&1 || fail 'Python jsonschema >=4.18 is required (install it in your Python environment first)'
   fi
-  unpack_native_payload
 }
 sha256_file() {
   local file="$1" output
@@ -347,6 +433,7 @@ resolve_yq() {
       return
     fi
   fi
+  [[ "${action}" == configure ]] || fail 'local switching needs the cached YAML/TOML helper; restore the setup cache or set AGENT_AUTH_YQ_BIN to a local yq v4.53.6 executable (no download attempted)'
 
   download="${scratch_dir}/${asset}"
   curl --fail --location --silent --show-error \
@@ -545,7 +632,7 @@ validate_gateway() {
 # --- setup/native.sh ---
 # Native adapters share staging and validation mechanics, not client schemas.
 native_prepare() {
-  client_bin="$(require_executable "$1")"
+  if [[ "${action}" == configure ]]; then client_bin="$(require_executable "$1")"; fi
 }
 native_validate_client() {
   require_native_tools
@@ -561,11 +648,13 @@ native_client() {
 # Snapshot before parsing/merging. All adapter edits use this immutable source,
 # never a live file that might change between parsing and transaction admission.
 stage_config() {
-  local target="$1" format="${2:-json}" empty
+  local target="$1" format="${2:-json}" role="${3:-config}" empty
   empty="${scratch_dir}/empty-${format}"
   if [[ "${format}" == toml ]]; then printf '' > "${empty}"; else printf '{}\n' > "${empty}"; fi
   if [[ -f "${target}" ]]; then register_file "${target}" "${target}" config
   else register_file "${target}" "${empty}" config; fi
+  tx_formats[tx_count-1]="${format}"
+  tx_roles[tx_count-1]="${role}"
   staged_config="${tx_candidates[tx_count-1]}"
   source_config="${tx_originals[tx_count-1]}"
   if [[ -z "${source_config}" ]]; then source_config="${empty}"; fi
@@ -597,6 +686,81 @@ native_report() {
       printf 'Pi uses generic Responses, not the JWT-only Codex API. Extra caller sampling controls are not removed.\n'
       printf 'Empty Codex instructions with native system input, and generic Anthropic OAuth shaping, require independent wire proof.\n' ;;
   esac
+}
+
+# --- setup/switch.sh ---
+# Scope-local state contains owned-field values, never a whole-file restore image.
+# All writes/deletions still go through the installer's original transaction.
+switch_begin() {
+  local lock_path
+  require_switch_tools
+  if [[ "${harness}" == codex && "${action}" != configure ]]; then yq_bin="$(resolve_yq)"; fi
+  token_root="${token_root:-${token_dir}}"
+  [[ ! -L "${token_root}" && ! -L "${token_dir}" && ! -L "${token_file}" ]] || fail 'gateway state/key paths must not be symlinks'
+  switch_state="${token_dir}/switch.json"
+  [[ ! -L "${switch_state}" ]] || fail 'gateway switch state must not be a symlink'
+  mkdir -p "${token_dir}"
+  switch_token_directory="$(cd -P "${token_dir}" && pwd)"
+  lock_path="${token_dir}/.setup-lock"
+  mkdir "${lock_path}" 2>/dev/null || fail "another setup owns this scope, or a previous setup was interrupted; verify no setup is running before removing ${lock_path}"
+  switch_lock="${lock_path}"
+  chmod 0700 "${token_root}" "${token_dir}"
+  printf '{}\n' > "${scratch_dir}/empty-state"
+  if [[ -f "${switch_state}" ]]; then register_file "${switch_state}" "${switch_state}" state
+  else register_file "${switch_state}" "${scratch_dir}/empty-state" state; fi
+}
+check_switch_scope() {
+  local index resolved
+  [[ ! -L "${token_root}" && ! -L "${token_dir}" && ! -L "${token_file}" && ! -L "${switch_state}" ]] || fail 'gateway state/key path changed during setup'
+  [[ "$(cd -P "${token_dir}" && pwd)" == "${switch_token_directory}" ]] || fail 'gateway state directory changed during setup'
+  for ((index=0; index<${#switch_references[@]}; index++)); do
+    resolved="$(resolve_config_target "${switch_references[index]}")"
+    [[ "${resolved}" == "${switch_configs[index]}" ]] || fail 'selected config symlink/path changed during setup'
+  done
+}
+switch_stage_local() {
+  local index target
+  for ((index=0; index<${#switch_configs[@]}; index++)); do
+    stage_config "${switch_configs[index]}" "${switch_formats[index]}" "${switch_roles[index]}"
+  done
+  printf '' > "${scratch_dir}/empty-asset"
+  for target in "${token_file}" "${switch_assets[@]}"; do
+    if [[ -f "${target}" ]]; then register_file "${target}" "${target}" asset
+    else register_file "${target}" "${scratch_dir}/empty-asset" asset; fi
+    if [[ "${target}" == "${token_file}" ]]; then tx_kinds[tx_count-1]=token; fi
+  done
+}
+switch_finish() {
+  local index backup operation
+  # Older installers left whole-file backups. Only positively identified gateway
+  # backups are retired by unset, and only if their recorded bytes still match.
+  for ((index=0; index<${#switch_configs[@]}; index++)); do
+    for backup in "${switch_configs[index]}".pre-agent-auth.*; do
+      [[ -e "${backup}" || -L "${backup}" ]] || continue
+      register_file "${backup}" "${backup}" history
+      tx_formats[tx_count-1]="${switch_formats[index]}"
+      tx_roles[tx_count-1]="${switch_configs[index]}"
+    done
+  done
+  : > "${scratch_dir}/switch-files"
+  for ((index=0; index<tx_count; index++)); do
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "${index}" "${tx_paths[index]}" \
+      "${tx_originals[index]}" "${tx_candidates[index]}" "${tx_kinds[index]}" \
+      "${tx_formats[index]}" "${tx_roles[index]}" "${tx_restore_sources[index]}" >> "${scratch_dir}/switch-files"
+  done
+  "${node_bin}" "${scratch_dir}/native/switch.cjs" "${action}" "${harness}" "${profile}" \
+    "${token_file}" "${yq_bin:-}" "${scratch_dir}/switch-files" > "${scratch_dir}/switch-plan"
+  while IFS=$'\t' read -r index operation; do
+    case "${operation}" in
+      write) tx_operations[index]=write ;;
+      managed) tx_operations[index]=write; tx_backup_allowed[index]=0 ;;
+      keep) tx_operations[index]=keep ;;
+      delete)
+        tx_operations[index]=delete
+        if [[ "${tx_kinds[index]}" != state ]]; then tx_kinds[index]=cleanup; fi ;;
+      *) fail 'invalid local switch transaction plan' ;;
+    esac
+  done < "${scratch_dir}/switch-plan"
 }
 
 # --- setup/adapters/omp.sh ---
@@ -691,7 +855,7 @@ omp_prepare() {
   omp_bin="$(require_executable omp)"
   # Even `omp config path` can initialize agent.db. Do not invoke it until
   # the owner approves the selected scope; do not guess paths or parse .env.
-  if (( overwrite == 0 )); then
+  if [[ "${action}" == configure && "${overwrite}" == 0 ]]; then
     (( has_tty == 1 )) || fail 'OMP scope resolution can initialize client state; rerun with --overwrite to consent, or leave it alone'
     printf 'OMP resolves the active/profile config path and may initialize client state.\n' >/dev/tty
     while true; do
@@ -705,7 +869,7 @@ omp_prepare() {
     done
   fi
   yq_bin="$(resolve_yq)"
-  if [[ "${omp_transport}" != auto ]]; then omp_validate_client; fi
+  if [[ "${action}" == configure && "${omp_transport}" != auto ]]; then omp_validate_client; fi
 
   if [[ -n "${profile}" ]]; then
     agent_dir="$("${omp_bin}" --profile "${profile}" config path 2> "${scratch_dir}/config-path.stderr")" || fail 'could not resolve the OMP config path'
@@ -725,12 +889,15 @@ omp_prepare() {
     legacy_models="${agent_dir}/models.json"
   fi
 
+  switch_references=("${models}")
   models="$(resolve_config_target "${models}")"
   models_existed=0
   if [[ -f "${models}" ]]; then models_existed=1; fi
-  token_dir="${agent_dir}/agent-auth"
+  token_dir="$(resolve_token_directory "${agent_dir}/agent-auth")"
   token_file="${token_dir}/token"
   setup_targets=("${models}" "${token_file}")
+  switch_configs=("${models}"); switch_formats=(yaml); switch_roles=(models)
+  switch_assets=()
   if [[ -n "${legacy_models}" ]]; then setup_targets+=("${legacy_models}"); fi
 }
 omp_recover_embedded_key() {
@@ -759,7 +926,7 @@ omp_recover_embedded_key() {
 }
 omp_stage() {
   local omp_candidate
-  stage_config "${models}" yaml
+  stage_config "${models}" yaml models
   omp_candidate="${staged_config}"
   route_expression='
     (.providers[strenv(PROVIDER)] | type) == "!!map" and
@@ -807,6 +974,8 @@ omp_stage() {
         fi
         source_file="${legacy_agent_dir}/models.yml"
         [[ -f "${source_file}" ]] || fail "OMP did not migrate ${legacy_models/#${HOME}/\~}"
+        # Retain the client's actual legacy migration as the normal-mode baseline.
+        tx_restore_sources[tx_count-1]="${source_file}"
       else
         source_file="${scratch_dir}/empty-models.yml"
         printf '{}\n' > "${source_file}"
@@ -874,13 +1043,16 @@ claude_code_prepare() {
   local key value
   for key in ANTHROPIC_AUTH_TOKEN ANTHROPIC_API_KEY ANTHROPIC_AWS_API_KEY CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY CLAUDE_CODE_USE_ANTHROPIC_AWS; do
     value="${!key:-}"
-    [[ -z "${value}" || "${value}" == 0 || "${value}" == false ]] || fail 'inherited Claude credentials/cloud routing conflict with setup; use a clean environment and isolated CLAUDE_CONFIG_DIR'
+    [[ "${action}" != configure || -z "${value}" || "${value}" == 0 || "${value}" == false ]] || fail 'inherited Claude credentials/cloud routing conflict with setup; use a clean environment and isolated CLAUDE_CONFIG_DIR'
   done
   client_dir="${CLAUDE_CONFIG_DIR:-${HOME}/.claude}"
   config_target="$(resolve_config_target "${client_dir}/settings.json")"
-  token_dir="${client_dir}/agent-auth"
+  token_dir="$(resolve_token_directory "${client_dir}/agent-auth")"
   token_file="${token_dir}/token"
   setup_targets=("${config_target}" "${token_file}")
+  switch_configs=("${config_target}"); switch_formats=(json); switch_roles=(config)
+  switch_references=("${client_dir}/settings.json")
+  switch_assets=()
 }
 claude_code_stage() {
   stage_config "${config_target}"
@@ -898,12 +1070,16 @@ codex_prepare() {
   base_config="$(resolve_config_target "${client_dir}/config.toml")"
   if [[ -n "${profile}" ]]; then config_target="$(resolve_config_target "${client_dir}/${profile}.config.toml")"
   else config_target="${base_config}"; fi
-  token_root="${client_dir}/agent-auth"
+  token_root="$(resolve_token_directory "${client_dir}/agent-auth")"
   token_dir="${token_root}"
   if [[ -n "${profile}" ]]; then token_dir+="/${profile}"; else token_dir+='/default'; fi
+  token_dir="$(resolve_token_directory "${token_dir}")"
   token_file="${token_dir}/token"
-  catalog_target="$(resolve_config_target "${token_dir}/models.json")"
+  catalog_target="${token_dir}/models.json"
   setup_targets=("${config_target}" "${token_file}" "${catalog_target}")
+  switch_configs=("${config_target}"); switch_formats=(toml); switch_roles=(config)
+  switch_references=("${client_dir}/${profile:+${profile}.}config.toml")
+  switch_assets=("${catalog_target}")
   if [[ -n "${profile}" ]]; then setup_targets+=("${base_config}"); fi
 }
 codex_stage() {
@@ -919,7 +1095,9 @@ codex_stage() {
   "${node_bin}" "${scratch_dir}/native/check.cjs" equal "${scratch_dir}/codex-source.json" "${scratch_dir}/codex-roundtrip.json"
   "${node_bin}" "${scratch_dir}/native/check.cjs" codex-profile "${scratch_dir}/codex-source.json"
   if [[ -n "${profile}" && -f "${base_config}" ]]; then
-    cp -p "${base_config}" "${scratch_dir}/codex-base.toml"
+    register_file "${base_config}" "${base_config}" dependency
+    tx_operations[tx_count-1]=keep
+    cp -p "${tx_originals[tx_count-1]}" "${scratch_dir}/codex-base.toml"
     "${yq_bin}" -p toml -o json '. // {}' "${scratch_dir}/codex-base.toml" > "${scratch_dir}/codex-base.json" 2> "${scratch_dir}/toml.stderr" || fail 'could not decode base Codex TOML'
     "${node_bin}" "${scratch_dir}/native/check.cjs" codex-profile "${scratch_dir}/codex-base.json"
     SOURCE_JSON="${scratch_dir}/codex-source.json" "${yq_bin}" -p json -o json '. * load(strenv(SOURCE_JSON))' "${scratch_dir}/codex-base.json" > "${scratch_dir}/codex-effective.json"
@@ -956,7 +1134,7 @@ codex_stage() {
 # --- setup/adapters/opencode.sh ---
 opencode_prepare() {
   native_prepare opencode
-  if [[ -n "${OPENCODE_CONFIG_CONTENT:-}" || -n "${OPENCODE_CONFIG_DIR:-}" ]]; then
+  if [[ "${action}" == configure && ( -n "${OPENCODE_CONFIG_CONTENT:-}" || -n "${OPENCODE_CONFIG_DIR:-}" ) ]]; then
     fail 'OPENCODE_CONFIG_CONTENT or OPENCODE_CONFIG_DIR can override the selected file; use a clean environment for setup'
   fi
   client_dir="${XDG_CONFIG_HOME:-${HOME}/.config}/opencode"
@@ -973,9 +1151,12 @@ opencode_prepare() {
   fi
   config_display="${config_target}"
   config_target="$(resolve_config_target "${config_target}")"
-  token_dir="$(dirname "${config_target}")/agent-auth"
+  token_dir="$(resolve_token_directory "$(dirname "${config_target}")/agent-auth")"
   token_file="${token_dir}/token"
   setup_targets=("${config_target}" "${token_file}")
+  switch_configs=("${config_target}"); switch_formats=(json); switch_roles=(config)
+  switch_references=("${config_display}")
+  switch_assets=()
 }
 opencode_stage() {
   stage_config "${config_target}"
@@ -998,17 +1179,20 @@ pi_prepare() {
   client_dir="${PI_CODING_AGENT_DIR:-${HOME}/.pi/agent}"
   models_target="$(resolve_config_target "${client_dir}/models.json")"
   settings_target="$(resolve_config_target "${client_dir}/settings.json")"
-  token_dir="${client_dir}/agent-auth"
+  token_dir="$(resolve_token_directory "${client_dir}/agent-auth")"
   token_file="${token_dir}/token"
   setup_targets=("${models_target}" "${settings_target}" "${token_file}")
+  switch_configs=("${models_target}" "${settings_target}"); switch_formats=(json json); switch_roles=(models settings)
+  switch_references=("${client_dir}/models.json" "${client_dir}/settings.json")
+  switch_assets=()
 }
 pi_stage() {
   local models_candidate settings_candidate
-  stage_config "${models_target}"
+  stage_config "${models_target}" json models
   models_candidate="${staged_config}"
   "${node_bin}" "${scratch_dir}/native/pi.cjs" models "${source_config}" "${staged_config}" \
     "${scratch_dir}/native-catalog.json" "${gateway_url}" "${cat_bin}" "${token_file}"
-  stage_config "${settings_target}"
+  stage_config "${settings_target}" json settings
   settings_candidate="${staged_config}"
   "${node_bin}" "${scratch_dir}/native/pi.cjs" settings "${source_config}" "${staged_config}" \
     "${scratch_dir}/native-catalog.json" "${gateway_url}" "${cat_bin}" "${token_file}"
@@ -1282,10 +1466,19 @@ AGENT_AUTH_174B49BDE65749A4F18F
   "${cat_bin}" > "${scratch_dir}/native/config-io.cjs" <<'AGENT_AUTH_5C44F65AEEC4D5B50F96'
 'use strict';
 const fs = require('node:fs');
-const { isDeepStrictEqual } = require('node:util');
 const jsonc = require('../vendor/jsonc-parser/main.js');
 
 function object(value) { return value !== null && typeof value === 'object' && !Array.isArray(value); }
+// JSONC produces null-prototype objects; saved/constructed JSON values need the
+// same value comparison regardless of that parser detail or object key order.
+function equal(left, right) {
+  if (left === right) return true;
+  if (left === null || right === null || typeof left !== 'object' || typeof right !== 'object'
+    || Array.isArray(left) !== Array.isArray(right)) return false;
+  const keys = Object.keys(left);
+  return keys.length === Object.keys(right).length
+    && keys.every(key => Object.hasOwn(right, key) && equal(left[key], right[key]));
+}
 function parse(text, strict = false) {
   const errors = [];
   const tree = jsonc.parseTree(text.replace(/^\uFEFF/, ' '), errors, { allowTrailingComma: !strict, disallowComments: strict });
@@ -1313,7 +1506,7 @@ function patch(source, destination, changes, strict = false) {
   function apply(path, desired) {
     let existing = value;
     for (const key of path) existing = existing?.[key];
-    if (isDeepStrictEqual(existing, desired)) return;
+    if (equal(existing, desired)) return;
     text = jsonc.applyEdits(text, jsonc.modify(text, path, desired, {
       formattingOptions: { insertSpaces: true, tabSize: 2, eol: text.includes('\r\n') ? '\r\n' : '\n' },
     }));
@@ -1331,7 +1524,7 @@ function checkOwnedProvider(existing, baseUrl, field) {
     throw new Error('the setup-owned provider name is already used by another configuration');
   }
 }
-module.exports = { object, parse, load, patch, save, command, checkOwnedProvider };
+module.exports = { object, equal, parse, load, patch, save, command, checkOwnedProvider };
 AGENT_AUTH_5C44F65AEEC4D5B50F96
   "${cat_bin}" > "${scratch_dir}/native/opencode.cjs" <<'AGENT_AUTH_2464A809E52279A1DF3E'
 'use strict';
@@ -1491,6 +1684,304 @@ if status:
     print('setup failed: selected client refused isolated validation', file=sys.stderr)
     sys.exit(1)
 AGENT_AUTH_E968C0B43D8C55F66557
+  "${cat_bin}" > "${scratch_dir}/native/switch.cjs" <<'AGENT_AUTH_52ABCB0691AE5994688D'
+'use strict';
+const fs = require('node:fs');
+const { execFileSync } = require('node:child_process');
+const { createHash } = require('node:crypto');
+const { object, equal, parse, load, patch, save } = require('./config-io.cjs');
+
+const absent = Object.freeze({ present: false });
+const own = (value, key) => object(value) && Object.hasOwn(value, key);
+function at(value, keys) {
+  for (const key of keys) {
+    if (!own(value, key)) return absent;
+    value = value[key];
+  }
+  return { present: true, value };
+}
+function put(value, keys, cell) {
+  for (const key of keys.slice(0, -1)) {
+    if (!own(value, key) || !object(value[key])) Object.defineProperty(value, key, { value: {}, enumerable: true, configurable: true, writable: true });
+    value = value[key];
+  }
+  if (cell.present) Object.defineProperty(value, keys.at(-1), { value: cell.value, enumerable: true, configurable: true, writable: true });
+  else delete value[keys.at(-1)];
+}
+const digest = file => createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+const fieldKey = keys => JSON.stringify(keys);
+const providerIds = ['anthropic', 'openai-codex'];
+function ownedPaths(harness, role) {
+  switch (harness) {
+    case 'omp': return providerIds.flatMap(id => ['baseUrl', 'apiKey', 'transport', 'discovery'].map(key => ['providers', id, key]));
+    case 'claude-code': return [['apiKeyHelper'], ['model'], ...['ANTHROPIC_BASE_URL', 'ANTHROPIC_MODEL', 'ANTHROPIC_DEFAULT_HAIKU_MODEL',
+      'CLAUDE_CODE_MAX_RETRIES', 'CLAUDE_CODE_RETRY_WATCHDOG', 'CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK'].map(key => ['env', key])];
+    case 'codex': return [['model'], ['model_provider'], ['model_catalog_json'], ['features', 'enable_request_compression'], ['model_providers', 'agent_auth']];
+    case 'opencode': return [['model'], ['small_model'], ['enabled_providers'], ...providerIds.map(id => ['provider', `agent-auth-${id}`])];
+    case 'pi': return role === 'models' ? providerIds.map(id => ['providers', `agent-auth-${id}`]) :
+      [['defaultProvider'], ['defaultModel'], ['retry', 'enabled'], ['retry', 'maxRetries'], ['retry', 'provider', 'maxRetries'], ['transport']];
+    default: throw new Error('unknown switch client');
+  }
+}
+function marked(harness, role, value) {
+  switch (harness) {
+    case 'omp': return providerIds.some(id => ['provider-wire', 'pi-native'].includes(value.providers?.[id]?.transport));
+    case 'claude-code': return typeof value.apiKeyHelper === 'string' && /agent-auth[\\/]token/.test(value.apiKeyHelper);
+    case 'codex': return value.model_provider === 'agent_auth' || own(value.model_providers, 'agent_auth');
+    case 'opencode': return providerIds.some(id => own(value.provider, `agent-auth-${id}`)) || [value.model, value.small_model].some(item => typeof item === 'string' && item.startsWith('agent-auth-'));
+    case 'pi': return role === 'models' ? providerIds.some(id => own(value.providers, `agent-auth-${id}`)) : typeof value.defaultProvider === 'string' && value.defaultProvider.startsWith('agent-auth-');
+  }
+}
+function readConfig(file, format, yq, strict) {
+  if (!file) return {};
+  if (format === 'json') return load(file, strict);
+  let decoded;
+  try { decoded = execFileSync(yq, ['-p', format, '-o', 'json', '. // {}', file], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 16 * 1024 * 1024 }); }
+  catch { throw new Error(`could not parse ${format} configuration for local switching`); }
+  const value = parse(decoded, true);
+  if (!object(value)) throw new Error('configuration root must be an object');
+  return value;
+}
+function editConfig(file, changes, expected, yq, strict) {
+  if (!changes.length) return false;
+  if (file.format === 'json') {
+    patch(file.original || file.candidate, file.candidate, changes.map(change => [change.path, change.cell.present ? change.cell.value : undefined]), strict);
+  } else {
+    const dataFile = file.candidate + '.values.json';
+    save(dataFile, changes.map(change => change.cell));
+    const selector = keys => '.' + keys.map(key => `[${JSON.stringify(key)}]`).join('');
+    // Values travel through a private JSON file, never command arguments/logs.
+    const expression = ['. = (. // {})', ...changes.map((change, index) => change.cell.present
+      ? `${selector(change.path)} = load(strenv(AGENT_AUTH_SWITCH_VALUES))[${index}].value`
+      : `del(${selector(change.path)})`)].join(' | ');
+    try {
+      const text = execFileSync(yq, ['-p', file.format, '-o', file.format, expression, file.original || file.candidate],
+        { encoding: 'utf8', env: { ...process.env, AGENT_AUTH_SWITCH_VALUES: dataFile }, stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 16 * 1024 * 1024 });
+      fs.writeFileSync(file.candidate, text, { mode: 0o600 });
+    } catch { throw new Error(`could not safely patch ${file.format} gateway fields`); }
+    finally { fs.rmSync(dataFile, { force: true }); }
+  }
+  if (!equal(readConfig(file.candidate, file.format, yq, strict), expected)) throw new Error('configuration editor changed unrelated values; nothing was committed');
+  return true;
+}
+function normalizedPaths(paths, baseline) {
+  const unique = new Map();
+  for (let keys of paths) {
+    for (let count = 1; count < keys.length; count++) {
+      const parent = at(baseline, keys.slice(0, count));
+      if (parent.present && !object(parent.value)) { keys = keys.slice(0, count); break; }
+    }
+    unique.set(fieldKey(keys), keys);
+  }
+  const result = [...unique.values()];
+  return result.filter(keys => !result.some(other => other.length < keys.length && other.every((key, index) => keys[index] === key)));
+}
+function absentParents(paths, baseline) {
+  const parents = new Map();
+  for (const keys of paths) for (let count = 1; count < keys.length; count++) {
+    const prefix = keys.slice(0, count);
+    if (!at(baseline, prefix).present) parents.set(fieldKey(prefix), prefix);
+  }
+  return [...parents.values()].sort((a, b) => b.length - a.length);
+}
+function cellValid(cell) { return object(cell) && typeof cell.present === 'boolean' && (cell.present ? own(cell, 'value') : !own(cell, 'value')); }
+function validateState(state, harness, tokenFile, files) {
+  if (state.version !== 1 || state.harness !== harness || state.tokenFile !== tokenFile || !['enabled', 'disabled'].includes(state.mode) ||
+      !Array.isArray(state.files) || !Array.isArray(state.history) || state.files.length !== files.length) throw new Error('switch state does not match this client/scope; restore its original state file or select the original profile/config path');
+  const seen = new Set();
+  for (const record of state.files) {
+    const file = files.find(file => file.path === record.path && file.kind === record.kind && file.role === record.role && file.format === record.format);
+    if (!file || seen.has(record.path)) throw new Error('switch state file targets differ from the selected scope');
+    seen.add(record.path);
+    if (file.kind !== 'config') {
+      if (!/^[a-f0-9]{64}$/.test(record.sha256)) throw new Error('switch state contains an invalid credential/asset fingerprint');
+      continue;
+    }
+    if (!Array.isArray(record.fields) || !Array.isArray(record.absentParents)) throw new Error('switch state has invalid owned fields');
+    const allowed = ownedPaths(harness, file.role);
+    const fieldNames = new Set();
+    for (const field of record.fields) {
+      if (!Array.isArray(field.path) || !field.path.length || !allowed.some(keys => field.path.length <= keys.length && field.path.every((key, index) => key === keys[index])) ||
+          !cellValid(field.before) || !cellValid(field.gateway) || fieldNames.has(fieldKey(field.path))) throw new Error('switch state contains an invalid owned field');
+      if (field.members !== undefined && (harness !== 'opencode' || !equal(field.path, ['enabled_providers']) ||
+          !Array.isArray(field.members) || !field.members.every(id => providerIds.some(provider => id === `agent-auth-${provider}`)) ||
+          !Array.isArray(field.before.value) || !Array.isArray(field.gateway.value))) throw new Error('switch state contains invalid provider-list ownership');
+      fieldNames.add(fieldKey(field.path));
+    }
+    for (const keys of record.absentParents) {
+      if (!Array.isArray(keys) || !keys.length || !allowed.some(full => keys.length < full.length && keys.every((key, index) => key === full[index]))) throw new Error('switch state contains an invalid parent field');
+    }
+  }
+  for (const history of state.history) {
+    if (typeof history.path !== 'string' || !files.some(file => file.kind === 'config' && history.path.startsWith(file.path + '.pre-agent-auth.')) ||
+        !/^[a-f0-9]{64}$/.test(history.sha256)) throw new Error('switch state contains an invalid backup target');
+  }
+}
+function recoverBaseline(file, history, harness, yq, strict) {
+  const candidates = [];
+  const owned = ownedPaths(harness, file.role);
+  for (const backup of history.filter(backup => backup.role === file.path)) {
+    let value;
+    try { value = readConfig(backup.original, file.format, yq, strict); } catch { continue; }
+    if (marked(harness, file.role, value)) continue;
+    const paths = normalizedPaths(owned, value);
+    const projection = { fields: paths.map(keys => [keys, at(value, keys)]), absentParents: absentParents(paths, value) };
+    if (!candidates.some(candidate => equal(candidate.projection, projection))) candidates.push({ value, projection });
+  }
+  if (candidates.length !== 1) throw new Error(`cannot recover original gateway-owned settings for ${file.path}: ${candidates.length ? 'conflicting pre-agent-auth backups' : 'no original pre-agent-auth backup'}. Restore the original owned settings manually (keep native login/auth records), then run --action configure; no files were changed`);
+  return candidates[0].value;
+}
+function main() {
+  const [action, harness, profile, tokenFile, yq, manifest] = process.argv.slice(2);
+  const strict = harness === 'claude-code';
+  const entries = fs.readFileSync(manifest, 'utf8').replace(/\n$/, '').split('\n').map(line => {
+    const [index, target, original, candidate, kind, format, role, restoreSource = ''] = line.split('\t');
+    return { index, path: target, original, candidate, kind, format, role, restoreSource };
+  });
+  const stateFile = entries.find(file => file.kind === 'state');
+  const files = entries.filter(file => ['config', 'token', 'asset'].includes(file.kind));
+  const history = entries.filter(file => file.kind === 'history');
+  const current = new Map(files.filter(file => file.kind === 'config').map(file => [file.path, readConfig(file.original, file.format, yq, strict)]));
+  let state = stateFile.original ? load(stateFile.original, true) : undefined;
+  if (state) validateState(state, harness, tokenFile, files);
+  const previousState = state;
+  const hasGateway = files.some(file => file.kind === 'config' && marked(harness, file.role, current.get(file.path)));
+  const operations = new Map(entries.map(file => [file.index, 'keep']));
+  if (!state && action !== 'configure' && !hasGateway) {
+    if (action === 'enable') throw new Error('no saved gateway configuration in this scope; run --action configure first');
+    if (files.some(file => file.kind !== 'config' && file.original)) throw new Error('a private gateway key/catalog exists but no matching switch state or gateway config was found; select the original profile/config path before switching, or preserve and remove the orphaned private files manually');
+    for (const [index, operation] of operations) console.log(`${index}\t${operation}`);
+    return;
+  }
+  if (!state || action === 'configure') {
+    const records = [];
+    for (const file of files) {
+      const previous = state?.files.find(record => record.path === file.path);
+      if (file.kind !== 'config') {
+        const source = action === 'configure' ? file.candidate : file.original;
+        if (!source) {
+          if (action !== 'enable') {
+            // Restoring normal login must not depend on a still-usable gateway key.
+            records.push({ path: file.path, kind: file.kind, format: file.format, role: file.role, sha256: digest(file.candidate) });
+            continue;
+          }
+          throw new Error(`saved gateway ${file.kind} is missing: ${file.path}; restore the private file or run --action configure`);
+        }
+        records.push({ path: file.path, kind: file.kind, format: file.format, role: file.role, sha256: digest(source) });
+        if (action === 'configure') operations.set(file.index, 'managed');
+        continue;
+      }
+      const value = current.get(file.path);
+      const gateway = action === 'configure' ? readConfig(file.candidate, file.format, yq, strict) : value;
+      const legacy = !state && marked(harness, file.role, value);
+      const baseline = legacy ? recoverBaseline(file, history, harness, yq, strict) :
+        file.restoreSource ? readConfig(file.restoreSource, file.format, yq, strict) : value;
+      const paths = normalizedPaths([...ownedPaths(harness, file.role), ...(previous?.fields.map(field => field.path) ?? [])], baseline);
+      const fields = [];
+      for (const keys of paths) {
+        let before = at(baseline, keys);
+        const old = previous?.fields.find(field => equal(field.path, keys));
+        // Enabled edits belong to the gateway, never to normal login. Only an
+        // explicit reconfigure while disabled may update the saved normal value.
+        if (old && state.mode === 'enabled') before = old.before;
+        if (old?.members && Array.isArray(at(value, keys).value)) {
+          before = { present: true, value: at(value, keys).value.filter(id => state.mode !== 'enabled' || !old.members.includes(id)) };
+        }
+        const after = at(gateway, keys);
+        if (!equal(before, after)) {
+          const field = { path: keys, before, gateway: after };
+          if (harness === 'opencode' && equal(keys, ['enabled_providers']) && Array.isArray(before.value) && Array.isArray(after.value)) {
+            field.members = after.value.filter(id => !before.value.includes(id) && providerIds.some(provider => id === `agent-auth-${provider}`));
+            if (!field.members.length) continue;
+            field.before = { present: true, value: after.value.filter(id => !field.members.includes(id)) };
+          }
+          fields.push(field);
+        }
+      }
+      const parents = previous ? previous.absentParents : absentParents(paths, baseline);
+      records.push({ path: file.path, kind: file.kind, format: file.format, role: file.role, fields, absentParents: parents });
+      if (action === 'configure') operations.set(file.index, previousState || legacy ? 'managed' : 'write');
+    }
+    const retiredHistory = new Map((state?.history ?? []).map(item => [item.path, item]));
+    for (const backup of history) {
+      const owner = files.find(file => file.path === backup.role);
+      if (!owner) throw new Error('backup does not belong to the selected config scope');
+      let value;
+      try { value = readConfig(backup.original, owner.format, yq, strict); } catch { continue; }
+      if (marked(harness, owner.role, value) && !retiredHistory.has(backup.path)) retiredHistory.set(backup.path, { path: backup.path, sha256: digest(backup.original) });
+    }
+    state = { version: 1, harness, profile, tokenFile, mode: 'enabled', files: records, history: [...retiredHistory.values()] };
+  }
+  if (action !== 'configure') {
+    const desiredMode = action === 'enable' ? 'enabled' : 'disabled';
+    for (const file of files) {
+      const record = state.files.find(record => record.path === file.path);
+      if (file.kind !== 'config') {
+        // Disable does not need working credentials. Enable/unset must not use or
+        // remove a later key/catalog written by someone else.
+        if (action === 'disable') continue;
+        if (!file.original) {
+          if (action === 'unset') continue;
+          // OMP's routes embed the complete key; old installations have no file.
+          if (harness === 'omp' && file.kind === 'token') continue;
+          throw new Error(`saved gateway ${file.kind} is missing: ${file.path}; restore it or run --action configure`);
+        }
+        if (digest(file.original) !== record.sha256) throw new Error(`gateway ${file.kind} changed outside setup: ${file.path}; restore the saved version or reconfigure explicitly`);
+        if (action === 'unset') operations.set(file.index, 'delete');
+        continue;
+      }
+      const value = current.get(file.path);
+      const expected = structuredClone(value);
+      const changes = [];
+      for (const field of record.fields) {
+        for (let count = 1; count < field.path.length; count++) {
+          const parent = at(value, field.path.slice(0, count));
+          if (parent.present && !object(parent.value)) throw new Error(`gateway-owned field parent changed outside setup: ${file.path} (${field.path.slice(0, count).join('.')}); preserve or restore that edit before switching`);
+        }
+        const actual = at(value, field.path);
+        let to = field[desiredMode === 'enabled' ? 'gateway' : 'before'];
+        if (field.members) {
+          if (!Array.isArray(actual.value) || (field.members.some(id => actual.value.includes(id)) &&
+              !field.members.every(id => actual.value.includes(id)))) throw new Error(`gateway provider-list membership changed outside setup: ${file.path}; restore the gateway entries before switching`);
+          to = { present: true, value: desiredMode === 'enabled'
+            ? [...actual.value.filter(id => !field.members.includes(id)), ...field.members]
+            : actual.value.filter(id => !field.members.includes(id)) };
+        } else if (!equal(actual, field.before) && !equal(actual, field.gateway)) throw new Error(`gateway-owned field changed outside setup: ${file.path} (${field.path.join('.')}); preserve your edit, or restore that field to its saved value before switching`);
+        if (!equal(actual, to)) { changes.push({ path: field.path, cell: to }); put(expected, field.path, to); }
+      }
+      if (desiredMode === 'disabled') for (const keys of record.absentParents) {
+        const parent = at(expected, keys);
+        if (parent.present && object(parent.value) && !Object.keys(parent.value).length) {
+          changes.push({ path: keys, cell: absent }); put(expected, keys, absent);
+        }
+      }
+      if (editConfig(file, changes, expected, yq, strict)) operations.set(file.index, 'managed');
+    }
+    if (action === 'unset') {
+      for (const old of state.history) {
+        const backup = history.find(file => file.path === old.path);
+        if (!backup) {
+          if (fs.existsSync(old.path)) throw new Error('saved gateway backup is no longer a safe regular file');
+          continue;
+        }
+        if (digest(backup.original) !== old.sha256) throw new Error(`gateway backup changed outside setup: ${old.path}; preserve it separately before unsetting`);
+        operations.set(backup.index, 'delete');
+      }
+      operations.set(stateFile.index, stateFile.original ? 'delete' : 'keep');
+    } else {
+      state.mode = desiredMode;
+      save(stateFile.candidate, state);
+      operations.set(stateFile.index, 'managed');
+    }
+  } else {
+    save(stateFile.candidate, state);
+    operations.set(stateFile.index, 'managed');
+  }
+  for (const [index, operation] of operations) console.log(`${index}\t${operation}`);
+}
+try { main(); }
+catch (error) { console.error(`setup failed: ${error.message}`); process.exitCode = 1; }
+AGENT_AUTH_52ABCB0691AE5994688D
   "${cat_bin}" > "${scratch_dir}/native/validate-schema.py" <<'AGENT_AUTH_E695311683A398F9FCFC'
 #!/usr/bin/env python3
 """Validate an exact staged JSON value without resolving network references."""
@@ -15846,13 +16337,25 @@ main() {
   init_scratch
   adapter="${harness//-/_}"
   "${adapter}_prepare"
+  if [[ "${action}" != configure ]]; then
+    overwrite=1
+    switch_begin
+    switch_stage_local
+    switch_finish
+    commit_transaction
+    printf '\n%s gateway %s completed locally\n' "${harness}" "${action}"
+    report_transaction
+    return
+  fi
   confirm_existing_setup
+  switch_begin
   load_stored_key
   choose_key
   if [[ "${harness}" != omp ]]; then native_validate_client; fi
   validate_gateway
   "${adapter}_stage"
   stage_key
+  switch_finish
   commit_transaction
   if [[ "${harness}" == omp ]]; then omp_report; else native_report; fi
 }
