@@ -362,6 +362,7 @@ init_scratch() {
   cache_dir="${cache_home}/omp-agent-auth"
   scratch_dir="$(mktemp -d /var/tmp/agent-auth-setup.XXXXXXXX)"
   init_transaction
+  require_switch_tools
 }
 require_switch_tools() {
   [[ "${switch_tools_ready:-0}" == 0 ]] || return 0
@@ -693,7 +694,6 @@ native_report() {
 # All writes/deletions still go through the installer's original transaction.
 switch_begin() {
   local lock_path
-  require_switch_tools
   if [[ "${harness}" == codex && "${action}" != configure ]]; then yq_bin="$(resolve_yq)"; fi
   token_root="${token_root:-${token_dir}}"
   [[ ! -L "${token_root}" && ! -L "${token_dir}" && ! -L "${token_file}" ]] || fail 'gateway state/key paths must not be symlinks'
@@ -724,7 +724,7 @@ switch_stage_local() {
     stage_config "${switch_configs[index]}" "${switch_formats[index]}" "${switch_roles[index]}"
   done
   printf '' > "${scratch_dir}/empty-asset"
-  for target in "${token_file}" "${switch_assets[@]}"; do
+  for target in "${token_file}" ${switch_assets[@]+"${switch_assets[@]}"}; do
     if [[ -f "${target}" ]]; then register_file "${target}" "${target}" asset
     else register_file "${target}" "${scratch_dir}/empty-asset" asset; fi
     if [[ "${target}" == "${token_file}" ]]; then tx_kinds[tx_count-1]=token; fi
@@ -1898,7 +1898,7 @@ function main() {
           fields.push(field);
         }
       }
-      const parents = previous ? previous.absentParents : absentParents(paths, baseline);
+      const parents = previous && state.mode === 'enabled' ? previous.absentParents : absentParents(paths, baseline);
       records.push({ path: file.path, kind: file.kind, format: file.format, role: file.role, fields, absentParents: parents });
       if (action === 'configure') operations.set(file.index, previousState || legacy ? 'managed' : 'write');
     }
