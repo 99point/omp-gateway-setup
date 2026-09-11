@@ -5,6 +5,176 @@
 set +x
 set -euo pipefail
 
+# --- setup/ui.sh ---
+# Terminal prompts: every interactive read comes from /dev/tty, never the
+# streamed program. Non-interactive runs never reach a prompt. Bash 3.2 safe.
+ui_init() {
+  ui_ansi=0; ui_color=0; ui_cursor_hidden=0; ui_reply=''
+  # Menus hide the cursor and hold echo off; the terminal is put back on any
+  # exit path, including Ctrl-C before the transaction installs its own traps
+  # (those call ui_restore as well).
+  trap ui_restore EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM HUP
+  if (( has_tty == 1 )) && [[ "${TERM:-}" != dumb ]]; then ui_ansi=1; fi
+  if (( ui_ansi == 1 )) && [[ -z "${NO_COLOR:-}" ]]; then ui_color=1; fi
+  case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in
+    *[Uu][Tt][Ff]-8*|*[Uu][Tt][Ff]8*) ui_ok='✓'; ui_pick='❯'; ui_step='›'; ui_bad='✗' ;;
+    *) ui_ok='+'; ui_pick='>'; ui_step='>'; ui_bad='x' ;;
+  esac
+  ui_bold=''; ui_dim=''; ui_cyan=''; ui_green=''; ui_yellow=''; ui_red=''; ui_reset=''
+  if (( ui_color == 1 )); then
+    ui_bold=$'\033[1m'; ui_dim=$'\033[2m'; ui_cyan=$'\033[36m'; ui_green=$'\033[32m'
+    ui_yellow=$'\033[33m'; ui_red=$'\033[31m'; ui_reset=$'\033[0m'
+  fi
+}
+# The terminal's real width, or 80 when it cannot be read (a pty without a
+# window size reports 0).
+ui_columns() {
+  local size cols=80
+  if size="$(stty size </dev/tty 2>/dev/null)"; then cols="${size##* }"; fi
+  [[ "${cols}" =~ ^[0-9]+$ ]] && (( cols > 0 )) || cols=80
+  printf '%s' "${cols}"
+}
+ui_restore() {
+  if (( ${ui_cursor_hidden:-0} == 1 )); then printf '\033[?25h' >/dev/tty 2>/dev/null || true; ui_cursor_hidden=0; fi
+  if [[ -n "${ui_tty_state:-}" ]]; then stty "${ui_tty_state}" </dev/tty 2>/dev/null || true; ui_tty_state=''; fi
+}
+# Progress and results go to stdout; only prompts and their echoes use the tty.
+ui_note() { printf '%s %s\n' "${ui_step}" "$*"; }
+ui_done() { printf '%s%s%s %-9s %s\n' "${ui_green}" "${ui_ok}" "${ui_reset}" "$1" "$2"; }
+ui_warn() { printf '%s!%s %s\n' "${ui_yellow}" "${ui_reset}" "$*"; }
+ui_summary() { printf '%s%s%s %-9s %s\n' "${ui_green}" "${ui_ok}" "${ui_reset}" "$1" "$2" >/dev/tty; }
+ui_title() { printf '\n%s%s%s\n' "${ui_bold}" "$*" "${ui_reset}"; }
+# ui_select LABEL DEFAULT_INDEX "value|Label|description"... -> ui_reply=value
+# Arrow keys, j/k, or a digit move the highlight; Enter confirms.
+ui_select() {
+  local label="$1" selected="$2" count index key rest value text description
+  local values=() labels=() descriptions=() width=0 cols line
+  shift 2
+  count=$#
+  for text in "$@"; do
+    value="${text%%|*}"; text="${text#*|}"; description="${text#*|}"; text="${text%%|*}"
+    [[ "${description}" != "${text}" ]] || description=''
+    values[${#values[@]}]="${value}"; labels[${#labels[@]}]="${text}"; descriptions[${#descriptions[@]}]="${description}"
+    (( ${#text} <= width )) || width=${#text}
+  done
+  cols="$(ui_columns)"
+  # A pane too narrow for the widest label would wrap rows and break the
+  # in-place redraw; the numbered prompt needs no redraw.
+  if (( ui_ansi == 0 || cols < width + 6 )); then
+    printf '? %s\n' "${label}" >/dev/tty
+    for ((index=0; index<count; index++)); do
+      printf '  %d) %s' "$((index + 1))" "${labels[index]}" >/dev/tty
+      if [[ -n "${descriptions[index]}" ]]; then printf '  %s' "${descriptions[index]}" >/dev/tty; fi
+      printf '\n' >/dev/tty
+    done
+    while true; do
+      printf 'Choice [1-%d, default %d]: ' "${count}" "$((selected + 1))" >/dev/tty
+      IFS= read -r line </dev/tty || fail "could not read the ${label} choice"
+      case "${line}" in
+        '') break ;;
+        *[!0-9]*) ;;
+        *) if (( line >= 1 && line <= count )); then selected=$((line - 1)); break; fi ;;
+      esac
+      printf 'Enter a number from 1 to %d.\n' "${count}" >/dev/tty
+    done
+    ui_reply="${values[selected]}"
+    ui_summary "${label}" "${labels[selected]}"
+    return 0
+  fi
+  # Echo stays off for the whole menu: a paste or an early Enter during drawing
+  # must not leave stray lines behind. ui_restore puts the terminal back.
+  ui_tty_state="$(stty -g </dev/tty 2>/dev/null || true)"
+  if [[ -n "${ui_tty_state}" ]]; then stty -echo </dev/tty 2>/dev/null || ui_tty_state=''; fi
+  printf '\033[?25l' >/dev/tty; ui_cursor_hidden=1
+  printf '%s?%s %s%s%s\n' "${ui_cyan}" "${ui_reset}" "${ui_bold}" "${label}" "${ui_reset}" >/dev/tty
+  while true; do
+    for ((index=0; index<count; index++)); do
+      description="${descriptions[index]}"
+      if (( cols - width - 8 < 4 )); then description=''
+      elif (( ${#description} > cols - width - 8 )); then description="${description:0:cols - width - 9}…"; fi
+      if (( index == selected )); then
+        printf '  %s%s %-'"${width}"'s%s  %s%s%s\033[K\n' "${ui_cyan}" "${ui_pick}" "${labels[index]}" "${ui_reset}" "${ui_dim}" "${description}" "${ui_reset}" >/dev/tty
+      else
+        printf '    %-'"${width}"'s  %s%s%s\033[K\n' "${labels[index]}" "${ui_dim}" "${description}" "${ui_reset}" >/dev/tty
+      fi
+    done
+    IFS= read -r -s -n 1 key </dev/tty || { ui_restore; fail "could not read the ${label} choice"; }
+    case "${key}" in
+      '') break ;;
+      k|K) selected=$(( (selected + count - 1) % count )) ;;
+      j|J) selected=$(( (selected + 1) % count )) ;;
+      [1-9]) if (( key <= count )); then selected=$((key - 1)); fi ;;
+      $'\033')
+        rest=''
+        IFS= read -r -s -n 2 -t 1 rest </dev/tty || true
+        case "${rest}" in
+          '[A'|OA) selected=$(( (selected + count - 1) % count )) ;;
+          '[B'|OB) selected=$(( (selected + 1) % count )) ;;
+        esac ;;
+    esac
+    printf '\033[%dA' "${count}" >/dev/tty
+  done
+  printf '\033[%dA\033[J' "$((count + 1))" >/dev/tty
+  ui_restore
+  ui_reply="${values[selected]}"
+  ui_summary "${label}" "${labels[selected]}"
+}
+# ui_input LABEL SUMMARY VALIDATOR: VALIDATOR receives the typed text and prints
+# either the normalized value (exit 0) or one reason it was refused (exit 1).
+ui_input() {
+  local label="$1" summary="$2" validator="$3" line prompt reason cols lines
+  while true; do
+    prompt="? ${label} ${ui_step} "
+    printf '%s?%s %s%s%s %s ' "${ui_cyan}" "${ui_reset}" "${ui_bold}" "${label}" "${ui_reset}" "${ui_step}" >/dev/tty
+    IFS= read -r line </dev/tty || fail "could not read the ${label}"
+    line="${line%$'\r'}"
+    if reason="$("${validator}" "${line}")"; then
+      ui_reply="${reason}"
+      if (( ui_ansi == 1 )); then
+        cols="$(ui_columns)"
+        lines=$(( (${#prompt} + ${#line}) / cols + 1 ))
+        printf '\033[%dA\033[J' "${lines}" >/dev/tty
+      fi
+      ui_summary "${summary}" "${ui_reply}"
+      return 0
+    fi
+    printf '%s!%s %s\n' "${ui_yellow}" "${ui_reset}" "${reason}" >/dev/tty
+  done
+}
+# ui_secret LABEL SUMMARY: hidden line; the value never echoes and is never summarized.
+ui_secret() {
+  local label="$1" summary="$2" line
+  while true; do
+    printf '%s?%s %s%s%s %s(hidden)%s %s ' "${ui_cyan}" "${ui_reset}" "${ui_bold}" "${label}" "${ui_reset}" "${ui_dim}" "${ui_reset}" "${ui_step}" >/dev/tty
+    IFS= read -r -s line </dev/tty || { printf '\n' >/dev/tty; fail "could not read the ${label}"; }
+    printf '\n' >/dev/tty
+    line="${line%$'\r'}"
+    if [[ -z "${line}" ]]; then printf '%s!%s nothing was entered\n' "${ui_yellow}" "${ui_reset}" >/dev/tty; continue; fi
+    if [[ "${line}" == *[$' \t']* ]]; then printf '%s!%s a key is one word with no spaces\n' "${ui_yellow}" "${ui_reset}" >/dev/tty; continue; fi
+    break
+  done
+  if (( ui_ansi == 1 )); then printf '\033[1A\033[J' >/dev/tty; fi
+  ui_reply="${line}"
+  ui_summary "${summary}" 'received'
+}
+# ui_confirm QUESTION [yes|no]: returns 0 for yes, 1 for no. Enter takes the default.
+ui_confirm() {
+  local question="$1" default="${2:-no}" hint line
+  if [[ "${default}" == yes ]]; then hint='Y/n'; else hint='y/N'; fi
+  while true; do
+    printf '%s?%s %s %s(%s)%s %s ' "${ui_cyan}" "${ui_reset}" "${question}" "${ui_dim}" "${hint}" "${ui_reset}" "${ui_step}" >/dev/tty
+    IFS= read -r line </dev/tty || fail 'could not read the confirmation'
+    case "${line}" in
+      '') if [[ "${default}" == yes ]]; then return 0; else return 1; fi ;;
+      y|Y|yes|YES|Yes) return 0 ;;
+      n|N|no|NO|No) return 1 ;;
+      *) printf '%s!%s answer y or n\n' "${ui_yellow}" "${ui_reset}" >/dev/tty ;;
+    esac
+  done
+}
+
 # --- setup/options.sh ---
 # Argument parsing and terminal selection never consume the streamed program.
 fail() { printf 'setup failed: %s\n' "$*" >&2; exit 1; }
@@ -12,43 +182,55 @@ usage() {
   cat <<'EOF'
 Usage: agent-auth-setup.sh [--harness NAME] [--unattended] [--url URL]
                            [--profile NAME] [--reuse-key|--new-key] [--overwrite]
-                           [--transport auto|provider-wire|pi-native]
+                           [--transport auto|provider-wire|standard|pi-native]
+                           [--action configure|disable|enable|unset]
 
   --harness NAME  omp (default), claude-code, codex, opencode, or pi
   --unattended    Never prompt; default to OMP unless --harness is given
-  --url URL       Gateway base URL (or AGENT_AUTH_URL); otherwise prompt on /dev/tty
+  --action        Configure (default), disable locally, re-enable, or remove setup
+  --url URL       Gateway host or URL (or AGENT_AUTH_URL); otherwise asked on /dev/tty.
+                  A bare host means https://HOST. HTTP is accepted only on loopback.
   --profile NAME  OMP profile or Codex NAME.config.toml overlay
   --reuse-key     Explicitly choose the stored gateway key
   --new-key       Use AGENT_AUTH_TOKEN or securely prompt for a new key
   --overwrite     Allow replacing existing selected-client config/key files
-  --transport     OMP endpoint protocol: auto-detect (default), provider-wire, pi-native
+  --transport     OMP protocol: auto (default) picks what the gateway and the
+                  installed OMP both support; provider-wire (native-capable OMP),
+                  standard (stock OMP codecs on the gateway's provider routes),
+                  or pi-native (legacy /v1/pi/stream gateways)
 
 Other scopes use the client's own environment: CLAUDE_CONFIG_DIR, CODEX_HOME,
 OPENCODE_CONFIG (explicit file), XDG_CONFIG_HOME, or PI_CODING_AGENT_DIR.
-Only the selected client must be installed. Native setup additionally needs
-Node.js >=18 and Python >=3.10; Claude/Codex/OpenCode need Python jsonschema >=4.18.
-OMP and Codex use checksum-pinned yq v4.53.6. No client or OAuth login is installed.
+Disable/enable/unset need no endpoint or new key and never contact the gateway.
+Only configure requires the selected client (OMP also resolves switch scopes).
+All actions need Node.js >=18. Native configure additionally needs Python >=3.10;
+Claude/Codex/OpenCode configure need Python jsonschema >=4.18.
+OMP and Codex use checksum-pinned yq v4.53.6 (cached/local for switching).
+No client or OAuth login is installed or removed.
 EOF
 }
 parse_options() {
-  gateway_url="${AGENT_AUTH_URL:-}"
+  gateway_url_input="${AGENT_AUTH_URL:-}"
+  gateway_url=''
   profile=''
   harness=''
+  action=''
   unattended=0
   overwrite=0
   omp_transport='auto'
   key_choice="${AGENT_AUTH_KEY_CHOICE:-}"
   while (( $# > 0 )); do
     case "$1" in
-      --url|--profile|--harness|--transport)
+      --url|--profile|--harness|--transport|--action)
         (( $# >= 2 )) || fail "$1 needs a value"
-        case "$1" in --url) gateway_url="$2";; --profile) profile="$2";; --harness) harness="$2";; --transport) omp_transport="$2";; esac
+        case "$1" in --url) gateway_url_input="$2";; --profile) profile="$2";; --harness) harness="$2";; --transport) omp_transport="$2";; --action) action="$2";; esac
         [[ -n "$2" ]] || fail "$1 needs a nonempty value"
         shift 2 ;;
-      --url=*) gateway_url="${1#*=}"; shift ;;
+      --url=*) gateway_url_input="${1#*=}"; shift ;;
       --profile=*) profile="${1#*=}"; shift ;;
       --harness=*) harness="${1#*=}"; [[ -n "${harness}" ]] || fail '--harness needs a value'; shift ;;
       --unattended) unattended=1; shift ;;
+      --action=*) action="${1#*=}"; [[ -n "${action}" ]] || fail '--action needs a value'; shift ;;
       --overwrite) overwrite=1; shift ;;
       --transport=*) omp_transport="${1#*=}"; shift ;;
       --reuse-key)
@@ -67,61 +249,81 @@ parse_options() {
     has_tty=1
     exec 9>&-
   fi
+  ui_init
+  if (( has_tty == 1 )); then ui_title 'Agent gateway setup'; fi
   if [[ -z "${harness}" ]]; then
     harness='omp'
-    if (( has_tty == 1 )); then choose_harness; fi
+    if (( has_tty == 1 )); then
+      ui_select 'Client' 0 'omp|OMP|default' 'claude-code|Claude Code' 'codex|Codex' 'opencode|OpenCode' 'pi|Pi'
+      harness="${ui_reply}"
+    fi
   fi
   case "${harness}" in omp|claude-code|codex|opencode|pi) ;; *) fail 'harness must be omp, claude-code, codex, opencode, or pi';; esac
-  case "${omp_transport}" in auto|provider-wire|pi-native) ;; *) fail '--transport must be auto, provider-wire, or pi-native';; esac
+  if [[ -z "${action}" ]]; then
+    action='configure'
+    if (( has_tty == 1 )); then
+      ui_select 'Action' 0 \
+        'configure|Configure|connect this client to a gateway' \
+        'disable|Disable|back to normal login; keeps the gateway key and settings' \
+        'enable|Enable|back to the saved gateway settings' \
+        'unset|Unset|remove the gateway key and saved settings'
+      action="${ui_reply}"
+    fi
+  fi
+  case "${action}" in configure|disable|enable|unset) ;; *) fail '--action must be configure, disable, enable, or unset';; esac
+  case "${omp_transport}" in auto|provider-wire|standard|pi-native) ;; *) fail '--transport must be auto, provider-wire, standard, or pi-native';; esac
   [[ "${harness}" == omp || "${omp_transport}" == auto ]] || fail '--transport is OMP-only; other clients use their native provider endpoints'
   if [[ -n "${profile}" ]]; then
     [[ "${profile}" =~ ^[a-z0-9][a-z0-9._-]{0,63}$ ]] || fail 'profile names are [a-z0-9][a-z0-9._-]{0,63}'
     case "${harness}" in omp|codex) ;; *) fail '--profile is only supported by OMP and Codex; use the selected client config-directory environment for other scopes';; esac
   fi
-  if [[ -z "${gateway_url}" ]]; then
-    (( has_tty == 1 )) || fail 'set AGENT_AUTH_URL or pass --url when no interactive terminal is available'
-    printf 'Gateway endpoint URL (HTTPS, or HTTP on loopback): ' >/dev/tty
-    IFS= read -r gateway_url </dev/tty || fail 'could not read gateway endpoint'
-    [[ -n "${gateway_url}" ]] || fail 'gateway endpoint cannot be empty'
-  fi
-  [[ "${gateway_url}" != *[$' \t\r\n']* ]] || fail 'gateway URL must not contain whitespace'
-  [[ "${gateway_url}" != *'?'* && "${gateway_url}" != *'#'* ]] || fail 'gateway URL must not contain a query or fragment'
-  while [[ "${gateway_url}" == */ ]]; do gateway_url="${gateway_url%/}"; done
-  if [[ "${gateway_url}" =~ ^https://([^/]+)(/.*)?$ ]]; then
-    [[ "${BASH_REMATCH[1]}" != *'@'* ]] || fail 'gateway URL must not contain credentials'
-  elif [[ "${gateway_url}" =~ ^http://(localhost|127\.0\.0\.1|\[::1\])(:[0-9]+)?(/.*)?$ ]]; then
-    :
-  else
-    fail 'gateway URL must use HTTPS (HTTP is allowed only for loopback)'
-  fi
 }
-choose_harness() {
-  local options=(omp claude-code codex opencode pi) labels=('OMP' 'Claude Code' 'Codex' 'OpenCode' 'Pi')
-  local selected=0 key suffix index
-  printf 'Select client (arrow keys, Enter defaults to OMP)\n' >/dev/tty
-  while true; do
-    for index in 0 1 2 3 4; do
-      if (( index == selected )); then printf '  > %s\033[K\n' "${labels[index]}" >/dev/tty
-      else printf '    %s\033[K\n' "${labels[index]}" >/dev/tty; fi
-    done
-    IFS= read -r -s -n 1 key </dev/tty || fail 'could not read harness choice'
-    case "${key}" in
-      '') harness="${options[selected]}"; return ;;
-      $'\033')
-        suffix=''
-        IFS= read -r -s -n 2 -t 1 suffix </dev/tty || true
-        case "${suffix}" in '[A'|OA) selected=$(( (selected + 4) % 5 ));; '[B'|OB) selected=$(( (selected + 1) % 5 ));; esac ;;
-    esac
-    printf '\033[5A' >/dev/tty
-  done
+# Prints the normalized gateway URL, or one reason and exit 1. A bare host
+# means HTTPS; cleartext HTTP is accepted only on loopback.
+normalize_gateway_url() {
+  local value="$1" host
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  [[ -n "${value}" ]] || { printf 'enter the gateway host or URL, for example gateway.example.com'; return 1; }
+  [[ "${value}" != *[[:space:]]* ]] || { printf 'the gateway URL must not contain spaces'; return 1; }
+  [[ "${value}" == *://* ]] || value="https://${value}"
+  while [[ "${value}" == */ ]]; do value="${value%/}"; done
+  [[ "${value}" != *'?'* && "${value}" != *'#'* ]] || { printf 'the gateway URL must not contain a query or fragment'; return 1; }
+  if [[ "${value}" =~ ^https://([^/]+)(/.*)?$ ]]; then
+    host="${BASH_REMATCH[1]}"
+    [[ "${host}" != *'@'* ]] || { printf 'the gateway URL must not contain credentials'; return 1; }
+  elif [[ "${value}" =~ ^http://(localhost|127\.0\.0\.1|\[::1\])(:[0-9]+)?(/.*)?$ ]]; then
+    :
+  elif [[ "${value}" =~ ^http:// ]]; then
+    printf 'cleartext http:// is accepted only for localhost; use https://'; return 1
+  else
+    printf 'use https://HOST (or a bare host); other schemes are not gateways'; return 1
+  fi
+  printf '%s' "${value}"
+}
+# The endpoint is asked (or taken from --url/AGENT_AUTH_URL) only for configure.
+collect_endpoint() {
+  local reason
+  if [[ -n "${gateway_url_input}" ]]; then
+    if ! reason="$(normalize_gateway_url "${gateway_url_input}")"; then fail "${reason}"; fi
+    gateway_url="${reason}"
+    if (( has_tty == 1 )); then ui_summary 'Gateway' "${gateway_url}"; else ui_done 'Gateway' "${gateway_url}"; fi
+    return 0
+  fi
+  (( has_tty == 1 )) || fail 'set AGENT_AUTH_URL or pass --url when no interactive terminal is available'
+  ui_input 'Gateway host or URL' 'Gateway' normalize_gateway_url
+  gateway_url="${ui_reply}"
 }
 
 # --- setup/transaction.sh ---
 # One owner stages every file, installs tokens before references, and rolls back
-# handled failures in reverse order. Renames are atomic per file, not crash-atomic
-# across files. Backups copy original bytes/mode/mtime without a rename gap.
+# handled failures in reverse order. Renames are atomic per file, not across files.
+# Private backups preserve bytes/mtime; private scratch snapshots retain the
+# original mode as well so rollback can restore it exactly.
 init_transaction() {
   tx_paths=(); tx_candidates=(); tx_originals=(); tx_backups=(); tx_kinds=(); tx_order=()
+  tx_formats=(); tx_roles=(); tx_restore_sources=(); tx_operations=(); tx_backup_allowed=(); tx_applied_sources=()
+  switch_lock=''
   tx_count=0
   tx_order_count=0
   setup_committed=0
@@ -130,7 +332,7 @@ init_transaction() {
   trap 'exit 143' TERM HUP
 }
 confirm_existing_setup() {
-  local target answer
+  local target
   local existing=()
   for target in "${setup_targets[@]}"; do
     if [[ -e "${target}" || -L "${target}" ]]; then existing+=("${target}"); fi
@@ -140,15 +342,25 @@ confirm_existing_setup() {
   (( has_tty == 1 )) || fail 'selected-client configuration or key already exists; rerun with --overwrite to consent, or leave it alone'
   printf 'Existing %s configuration/key files:\n' "${harness}" >/dev/tty
   for target in "${existing[@]}"; do printf '  %s\n' "${target/#${HOME}/\~}" >/dev/tty; done
-  while true; do
-    printf 'Overwrite gateway settings/key in this scope? Unrelated settings stay intact. [y/N]: ' >/dev/tty
-    IFS= read -r answer </dev/tty || fail 'could not read overwrite choice'
-    case "${answer}" in
-      y|Y|yes|YES) overwrite=1; return 0 ;;
-      ''|n|N|no|NO) printf 'Left existing configuration and key alone; no user files changed.\n'; exit 0 ;;
-      *) printf 'Enter y to overwrite or n to leave alone.\n' >/dev/tty ;;
-    esac
+  if ui_confirm 'Replace the gateway settings and key in this scope? Unrelated settings stay intact' no; then
+    overwrite=1
+    return 0
+  fi
+  printf 'Left existing configuration and key alone; no user files changed.\n'
+  exit 0
+}
+resolve_config_directory() {
+  local parent="$1" suffix=''
+  [[ "${parent}" == /* && "${parent}" != *[$'\t\r\n']* ]] || fail 'config directory must be one absolute path'
+  while [[ ! -d "${parent}" ]]; do
+    suffix="/$(basename "${parent}")${suffix}"
+    parent="$(dirname "${parent}")"
   done
+  printf '%s%s\n' "$(cd -P "${parent}" && pwd)" "${suffix}"
+}
+resolve_token_directory() {
+  [[ ! -L "$1" ]] || fail 'gateway state/key paths must not be symlinks'
+  resolve_config_directory "$1"
 }
 resolve_config_target() {
   local path="$1" link_target hops=0
@@ -161,10 +373,11 @@ resolve_config_target() {
     else path="$(cd -P "$(dirname "${path}")" && pwd)/${link_target}"; fi
   done
   [[ ! -e "${path}" || -f "${path}" ]] || fail "config is not a regular file: ${path}"
-  printf '%s\n' "${path}"
+  printf '%s/%s\n' "$(resolve_config_directory "$(dirname "${path}")")" "$(basename "${path}")"
 }
 register_file() {
   local target="$1" source="$2" kind="$3" index original staged
+  [[ "${target}" == /* && "${target}" != *[$'\t\r\n']* ]] || fail 'transaction target must be one absolute path'
   for ((index=0; index<tx_count; index++)); do
     [[ "${tx_paths[index]}" != "${target}" ]] || fail "duplicate transaction target: ${target}"
   done
@@ -179,6 +392,12 @@ register_file() {
   tx_originals[tx_count]="${original}"
   tx_backups[tx_count]=''
   tx_kinds[tx_count]="${kind}"
+  tx_formats[tx_count]=''
+  tx_roles[tx_count]=''
+  tx_restore_sources[tx_count]=''
+  tx_operations[tx_count]=write
+  tx_backup_allowed[tx_count]=1
+  tx_applied_sources[tx_count]=''
   ((tx_count += 1))
   cp "${source}" "${staged}"
   chmod 0600 "${staged}"
@@ -190,6 +409,7 @@ mark_applied() {
 commit_transaction() {
   local pass index target original backup staged
   # Precheck every snapshot before any replacement; don't overwrite concurrent edits.
+  check_switch_scope
   for ((index=0; index<tx_count; index++)); do
     target="${tx_paths[index]}"; original="${tx_originals[index]}"
     [[ ! -L "${target}" ]] || fail "config changed during setup: ${target}"
@@ -199,21 +419,47 @@ commit_transaction() {
       [[ ! -e "${target}" ]] || fail "config appeared during setup: ${target}"
     fi
   done
-  for pass in token asset config; do
+  # Switch state is written first and deleted last: after an abrupt stop the
+  # files that did land are always described by it, so a later switch or
+  # configure can finish or undo them. Tokens still precede the configs that
+  # reference them.
+  for pass in state token asset config cleanup state-delete; do
     for ((index=0; index<tx_count; index++)); do
-      [[ "${tx_kinds[index]}" == "${pass}" ]] || continue
+      case "${pass}" in
+        state) [[ "${tx_kinds[index]}" == state && "${tx_operations[index]}" != delete ]] || continue ;;
+        state-delete) [[ "${tx_kinds[index]}" == state && "${tx_operations[index]}" == delete ]] || continue ;;
+        *) [[ "${tx_kinds[index]}" == "${pass}" ]] || continue ;;
+      esac
+      [[ "${tx_operations[index]}" != keep ]] || continue
       target="${tx_paths[index]}"; original="${tx_originals[index]}"; staged="${tx_candidates[index]}"
+      # Recheck at the mutation boundary too: earlier replacements may take time.
+      check_switch_scope
+      [[ ! -L "${target}" ]] || fail "config changed during setup: ${target}"
+      if [[ -n "${original}" ]]; then
+        [[ -f "${target}" ]] && cmp -s "${original}" "${target}" || fail "config changed during setup: ${target}"
+      else
+        [[ ! -e "${target}" ]] || fail "config appeared during setup: ${target}"
+      fi
+      if [[ "${tx_operations[index]}" == delete ]]; then
+        mark_applied "${index}"
+        rm -f "${target}"
+        continue
+      fi
+      tx_applied_sources[index]="${scratch_dir}/applied-${index}"
+      cp "${staged}" "${tx_applied_sources[index]}"
       if [[ -n "${original}" ]] && cmp -s "${staged}" "${target}"; then
         # Keep the original mtime on idempotent runs. Snapshot also covers chmod rollback.
         mark_applied "${index}"
         chmod 0600 "${target}"
         continue
       fi
-      if [[ -n "${original}" && "${pass}" != token ]]; then
-        backup="${target}.pre-agent-auth.$(date -u +%Y%m%dT%H%M%SZ).$$"
-        [[ ! -e "${backup}" && ! -L "${backup}" ]] || fail "backup already exists: ${backup}"
+      if [[ -n "${original}" && "${pass}" == config && "${action}" == configure && "${tx_backup_allowed[index]}" == 1 ]]; then
+        # Create privately before copying: cp -p followed by chmod would expose
+        # embedded keys at the original mode until chmod completes.
+        backup="$(mktemp "${target}.pre-agent-auth.$(date -u +%Y%m%dT%H%M%SZ).XXXXXXXX")"
         tx_backups[index]="${backup}"
-        cp -p "${original}" "${backup}"
+        cp "${original}" "${backup}"
+        touch -r "${original}" "${backup}"
       fi
       mark_applied "${index}"
       mv -f "${staged}" "${target}"
@@ -225,11 +471,19 @@ commit_transaction() {
 cleanup() {
   local status=$? index order target original restore
   trap - EXIT INT TERM HUP
+  ui_restore
   set +e
   if (( setup_committed == 0 )); then
     for ((order=tx_order_count-1; order>=0; order--)); do
       index="${tx_order[order]}"
       target="${tx_paths[index]}"; original="${tx_originals[index]}"
+      # Never roll an unrelated writer back to our snapshot after a failed commit.
+      if [[ -L "${target}" ]] || { [[ -e "${target}" ]] &&
+        ! { [[ -n "${original}" ]] && cmp -s "${original}" "${target}"; } &&
+        ! { [[ -n "${tx_applied_sources[index]}" ]] && cmp -s "${tx_applied_sources[index]}" "${target}"; }; }; then
+        printf 'setup rollback refused a concurrent edit; originals remain at %s; lock remains at %s\n' "${scratch_dir}" "${switch_lock}" >&2
+        exit "${status}"
+      fi
       if [[ -n "${original}" ]]; then
         restore="$(mktemp "${target}.rollback.XXXXXXXX")"
         if [[ -z "${restore}" ]] || ! cp -p "${original}" "${restore}" || ! mv -f "${restore}" "${target}"; then
@@ -248,13 +502,21 @@ cleanup() {
   for ((index=0; index<tx_count; index++)); do
     [[ -z "${tx_candidates[index]}" ]] || rm -f "${tx_candidates[index]}"
   done
+  # Only this process's own lock generation is released; a reclaimed lock
+  # belongs to whoever wrote its pid.
+  if [[ -n "${switch_lock}" && -f "${switch_lock}/pid" && "$(<"${switch_lock}/pid")" == "$$" ]]; then rm -rf "${switch_lock}"; fi
   rm -rf "${scratch_dir}"
   exit "${status}"
 }
 report_transaction() {
   local index
   for ((index=0; index<tx_count; index++)); do
-    printf '  %-8s %s (0600)\n' "${tx_kinds[index]}" "${tx_paths[index]/#${HOME}/\~}"
+    [[ "${tx_operations[index]}" != keep ]] || continue
+    if [[ "${tx_operations[index]}" == delete ]]; then
+      printf '  removed  %s\n' "${tx_paths[index]/#${HOME}/\~}"
+    else
+      printf '  %-8s %s (0600)\n' "${tx_kinds[index]}" "${tx_paths[index]/#${HOME}/\~}"
+    fi
     if [[ -n "${tx_backups[index]}" ]]; then printf '  backup   %s\n' "${tx_backups[index]/#${HOME}/\~}"; fi
   done
 }
@@ -264,12 +526,12 @@ report_transaction() {
 readonly YQ_VERSION='v4.53.6'
 require_executable() {
   local value
-  value="$(command -v "$1")" || fail "$1 is required; install the selected client/prerequisite first"
+  value="$(command -v "$1")" || fail "${2:-$1 is required; install the selected client/prerequisite first}"
   [[ "${value}" == /* && -x "${value}" ]] || fail "$1 must resolve to an absolute executable path"
   printf '%s\n' "${value}"
 }
 init_scratch() {
-  command -v curl >/dev/null 2>&1 || fail 'curl is required'
+  if [[ "${action}" == configure ]]; then command -v curl >/dev/null 2>&1 || fail 'curl is required'; fi
   command -v env >/dev/null 2>&1 || fail 'env is required'
   cat_bin="$(require_executable cat)"
   umask 077
@@ -278,17 +540,23 @@ init_scratch() {
   cache_dir="${cache_home}/omp-agent-auth"
   scratch_dir="$(mktemp -d /var/tmp/agent-auth-setup.XXXXXXXX)"
   init_transaction
+  require_switch_tools
+}
+require_switch_tools() {
+  [[ "${switch_tools_ready:-0}" == 0 ]] || return 0
+  node_bin="$(require_executable node 'Node.js >=18 is required by the installer, including OMP setup and local switching')"
+  "${node_bin}" -e 'if (Number(process.versions.node.split(".")[0]) < 18) process.exit(1)' || fail 'Node.js >=18 is required'
+  unpack_native_payload
+  switch_tools_ready=1
 }
 require_native_tools() {
   validation_home="${scratch_dir}/client-home"
-  node_bin="$(require_executable node)"
+  require_switch_tools
   python_bin="$(require_executable python3)"
-  "${node_bin}" -e 'if (Number(process.versions.node.split(".")[0]) < 18) process.exit(1)' || fail 'Node.js >=18 is required'
   "${python_bin}" -c 'import sys; assert sys.version_info >= (3, 10)' || fail 'Python >=3.10 is required'
   if [[ "${harness}" != pi ]]; then
     "${python_bin}" -c 'from jsonschema import Draft7Validator; from referencing import Registry' >/dev/null 2>&1 || fail 'Python jsonschema >=4.18 is required (install it in your Python environment first)'
   fi
-  unpack_native_payload
 }
 sha256_file() {
   local file="$1" output
@@ -344,6 +612,7 @@ resolve_yq() {
       return
     fi
   fi
+  [[ "${action}" == configure ]] || fail 'local switching needs the cached YAML/TOML helper; restore the setup cache or set AGENT_AUTH_YQ_BIN to a local yq v4.53.6 executable (no download attempted)'
 
   download="${scratch_dir}/${asset}"
   curl --fail --location --silent --show-error \
@@ -368,12 +637,26 @@ load_stored_key() {
   [[ ! -L "${token_dir}" ]] || fail 'gateway token directory must not be a symlink'
   [[ ! -e "${token_file}" || -f "${token_file}" ]] || fail "stored gateway key is not a regular file: ${token_file}"
   [[ ! -L "${token_file}" ]] || fail "stored gateway key must not be a symlink: ${token_file}"
-  stored_token=''; stored_source=''
+  stored_token=''; stored_source=''; stored_gateway=''
   if [[ -f "${token_file}" ]]; then
     stored_token="$(<"${token_file}")"
     if [[ -n "${stored_token}" ]]; then stored_source="${token_file/#${HOME}/\~}"; fi
   fi
+  # The switch state records which gateway issued the stored key (installer >= this
+  # version); older state has no record, so the origin stays unknown.
+  if [[ -n "${stored_token}" && -f "${switch_state}" ]]; then
+    stored_gateway="$("${node_bin}" -e '
+      try { const state = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8"));
+        if (typeof state.gateway === "string") process.stdout.write(state.gateway); } catch {}
+    ' "${switch_state}" 2>/dev/null || true)"
+  fi
   if [[ "${harness}" == omp ]]; then omp_recover_embedded_key; fi
+}
+prompt_new_token() {
+  (( has_tty == 1 )) || fail 'set AGENT_AUTH_TOKEN or run from an interactive terminal to enter a new key'
+  ui_secret 'Gateway key' 'Key'
+  token="${ui_reply}"
+  token_source='entered'
 }
 choose_key() {
   explicit_token="${AGENT_AUTH_TOKEN:-}"
@@ -389,30 +672,19 @@ choose_key() {
   fi
 
   prompt_choice() {
-    local answer
-    printf 'A gateway key already exists (%s).\n' "${existing_source}" >/dev/tty
-    if [[ -n "${explicit_token}" && "${explicit_token}" != "${existing_token}" ]]; then
-      printf 'AGENT_AUTH_TOKEN contains a different key; choose new to use it.\n' >/dev/tty
+    local reuse_label default=0
+    reuse_label="Reuse the stored key|${existing_source}"
+    if [[ -n "${stored_gateway}" && "${stored_gateway}" != "${gateway_url}" ]]; then
+      printf '%s!%s the stored key was issued by %s; %s needs its own key\n' "${ui_yellow}" "${ui_reset}" "${stored_gateway}" "${gateway_url#*://}" >/dev/tty
+      reuse_label="Reuse the stored key|issued by ${stored_gateway#*://}"
+      default=1
     fi
-    while true; do
-      printf '  1) Set up using the same key\n  2) Set up using a new key\nChoice [1-2]: ' >/dev/tty
-      IFS= read -r answer </dev/tty || fail 'could not read key choice'
-      case "${answer}" in
-        1|same|'') key_choice='same'; return ;;
-        2|new) key_choice='new'; return ;;
-        *) printf 'Enter 1 or 2.\n' >/dev/tty ;;
-      esac
-    done
-  }
-
-  prompt_new_token() {
-    local entered
-    (( has_tty == 1 )) || fail 'set AGENT_AUTH_TOKEN or run from an interactive terminal to enter a new key'
-    printf 'Paste the minted gateway key (input is hidden): ' >/dev/tty
-    IFS= read -r -s entered </dev/tty || fail 'could not read gateway key'
-    printf '\n' >/dev/tty
-    [[ -n "${entered}" ]] || fail 'gateway key cannot be empty'
-    printf '%s' "${entered}"
+    if [[ -n "${explicit_token}" && "${explicit_token}" != "${existing_token}" ]]; then
+      ui_select 'Key' "${default}" "same|${reuse_label}" 'new|Use AGENT_AUTH_TOKEN|a different key is exported'
+    else
+      ui_select 'Key' "${default}" "same|${reuse_label}" "new|Paste a new key|minted at ${gateway_url}/admin"
+    fi
+    key_choice="${ui_reply}"
   }
 
   if [[ -n "${existing_token}" ]]; then
@@ -431,12 +703,21 @@ choose_key() {
   fi
 
   token=''
+  token_source=''
+  token_env_name=''
   if [[ "${key_choice}" == same ]]; then
     token="${existing_token}"
+    token_source='stored'
+    if [[ "${existing_source}" == AGENT_AUTH_TOKEN || "${existing_source}" == AUTH_GATEWAY_TOKEN ]]; then
+      token_source='env'
+      token_env_name="${existing_source}"
+    fi
   elif [[ -n "${explicit_token}" ]]; then
     token="${explicit_token}"
+    token_source='env'
+    token_env_name='AGENT_AUTH_TOKEN'
   else
-    token="$(prompt_new_token)"
+    prompt_new_token
   fi
   [[ -n "${token}" ]] || fail 'gateway key cannot be empty'
   [[ "${token}" != *$'\n'* && "${token}" != *$'\r'* ]] || fail 'gateway key must be one line'
@@ -464,73 +745,183 @@ gateway_request() {
     ulimit -f 4096
     curl --silent --show-error --retry 0 --max-filesize 2097152 \
       --output "${destination}" --write-out '%{http_code}' \
-      --header "@${header_file}" --connect-timeout 10 --max-time 30 "$@" "${url}"
-  )"; then fail 'gateway validation failed or exceeded its bounded response limit'; fi
+      --header "@${header_file}" --connect-timeout 10 --max-time 30 "$@" "${url}" \
+      2> "${scratch_dir}/curl.stderr"
+  )"; then fail "could not reach ${url}: $(curl_reason)"; fi
   [[ "$(wc -c < "${destination}")" -le 2097152 ]] || fail 'gateway validation response is too large'
   printf '%s' "${status}"
 }
-gateway_catalog() {
-  local path="$1" destination="$2" status
-  status="$(gateway_request "${gateway_url}${path}" "${destination}")"
-  case "${status}" in
-    200) ;;
-    401|403) fail "the gateway refused this key (${status})" ;;
-    *) fail "gateway model catalog returned HTTP ${status}" ;;
-  esac
+curl_reason() {
+  local line
+  line="$(tail -n 1 "${scratch_dir}/curl.stderr" 2>/dev/null || true)"
+  line="${line#curl: }"
+  printf '%s' "${line:-connection failed or the response exceeded the bounded limit}"
 }
-validate_gateway() {
+# Unauthenticated liveness probe. Prints the HTTP status, or 'unreachable'.
+gateway_reach() {
+  local url="$1" status
+  if status="$(curl --silent --show-error --retry 0 --max-filesize 65536 --output /dev/null \
+      --write-out '%{http_code}' --connect-timeout 10 --max-time 20 "${url}/healthz" 2> "${scratch_dir}/curl.stderr")"; then
+    printf '%s' "${status}"
+  else
+    printf 'unreachable'
+  fi
+}
+# Asked-for endpoints get a liveness check before any key is requested, so a
+# typo is corrected in place instead of surfacing as a refused key later.
+confirm_gateway_reachable() {
+  local status
+  while true; do
+    ui_note "Checking ${gateway_url}"
+    status="$(gateway_reach "${gateway_url}")"
+    gateway_healthz="${status}"
+    if [[ "${status}" != unreachable ]]; then
+      if [[ "${status}" != 200 ]]; then ui_warn "${gateway_url}/healthz answered HTTP ${status}; continuing, but this may not be a gateway endpoint"; fi
+      return 0
+    fi
+    if (( has_tty == 1 )) && [[ -z "${gateway_url_input}" ]]; then
+      printf '%s!%s could not reach %s: %s\n' "${ui_yellow}" "${ui_reset}" "${gateway_url}" "$(curl_reason)" >/dev/tty
+      ui_input 'Gateway host or URL' 'Gateway' normalize_gateway_url
+      gateway_url="${ui_reply}"
+      continue
+    fi
+    fail "could not reach ${gateway_url}: $(curl_reason)"
+  done
+}
+write_header_file() {
   header_file="${scratch_dir}/authorization-header"
   printf 'Authorization: Bearer %s\n' "${token}" > "${header_file}"
   chmod 0600 "${header_file}"
+}
+refusal_text() {
+  local status="$1" host="${gateway_url#*://}" text
+  text="${host} refused this key (HTTP ${status})."
+  case "${token_source}" in
+    stored)
+      if [[ -n "${stored_gateway}" && "${stored_gateway}" != "${gateway_url}" ]]; then
+        text+=$'\n'"  The stored key was issued by ${stored_gateway}; keys are minted per gateway and do not carry over."
+      else
+        text+=$'\n'"  The stored key (${existing_source}) is no longer accepted: it was revoked, or it was minted by another gateway."
+      fi ;;
+    env) text+=$'\n'"  The exported ${token_env_name} is not a key ${host} recognizes." ;;
+    *) text+=$'\n'"  ${host} does not recognize the key you pasted." ;;
+  esac
+  if [[ "${token}" != s99dev.* ]]; then
+    text+=$'\n''  It is not a personal gateway key either: those start with s99dev. (provider API keys, box leases and the gateway root do not work here).'
+  fi
+  if [[ "${status}" == 403 ]]; then text+=$'\n''  HTTP 403 means the bearer was recognized but is not allowed to read the model catalog.'; fi
+  if [[ "${gateway_healthz:-200}" != 200 ]]; then text+=$'\n'"  Note: ${gateway_url}/healthz answered HTTP ${gateway_healthz}; check that this is the gateway's public endpoint."; fi
+  text+=$'\n'"  Mint a key for ${host} in its console (${gateway_url}/admin) and paste that one."
+  printf '%s' "${text}"
+}
+# Fetches an authenticated catalog. 401/403 explain the refusal and, on a
+# terminal, offer a different key (before anything is staged). With
+# allow_missing=1 a 404 returns status 4 so callers can treat the route as absent.
+gateway_catalog() {
+  local path="$1" destination="$2" allow_missing="${3:-0}" status attempts=0
+  while true; do
+    status="$(gateway_request "${gateway_url}${path}" "${destination}")" || exit 1
+    case "${status}" in
+      200) return 0 ;;
+      401|403)
+        refusal="$(refusal_text "${status}")"
+        if (( has_tty == 1 && attempts < 3 )) && [[ "${token_source}" != env ]]; then
+          printf '%s!%s %s\n' "${ui_yellow}" "${ui_reset}" "${refusal}" >/dev/tty
+          ui_select 'Key refused' 0 'retry|Paste a different key' 'quit|Quit without changing anything'
+          if [[ "${ui_reply}" == retry ]]; then
+            prompt_new_token
+            write_header_file
+            attempts=$((attempts + 1))
+            continue
+          fi
+          printf 'Left %s alone; no user files changed.\n' "${harness}"
+          exit 0
+        fi
+        fail "${refusal}" ;;
+      404) if (( allow_missing == 1 )); then return 4; fi; fail "${gateway_url}${path} is not served by this gateway (HTTP 404)" ;;
+      *) fail "${gateway_url}${path} returned HTTP ${status}" ;;
+    esac
+  done
+}
+# Presence probes set probe_result to present/absent; anything else is fatal
+# here, in the parent shell, so a refusal can never be mistaken for absence.
+catalog_only_bearer() {
+  fail "this key can read the catalog but cannot make model calls (HTTP $1 on $2); it is a catalog-only bearer such as the gateway root, not a personal key. Mint a personal key at ${gateway_url}/admin"
+}
+# provider-wire route: 400 = present (metadata validation), 404 = absent.
+probe_provider_wire_route() {
+  local provider="$1" probe_status
+  probe_status="$(gateway_request "${gateway_url}/v1/provider-wire/${provider}" "${scratch_dir}/probe-response" \
+    --request POST --header 'Content-Type: application/json' --header 'x-omp-provider-wire-version: 1' \
+    --data-binary "@${scratch_dir}/probe.json")" || exit 1
+  case "${probe_status}" in
+    400) probe_result=present ;;
+    404) probe_result=absent ;;
+    401|403) catalog_only_bearer "${probe_status}" "/v1/provider-wire/${provider}" ;;
+    *) fail "gateway provider-wire route for ${provider} returned HTTP ${probe_status}; expected its 400 metadata validation" ;;
+  esac
+}
+# standard provider route: an empty body is refused at intake (400, no model
+# named) before any provider is contacted; 404 = the provider's API is not served.
+probe_standard_route() {
+  local provider="$1" path probe_status
+  if [[ "${provider}" == anthropic ]]; then path='/anthropic/v1/messages'; else path="/${provider}/v1/responses"; fi
+  probe_status="$(gateway_request "${gateway_url}${path}" "${scratch_dir}/probe-response" \
+    --request POST --header 'Content-Type: application/json' --data-binary "@${scratch_dir}/probe.json")" || exit 1
+  case "${probe_status}" in
+    400) probe_result=present ;;
+    404) probe_result=absent ;;
+    401|403) catalog_only_bearer "${probe_status}" "${path}" ;;
+    *) fail "gateway route ${path} returned HTTP ${probe_status}; expected its 400 body validation" ;;
+  esac
+}
+probe_pi_native_route() {
+  local probe_status
+  probe_status="$(gateway_request "${gateway_url}/v1/pi/stream" "${scratch_dir}/probe-response" \
+    --request POST --header 'Content-Type: application/json' --data-binary "@${scratch_dir}/probe.json")" || exit 1
+  case "${probe_status}" in
+    400) probe_result=present ;;
+    404) probe_result=absent ;;
+    401|403) catalog_only_bearer "${probe_status}" '/v1/pi/stream' ;;
+    *) fail "legacy OMP stream route returned HTTP ${probe_status}; expected its 400 body validation" ;;
+  esac
+}
+validate_gateway() {
+  write_header_file
   catalog_file="${scratch_dir}/catalog.json"
+  printf '{}\n' > "${scratch_dir}/probe.json"
+  ui_note "Reading the model catalog from ${gateway_url}"
   gateway_catalog /v1/models "${catalog_file}"
   if [[ "${harness}" != omp ]]; then
-    # Catalog metadata and raw request IDs must agree before any config is staged.
+    # Catalog metadata and raw request IDs must agree before any config is staged,
+    # and the key must be allowed on the model route (the gateway root is not).
     "${node_bin}" "${scratch_dir}/native/catalog.cjs" providers "${harness}" "${catalog_file}" > "${scratch_dir}/native-providers"
     while IFS= read -r provider; do
-      gateway_catalog "/${provider}/v1/models" "${scratch_dir}/${provider}-catalog.json"
+      if ! gateway_catalog "/${provider}/v1/models" "${scratch_dir}/${provider}-catalog.json" 1; then
+        fail "${gateway_url} has no native ${provider} route (/${provider}/v1/models is HTTP 404); ${harness} needs a gateway that serves the provider's own API"
+      fi
+      probe_standard_route "${provider}"
+      [[ "${probe_result}" == present ]] || fail "${gateway_url} serves the ${provider} catalog but not its model route; ${harness} needs a gateway that serves the provider's own API"
     done < "${scratch_dir}/native-providers"
     "${node_bin}" "${scratch_dir}/native/catalog.cjs" normalize "${harness}" "${catalog_file}" "${scratch_dir}" > "${scratch_dir}/native-catalog.json"
   else
     model_ids_file="${scratch_dir}/model-ids"
+    catalog_ids_file="${scratch_dir}/catalog-model-ids"
     if ! AGENT_AUTH_YQ_ACTION='catalog-model-ids' "${yq_bin}" eval -r \
-      '.data[] | select((.id | type) == "!!str") | .id' "${catalog_file}" > "${model_ids_file}"; then
+      '.data[] | select((.id | type) == "!!str") | .id' "${catalog_file}" > "${catalog_ids_file}"; then
       fail 'gateway model catalog is not valid JSON'
     fi
     providers=(); seen_providers=' '
+    : > "${model_ids_file}"
     while IFS= read -r model_id; do
       [[ -n "${model_id}" && "${model_id}" == */* ]] || continue
       provider="${model_id%%/*}"
-      case "${provider}" in anthropic|openai-codex) ;; *) fail 'gateway advertised an unsupported provider';; esac
+      case "${provider}" in anthropic|openai-codex) ;; *) continue;; esac
+      printf '%s\n' "${model_id}" >> "${model_ids_file}"
       if [[ "${seen_providers}" != *" ${provider} "* ]]; then providers+=("${provider}"); seen_providers+="${provider} "; fi
-    done < "${model_ids_file}"
+    done < "${catalog_ids_file}"
     (( ${#providers[@]} > 0 )) || fail 'gateway advertises no supported providers'
-    printf '{}\n' > "${scratch_dir}/probe.json"
-    if [[ "${omp_transport}" != pi-native ]]; then
-      native_routes=0; missing_routes=0
-      for provider in "${providers[@]}"; do
-        probe_status="$(gateway_request "${gateway_url}/v1/provider-wire/${provider}" "${scratch_dir}/probe-response" \
-          --request POST --header 'Content-Type: application/json' --header 'x-omp-provider-wire-version: 1' \
-          --data-binary "@${scratch_dir}/probe.json")"
-        case "${probe_status}" in
-          400) ((native_routes += 1)) ;;
-          404) ((missing_routes += 1)) ;;
-          *) fail "gateway provider-wire route for ${provider} returned HTTP ${probe_status}; expected its 400 metadata validation" ;;
-        esac
-      done
-      if (( native_routes == ${#providers[@]} )); then
-        omp_transport='provider-wire'
-      elif [[ "${omp_transport}" == auto ]] && (( missing_routes == ${#providers[@]} )); then
-        omp_transport='pi-native'
-      else
-        fail 'gateway does not consistently support the selected OMP protocol'
-      fi
-    fi
-    if [[ "${omp_transport}" == pi-native ]]; then
-      probe_status="$(gateway_request "${gateway_url}/v1/pi/stream" "${scratch_dir}/probe-response" \
-        --request POST --header 'Content-Type: application/json' --data-binary "@${scratch_dir}/probe.json")"
-      [[ "${probe_status}" == 400 ]] || fail "legacy OMP stream route returned HTTP ${probe_status}; expected its 400 body validation"
-    fi
+    omp_select_transport
     omp_validate_client
   fi
   rm -f "${header_file}"
@@ -539,7 +930,7 @@ validate_gateway() {
 # --- setup/native.sh ---
 # Native adapters share staging and validation mechanics, not client schemas.
 native_prepare() {
-  client_bin="$(require_executable "$1")"
+  if [[ "${action}" == configure ]]; then client_bin="$(require_executable "$1")"; fi
 }
 native_validate_client() {
   require_native_tools
@@ -555,11 +946,13 @@ native_client() {
 # Snapshot before parsing/merging. All adapter edits use this immutable source,
 # never a live file that might change between parsing and transaction admission.
 stage_config() {
-  local target="$1" format="${2:-json}" empty
+  local target="$1" format="${2:-json}" role="${3:-config}" empty
   empty="${scratch_dir}/empty-${format}"
   if [[ "${format}" == toml ]]; then printf '' > "${empty}"; else printf '{}\n' > "${empty}"; fi
   if [[ -f "${target}" ]]; then register_file "${target}" "${target}" config
   else register_file "${target}" "${empty}" config; fi
+  tx_formats[tx_count-1]="${format}"
+  tx_roles[tx_count-1]="${role}"
   staged_config="${tx_candidates[tx_count-1]}"
   source_config="${tx_originals[tx_count-1]}"
   if [[ -z "${source_config}" ]]; then source_config="${empty}"; fi
@@ -570,10 +963,11 @@ native_schema() {
   "${python_bin}" "${scratch_dir}/native/validate-schema.py" "${harness}" "${value}"
 }
 native_report() {
-  printf '\n%s gateway configuration installed\n' "${harness}"
+  ui_title "${harness} gateway configuration installed"
   printf '  gateway  %s\n' "${gateway_url}"
   report_transaction
   printf '\nCatalog/config validation only; no provider inference was submitted.\n'
+  printf 'Undo: rerun this setup and choose Disable (keeps the key), or Unset (removes it).\n'
   case "${harness}" in
     claude-code)
       printf 'Run: CLAUDE_CONFIG_DIR=%s claude\n' "$(quote_shell_word "${client_dir}")"
@@ -593,19 +987,139 @@ native_report() {
   esac
 }
 
+# --- setup/switch.sh ---
+# Scope-local state contains owned-field values, never a whole-file restore image.
+# All writes/deletions still go through the installer's original transaction.
+switch_begin() {
+  local lock_path
+  if [[ "${harness}" == codex && "${action}" != configure ]]; then yq_bin="$(resolve_yq)"; fi
+  token_root="${token_root:-${token_dir}}"
+  [[ ! -L "${token_root}" && ! -L "${token_dir}" && ! -L "${token_file}" ]] || fail 'gateway state/key paths must not be symlinks'
+  switch_state="${token_dir}/switch.json"
+  [[ ! -L "${switch_state}" ]] || fail 'gateway switch state must not be a symlink'
+  mkdir -p "${token_dir}"
+  switch_token_directory="$(cd -P "${token_dir}" && pwd)"
+  lock_path="${token_dir}/.setup-lock"
+  if ! mkdir "${lock_path}" 2>/dev/null; then
+    # An interrupted run leaves its lock behind; only a live owner keeps it.
+    # Reclaiming is serialized by a second directory so exactly one contender
+    # re-reads the owner and replaces the lock; every other contender is told
+    # to rerun, and a fresh mkdir still decides ownership.
+    local owner_pid='' reclaim="${lock_path}.reclaim" reclaimer=''
+    if [[ -f "${lock_path}/pid" ]]; then owner_pid="$(<"${lock_path}/pid")"; fi
+    if [[ "${owner_pid}" =~ ^[0-9]+$ ]] && kill -0 "${owner_pid}" 2>/dev/null; then
+      fail "another setup (pid ${owner_pid}) owns this scope; let it finish first"
+    elif [[ "${owner_pid}" =~ ^[0-9]+$ ]]; then
+      if ! mkdir "${reclaim}" 2>/dev/null; then
+        if [[ -f "${reclaim}/pid" ]]; then reclaimer="$(<"${reclaim}/pid")"; fi
+        if [[ "${reclaimer}" =~ ^[0-9]+$ ]] && ! kill -0 "${reclaimer}" 2>/dev/null; then rm -rf "${reclaim}"; fi
+        fail 'another setup is taking over this scope at the same moment; rerun in a moment'
+      fi
+      printf '%s\n' "$$" > "${reclaim}/pid"
+      owner_pid=''
+      if [[ -f "${lock_path}/pid" ]]; then owner_pid="$(<"${lock_path}/pid")"; fi
+      if [[ "${owner_pid}" =~ ^[0-9]+$ ]] && ! kill -0 "${owner_pid}" 2>/dev/null; then
+        rm -rf "${lock_path}"
+        ui_warn "removed the lock left by an interrupted setup (pid ${owner_pid}): ${lock_path/#${HOME}/\~}"
+      fi
+      if ! mkdir "${lock_path}" 2>/dev/null; then
+        rm -rf "${reclaim}"
+        fail 'another setup took this scope at the same moment; rerun after it finishes'
+      fi
+      printf '%s\n' "$$" > "${lock_path}/pid"
+      rm -rf "${reclaim}"
+    else
+      fail "another setup owns this scope, or a previous setup was interrupted; verify no setup is running before removing ${lock_path}"
+    fi
+  else
+    printf '%s\n' "$$" > "${lock_path}/pid"
+  fi
+  switch_lock="${lock_path}"
+  chmod 0700 "${token_root}" "${token_dir}"
+  printf '{}\n' > "${scratch_dir}/empty-state"
+  if [[ -f "${switch_state}" ]]; then register_file "${switch_state}" "${switch_state}" state
+  else register_file "${switch_state}" "${scratch_dir}/empty-state" state; fi
+}
+check_switch_scope() {
+  local index resolved
+  [[ -f "${switch_lock}/pid" && "$(<"${switch_lock}/pid")" == "$$" ]] || fail 'the scope lock changed hands during setup; nothing further was changed'
+  [[ ! -L "${token_root}" && ! -L "${token_dir}" && ! -L "${token_file}" && ! -L "${switch_state}" ]] || fail 'gateway state/key path changed during setup'
+  [[ "$(cd -P "${token_dir}" && pwd)" == "${switch_token_directory}" ]] || fail 'gateway state directory changed during setup'
+  for ((index=0; index<${#switch_references[@]}; index++)); do
+    resolved="$(resolve_config_target "${switch_references[index]}")"
+    [[ "${resolved}" == "${switch_configs[index]}" ]] || fail 'selected config symlink/path changed during setup'
+  done
+}
+switch_stage_local() {
+  local index target
+  for ((index=0; index<${#switch_configs[@]}; index++)); do
+    stage_config "${switch_configs[index]}" "${switch_formats[index]}" "${switch_roles[index]}"
+  done
+  printf '' > "${scratch_dir}/empty-asset"
+  for target in "${token_file}" ${switch_assets[@]+"${switch_assets[@]}"}; do
+    if [[ -f "${target}" ]]; then register_file "${target}" "${target}" asset
+    else register_file "${target}" "${scratch_dir}/empty-asset" asset; fi
+    if [[ "${target}" == "${token_file}" ]]; then tx_kinds[tx_count-1]=token; fi
+  done
+}
+switch_finish() {
+  local index backup operation
+  # Older installers left whole-file backups. Only positively identified gateway
+  # backups are retired by unset, and only if their recorded bytes still match.
+  for ((index=0; index<${#switch_configs[@]}; index++)); do
+    for backup in "${switch_configs[index]}".pre-agent-auth.*; do
+      [[ -e "${backup}" || -L "${backup}" ]] || continue
+      register_file "${backup}" "${backup}" history
+      tx_formats[tx_count-1]="${switch_formats[index]}"
+      tx_roles[tx_count-1]="${switch_configs[index]}"
+    done
+  done
+  : > "${scratch_dir}/switch-files"
+  for ((index=0; index<tx_count; index++)); do
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "${index}" "${tx_paths[index]}" \
+      "${tx_originals[index]}" "${tx_candidates[index]}" "${tx_kinds[index]}" \
+      "${tx_formats[index]}" "${tx_roles[index]}" "${tx_restore_sources[index]}" >> "${scratch_dir}/switch-files"
+  done
+  "${node_bin}" "${scratch_dir}/native/switch.cjs" "${action}" "${harness}" "${profile}" \
+    "${token_file}" "${yq_bin:-}" "${scratch_dir}/switch-files" "${gateway_url}" > "${scratch_dir}/switch-plan"
+  while IFS=$'\t' read -r index operation; do
+    case "${operation}" in
+      write) tx_operations[index]=write ;;
+      managed) tx_operations[index]=write; tx_backup_allowed[index]=0 ;;
+      keep) tx_operations[index]=keep ;;
+      delete)
+        tx_operations[index]=delete
+        if [[ "${tx_kinds[index]}" != state ]]; then tx_kinds[index]=cleanup; fi ;;
+      *) fail 'invalid local switch transaction plan' ;;
+    esac
+  done < "${scratch_dir}/switch-plan"
+}
+
 # --- setup/adapters/omp.sh ---
 # OMP owns path/profile resolution; consent precedes its potentially mutating CLI.
-validate_omp_config() {
-  local config="$1" mode="$2"
-  shift 2
-  local validation_home validation_agent_dir omp_models_file listed_providers_file provider found listed model_id
+# Three protocols exist: provider-wire (native-capable OMP builds), standard
+# (stock OMP codecs on the gateway's provider routes) and pi-native (legacy
+# /v1/pi/stream gateways). Selection needs both sides: what the gateway serves
+# and what the installed client's models.yml schema accepts.
+omp_transport_label() {
+  case "$1" in
+    provider-wire) printf 'provider-wire (OMP native discovery on /v1/provider-wire)' ;;
+    standard) printf "standard provider routes (OMP's built-in codecs on /anthropic and /openai-codex/v1)" ;;
+    pi-native) printf 'pi-native (legacy /v1/pi/stream)' ;;
+  esac
+}
+# Runs `omp models --json` against CONFIG in a throwaway home. Sets
+# omp_models_file/omp_models_stderr; returns the client's exit status.
+omp_models_json() {
+  local config="$1" validation_home validation_agent_dir
   validation_home="$(mktemp -d "${scratch_dir}/validation-home.XXXXXX")"
   validation_agent_dir="${validation_home}/.omp/agent"
   mkdir -p "${validation_agent_dir}"
   cp -p "${config}" "${validation_agent_dir}/models.yml"
   chmod 0600 "${validation_agent_dir}/models.yml"
   omp_models_file="${validation_home}/omp-models.json"
-  if ! (
+  omp_models_stderr="${validation_home}/omp-models.stderr"
+  (
     cd "${validation_home}"
     env -i \
       HOME="${validation_home}" PATH="${PATH}" TMPDIR="${scratch_dir}" \
@@ -614,26 +1128,160 @@ validate_omp_config() {
       XDG_CONFIG_HOME="${validation_home}/.config" XDG_DATA_HOME="${validation_home}/.local/share" \
       XDG_STATE_HOME="${validation_home}/.local/state" XDG_CACHE_HOME="${validation_home}/.cache" \
       "${omp_bin}" models --json --no-extensions \
-        > "${omp_models_file}" 2> "${validation_home}/omp-models.stderr"
-  ); then
-    [[ "${mode}" == schema && "${omp_transport}" == provider-wire ]] || fail "OMP could not inspect the ${omp_transport} config; update the installed client and check its model configuration"
+        > "${omp_models_file}" 2> "${omp_models_stderr}"
+  )
+}
+# The client's own diagnostics, with the key redacted, for actionable failures.
+omp_client_diagnostics() {
+  local line
+  while IFS= read -r line; do
+    [[ -n "${line}" ]] || continue
+    if [[ -n "${token:-}" ]]; then line="${line//"${token}"/[key]}"; fi
+    printf '    %s\n' "${line}"
+  done < "${omp_models_stderr}"
+}
+omp_schema_rejected() { grep -q 'validation failed' "${omp_models_stderr}" 2>/dev/null; }
+omp_probe_config() {
+  local transport="$1" file="$2"
+  if [[ "${transport}" == provider-wire ]]; then
+    printf '%s\n' 'providers:' \
+      '  anthropic: {baseUrl: "http://127.0.0.1:9", apiKey: schema-probe-only, transport: provider-wire, discovery: {type: provider-wire, timeoutMs: 100}}' \
+      '  openai-codex: {baseUrl: "http://127.0.0.1:9", apiKey: schema-probe-only, transport: provider-wire, discovery: {type: provider-wire, timeoutMs: 100}}' \
+      > "${file}"
+  else
+    printf '%s\n' 'providers:' \
+      '  anthropic: {baseUrl: "http://127.0.0.1:9", apiKey: schema-probe-only, transport: pi-native}' \
+      '  openai-codex: {baseUrl: "http://127.0.0.1:9", apiKey: schema-probe-only, transport: pi-native}' \
+      > "${file}"
   fi
-  listed_providers_file="${validation_home}/omp-providers"
+}
+# Capability probe: which transports the installed client's schema accepts.
+# Runs in isolation and never touches the selected scope.
+omp_probe_client() {
+  [[ "${client_probe_done:-0}" == 0 ]] || return 0
+  omp_version="$("${omp_bin}" --version 2>/dev/null | head -n 1 || true)"
+  omp_version="${omp_version:-omp/unknown}"
+  client_provider_wire=0; client_pi_native=0; client_standard=1
+  omp_probe_config provider-wire "${scratch_dir}/probe-provider-wire.yml"
+  omp_models_json "${scratch_dir}/probe-provider-wire.yml" || true
+  if ! omp_schema_rejected; then
+    # An unreachable loopback catalog fails discovery. Only a client that
+    # recognized native discovery reports its typed errors per provider.
+    if AGENT_AUTH_YQ_ACTION='omp-schema-providers' "${yq_bin}" eval -r \
+        '.discoveryErrors[] | .provider' "${omp_models_file}" > "${scratch_dir}/probe-providers" 2>/dev/null \
+      && grep -qx anthropic "${scratch_dir}/probe-providers" && grep -qx openai-codex "${scratch_dir}/probe-providers"; then
+      client_provider_wire=1
+    fi
+  fi
+  omp_probe_config pi-native "${scratch_dir}/probe-pi-native.yml"
+  if omp_models_json "${scratch_dir}/probe-pi-native.yml" && ! omp_schema_rejected; then client_pi_native=1; fi
+  client_probe_done=1
+  ui_done 'Installed' "${omp_version}$( (( client_provider_wire == 1 )) && printf ', native-capable (provider-wire)' || printf ', stock (standard provider routes)')"
+}
+omp_client_supports() {
+  case "$1" in
+    provider-wire) (( client_provider_wire == 1 )) ;;
+    standard) (( client_standard == 1 )) ;;
+    pi-native) (( client_pi_native == 1 )) ;;
+  esac
+}
+omp_require_client_transport() {
+  omp_client_supports "$1" && return 0
+  case "$1" in
+    provider-wire)
+      fail "${omp_version} has no provider-wire transport (its models.yml schema rejects transport: provider-wire). Use --transport standard (stock OMP codecs on the gateway's provider routes), or install the native-capable OMP build from https://github.com/stephrenny/oh-my-pi/releases (SHA-256 pinned in the gateway repository) and rerun" ;;
+    pi-native)
+      fail "${omp_version} does not accept transport: pi-native in models.yml; update OMP or choose a gateway with standard provider routes" ;;
+  esac
+}
+# Presence probes are made only once and only for the protocols still in play.
+# They run in this shell: a refusal or unexpected reply ends setup instead of
+# reading as absence.
+omp_gateway_offers() {
+  local transport="$1" provider present=0 absent=0
+  case "${transport}" in
+    provider-wire)
+      if [[ -z "${gateway_provider_wire:-}" ]]; then
+        for provider in "${providers[@]}"; do
+          probe_provider_wire_route "${provider}"
+          if [[ "${probe_result}" == present ]]; then present=$((present + 1)); else absent=$((absent + 1)); fi
+        done
+        if (( present == ${#providers[@]} )); then gateway_provider_wire=1
+        elif (( absent == ${#providers[@]} )); then gateway_provider_wire=0
+        else fail 'the gateway serves provider-wire routes for only some of its providers; setup cannot pick one OMP protocol'; fi
+      fi
+      (( gateway_provider_wire == 1 )) ;;
+    standard)
+      if [[ -z "${gateway_standard:-}" ]]; then
+        # Both the provider's catalog and its model route must exist; the model
+        # route probe also proves this key may make model calls, which the
+        # catalog alone (readable by the gateway root) cannot.
+        for provider in "${providers[@]}"; do
+          if gateway_catalog "/${provider}/v1/models" "${scratch_dir}/${provider}-catalog.json" 1; then
+            probe_standard_route "${provider}"
+          else
+            probe_result=absent
+          fi
+          if [[ "${probe_result}" == present ]]; then present=$((present + 1)); else absent=$((absent + 1)); fi
+        done
+        if (( present == ${#providers[@]} )); then gateway_standard=1
+        elif (( absent == ${#providers[@]} )); then gateway_standard=0
+        else fail 'the gateway serves standard provider routes for only some of its providers; setup cannot pick one OMP protocol'; fi
+      fi
+      (( gateway_standard == 1 )) ;;
+    pi-native)
+      if [[ -z "${gateway_pi_native:-}" ]]; then
+        probe_pi_native_route
+        if [[ "${probe_result}" == present ]]; then gateway_pi_native=1; else gateway_pi_native=0; fi
+      fi
+      (( gateway_pi_native == 1 )) ;;
+  esac
+}
+omp_yes_no() { if [[ "${1:-}" == 1 ]]; then printf 'yes'; elif [[ "${1:-}" == 0 ]]; then printf 'no'; else printf 'not probed'; fi; }
+omp_select_transport() {
+  local transport
+  omp_probe_client
+  if [[ "${omp_transport}" == auto ]]; then
+    for transport in provider-wire standard pi-native; do
+      if omp_client_supports "${transport}" && omp_gateway_offers "${transport}"; then omp_transport="${transport}"; break; fi
+    done
+    [[ "${omp_transport}" != auto ]] || fail "no OMP protocol works for this pair.
+  ${gateway_url} serves: provider-wire routes $(omp_yes_no "${gateway_provider_wire:-}"), standard provider routes $(omp_yes_no "${gateway_standard:-}"), legacy /v1/pi/stream $(omp_yes_no "${gateway_pi_native:-}")
+  ${omp_version} accepts: provider-wire $(omp_yes_no "${client_provider_wire}"), standard provider routes yes, pi-native $(omp_yes_no "${client_pi_native}")
+  Update OMP, or choose a gateway that serves a protocol this client accepts"
+  else
+    omp_require_client_transport "${omp_transport}"
+    omp_gateway_offers "${omp_transport}" || fail "${gateway_url} does not serve $(omp_transport_label "${omp_transport}"); drop --transport to let setup pick, or choose the protocol this gateway serves"
+  fi
+  ui_done 'Protocol' "$(omp_transport_label "${omp_transport}")"
+  if [[ "${omp_transport}" == standard ]]; then
+    "${node_bin}" "${scratch_dir}/native/catalog.cjs" normalize omp "${catalog_file}" "${scratch_dir}" > "${scratch_dir}/native-catalog.json"
+  fi
+}
+# validate_omp_config CONFIG MODE PROVIDER...: MODE schema proves the client
+# accepts the selected transport; MODE catalog proves the exact candidate
+# lists every gateway model the way the gateway describes it.
+validate_omp_config() {
+  local config="$1" mode="$2"
+  shift 2
+  local listed_providers_file provider found listed model_id
+  if ! omp_models_json "${config}"; then
+    if omp_schema_rejected || [[ "${mode}" != schema || "${omp_transport}" != provider-wire ]]; then
+      fail "${omp_version} rejected the ${omp_transport} models config:
+$(omp_client_diagnostics)"
+    fi
+  fi
+  if omp_schema_rejected; then
+    fail "${omp_version} rejected the ${omp_transport} models config:
+$(omp_client_diagnostics)"
+  fi
+  listed_providers_file="${omp_models_file}.providers"
   if [[ "${mode}" == schema && "${omp_transport}" == provider-wire ]]; then
-    # This intentionally unreachable loopback catalog fails discovery. Only a
-    # client that recognized native discovery can report its typed errors;
-    # built-in providers or an old transport-only binary cannot satisfy it.
     if ! AGENT_AUTH_YQ_ACTION='omp-schema-providers' "${yq_bin}" eval -r \
       '.discoveryErrors[] | .provider' "${omp_models_file}" > "${listed_providers_file}"; then
-      fail 'OMP does not support native catalog discovery'
+      fail "${omp_version} does not support native catalog discovery (no discoveryErrors in its model listing)"
     fi
-  elif [[ "${omp_transport}" == pi-native ]]; then
-    if ! AGENT_AUTH_YQ_ACTION='omp-providers' "${yq_bin}" eval -r \
-      '.models[] | select(.transport == "pi-native" and ((.api | type) == "!!str")) | .provider' \
-      "${omp_models_file}" > "${listed_providers_file}"; then
-      fail 'OMP does not expose its selected pi-native transport; update the installed client'
-    fi
-  else
+  elif [[ "${omp_transport}" == provider-wire ]]; then
     if ! GATEWAY_URL="${gateway_url}" AGENT_AUTH_YQ_ACTION='omp-providers' "${yq_bin}" eval -r '
       .models[] | select(
         .transport == "provider-wire" and .baseUrl == strenv(GATEWAY_URL) and
@@ -642,64 +1290,70 @@ validate_omp_config() {
     ' "${omp_models_file}" > "${listed_providers_file}"; then
       fail 'OMP returned an unreadable native model list'
     fi
+  else
+    if ! AGENT_AUTH_YQ_ACTION='omp-providers' "${yq_bin}" eval -r \
+      '.models[] | select((.provider | type) == "!!str") | .provider' \
+      "${omp_models_file}" > "${listed_providers_file}"; then
+      fail 'OMP returned an unreadable model list'
+    fi
   fi
   for provider in "$@"; do
     found=0
     while IFS= read -r listed; do
       if [[ "${listed}" == "${provider}" ]]; then found=1; break; fi
     done < "${listed_providers_file}"
-    (( found == 1 )) || fail "OMP did not load ${omp_transport} routing for ${provider}; a capable installed client and valid models config are required"
+    (( found == 1 )) || fail "${omp_version} listed no ${provider} models for the ${omp_transport} config ($(omp_transport_label "${omp_transport}")):
+$(omp_client_diagnostics)"
   done
-  if [[ "${mode}" != schema && "${omp_transport}" == provider-wire ]]; then
+  [[ "${mode}" == catalog ]] || return 0
+  if [[ "${omp_transport}" == provider-wire ]]; then
     AGENT_AUTH_YQ_ACTION='omp-selectors' "${yq_bin}" eval -r \
       '.models[] | select(.transport == "provider-wire") | .selector' \
-      "${omp_models_file}" > "${validation_home}/omp-selectors"
+      "${omp_models_file}" > "${omp_models_file}.selectors"
     while IFS= read -r model_id; do
       found=0
       while IFS= read -r listed; do
         if [[ "${listed}" == "${model_id}" ]]; then found=1; break; fi
-      done < "${validation_home}/omp-selectors"
-      (( found == 1 )) || fail "OMP did not discover gateway model ${model_id}"
+      done < "${omp_models_file}.selectors"
+      (( found == 1 )) || fail "${omp_version} did not discover gateway model ${model_id} over provider-wire"
     done < "${model_ids_file}"
+  elif [[ "${omp_transport}" == standard ]]; then
+    "${node_bin}" "${scratch_dir}/native/check.cjs" omp-list "${scratch_dir}/native-catalog.json" "${omp_models_file}" \
+      > "${scratch_dir}/omp-list-report" || fail "${omp_version} did not list the gateway models as described:
+$(omp_client_diagnostics)"
+  fi
+  # Bundled models the gateway does not serve stay listed on the stock protocols
+  # (only provider-wire discovery replaces the bundled catalog).
+  omp_extra_models=''
+  if [[ "${omp_transport}" != provider-wire ]]; then
+    AGENT_AUTH_YQ_ACTION='omp-selectors' "${yq_bin}" eval -r \
+      '.models[] | select(.provider == "anthropic" or .provider == "openai-codex") | .selector' \
+      "${omp_models_file}" > "${omp_models_file}.selectors"
+    omp_extra_models="$(grep -vxFf "${model_ids_file}" "${omp_models_file}.selectors" | tr '\n' ' ' || true)"
+    omp_extra_models="${omp_extra_models% }"
   fi
 }
 omp_validate_client() {
-  [[ "${validated_omp_transport:-}" != "${omp_transport}" ]] || return 0
-  schema_probe="${scratch_dir}/schema-probe.yml"
-  if [[ "${omp_transport}" == provider-wire ]]; then
-    printf '%s\n' 'providers:' \
-      '  anthropic: {baseUrl: "http://127.0.0.1:9", apiKey: schema-probe-only, transport: provider-wire, discovery: {type: provider-wire, timeoutMs: 100}}' \
-      '  openai-codex: {baseUrl: "http://127.0.0.1:9", apiKey: schema-probe-only, transport: provider-wire, discovery: {type: provider-wire, timeoutMs: 100}}' \
-      > "${schema_probe}"
-  else
-    printf '%s\n' 'providers:' \
-      '  anthropic: {baseUrl: "http://127.0.0.1:9", apiKey: schema-probe-only, transport: pi-native}' \
-      '  openai-codex: {baseUrl: "http://127.0.0.1:9", apiKey: schema-probe-only, transport: pi-native}' \
-      > "${schema_probe}"
-  fi
-  validate_omp_config "${schema_probe}" schema anthropic openai-codex
-  validated_omp_transport="${omp_transport}"
+  omp_probe_client
+  omp_require_client_transport "${omp_transport}"
 }
 omp_prepare() {
-  local answer
   omp_bin="$(require_executable omp)"
   # Even `omp config path` can initialize agent.db. Do not invoke it until
   # the owner approves the selected scope; do not guess paths or parse .env.
-  if (( overwrite == 0 )); then
+  if [[ "${action}" == configure && "${overwrite}" == 0 ]]; then
     (( has_tty == 1 )) || fail 'OMP scope resolution can initialize client state; rerun with --overwrite to consent, or leave it alone'
-    printf 'OMP resolves the active/profile config path and may initialize client state.\n' >/dev/tty
-    while true; do
-      printf 'Set up OMP in the selected scope, overwriting gateway settings/key if present? [y/N]: ' >/dev/tty
-      IFS= read -r answer </dev/tty || fail 'could not read OMP scope choice'
-      case "${answer}" in
-        y|Y|yes|YES) overwrite=1; break ;;
-        ''|n|N|no|NO) printf 'Left OMP alone; no user files changed.\n'; exit 0 ;;
-        *) printf 'Enter y to set up or n to leave alone.\n' >/dev/tty ;;
-      esac
-    done
+    if ! ui_confirm 'Set up OMP here? Existing gateway settings and key in this scope are replaced; OMP may initialize its state' no; then
+      printf 'Left OMP alone; no user files changed.\n'
+      exit 0
+    fi
+    overwrite=1
   fi
   yq_bin="$(resolve_yq)"
-  if [[ "${omp_transport}" != auto ]]; then omp_validate_client; fi
+  if [[ "${action}" == configure ]]; then
+    omp_probe_client
+    if [[ "${omp_transport}" != auto ]]; then omp_require_client_transport "${omp_transport}"; fi
+  fi
 
   if [[ -n "${profile}" ]]; then
     agent_dir="$("${omp_bin}" --profile "${profile}" config path 2> "${scratch_dir}/config-path.stderr")" || fail 'could not resolve the OMP config path'
@@ -719,25 +1373,37 @@ omp_prepare() {
     legacy_models="${agent_dir}/models.json"
   fi
 
+  # OMP's default model lives in config.yml (modelRoles.default); a default the
+  # gateway does not serve would make a fresh `omp` fail, so it is owned too.
+  settings="${agent_dir}/config.yml"
+  if [[ ! -e "${settings}" && ! -L "${settings}" && ( -e "${agent_dir}/config.yaml" || -L "${agent_dir}/config.yaml" ) ]]; then
+    settings="${agent_dir}/config.yaml"
+  fi
+  switch_references=("${models}" "${settings}")
   models="$(resolve_config_target "${models}")"
+  settings="$(resolve_config_target "${settings}")"
   models_existed=0
   if [[ -f "${models}" ]]; then models_existed=1; fi
-  token_dir="${agent_dir}/agent-auth"
+  token_dir="$(resolve_token_directory "${agent_dir}/agent-auth")"
   token_file="${token_dir}/token"
-  setup_targets=("${models}" "${token_file}")
+  setup_targets=("${models}" "${settings}" "${token_file}")
+  switch_configs=("${models}" "${settings}"); switch_formats=(yaml yaml); switch_roles=(models settings)
+  switch_assets=()
   if [[ -n "${legacy_models}" ]]; then setup_targets+=("${legacy_models}"); fi
 }
+# Older installs embedded the key only in the routes; any gateway-owned provider
+# whose base URL is under this gateway (any protocol) can supply it.
 omp_recover_embedded_key() {
   config_token=''
   if [[ -z "${stored_token}" && -f "${models}" ]]; then
     config_token="$(
-      GATEWAY_URL="${gateway_url}" AGENT_AUTH_YQ_ACTION='existing-key' \
-        "${yq_bin}" eval -r '
+      GATEWAY_URL="${gateway_url}" GATEWAY_URL_ANTHROPIC="${gateway_url}/anthropic" GATEWAY_URL_CODEX="${gateway_url}/openai-codex/v1" \
+        AGENT_AUTH_YQ_ACTION='existing-key' "${yq_bin}" eval -r '
           (.providers // {} | to_entries | map(.value)) |
           map(select(
             (type == "!!map") and
-            (.baseUrl == strenv(GATEWAY_URL)) and
-            ((.transport == "provider-wire") or (.transport == "pi-native")) and
+            (.baseUrl == strenv(GATEWAY_URL) or .baseUrl == strenv(GATEWAY_URL_ANTHROPIC) or .baseUrl == strenv(GATEWAY_URL_CODEX)) and
+            ((.transport == "provider-wire") or (.transport == "pi-native") or (.authHeader == true)) and
             ((.apiKey // "") | type == "!!str") and
             ((.apiKey // "") | test("^!") | not)
           )) |
@@ -751,26 +1417,58 @@ omp_recover_embedded_key() {
     fi
   fi
 }
+# Gateway-owned provider fields. Every protocol clears the others' fields first so
+# a reconfigure between protocols never leaves stale routing behind.
+omp_owned_reset='del(.transport) | del(.discovery) | del(.authHeader) | del(.api) | del(.models)'
+# Credential headers (any spelling, on the provider or a model override) would
+# conflict with the gateway bearer: lease.mjs refuses a request whose x-api-key
+# and Authorization disagree. They are enumerated from the source config, dropped
+# by the merge, and their presence alone makes a config need updating.
+omp_credential_headers() {
+  local config="$1"
+  "${yq_bin}" -o json '. // {}' "${config}" > "${scratch_dir}/omp-source.json" 2> "${scratch_dir}/yq.stderr" \
+    || fail "could not read ${models/#${HOME}/\~}"
+  "${node_bin}" "${scratch_dir}/native/omp.cjs" credentials "${scratch_dir}/omp-source.json"
+}
 omp_stage() {
-  local omp_candidate
-  stage_config "${models}" yaml
+  local omp_candidate provider block credential
+  stage_config "${models}" yaml models
   omp_candidate="${staged_config}"
-  route_expression='
-    (.providers[strenv(PROVIDER)] | type) == "!!map" and
-    .providers[strenv(PROVIDER)].baseUrl == strenv(GATEWAY_URL) and
-    .providers[strenv(PROVIDER)].apiKey == strenv(GATEWAY_TOKEN) and
-    .providers[strenv(PROVIDER)].transport == strenv(GATEWAY_TRANSPORT)
-  '
-  if [[ "${omp_transport}" == provider-wire ]]; then
-    route_expression+=' and .providers[strenv(PROVIDER)].discovery.type == "provider-wire"'
+  block="${scratch_dir}/omp-block.json"
+  if [[ "${omp_transport}" == standard ]]; then
+    "${node_bin}" "${scratch_dir}/native/omp.cjs" block "${scratch_dir}/native-catalog.json" "${gateway_url}" > "${block}"
+    route_expression='
+      (.providers[strenv(PROVIDER)] | type) == "!!map" and
+      .providers[strenv(PROVIDER)].baseUrl == load(strenv(OMP_BLOCK))[strenv(PROVIDER)].baseUrl and
+      .providers[strenv(PROVIDER)].apiKey == strenv(GATEWAY_TOKEN) and
+      .providers[strenv(PROVIDER)].authHeader == true and
+      .providers[strenv(PROVIDER)].api == load(strenv(OMP_BLOCK))[strenv(PROVIDER)].api and
+      .providers[strenv(PROVIDER)].transport == null and
+      .providers[strenv(PROVIDER)].discovery == null and
+      (.providers[strenv(PROVIDER)].models | @json) == (load(strenv(OMP_BLOCK))[strenv(PROVIDER)].models | @json)
+    '
   else
-    route_expression+=' and .providers[strenv(PROVIDER)].discovery == null'
+    printf '{}\n' > "${block}"
+    route_expression='
+      (.providers[strenv(PROVIDER)] | type) == "!!map" and
+      .providers[strenv(PROVIDER)].baseUrl == strenv(GATEWAY_URL) and
+      .providers[strenv(PROVIDER)].apiKey == strenv(GATEWAY_TOKEN) and
+      .providers[strenv(PROVIDER)].transport == strenv(GATEWAY_TRANSPORT) and
+      .providers[strenv(PROVIDER)].authHeader == null and
+      .providers[strenv(PROVIDER)].models == null
+    '
+    if [[ "${omp_transport}" == provider-wire ]]; then
+      route_expression+=' and .providers[strenv(PROVIDER)].discovery.type == "provider-wire"'
+    else
+      route_expression+=' and .providers[strenv(PROVIDER)].discovery == null'
+    fi
   fi
   config_needs_update=1
   if (( models_existed == 1 )); then
     config_needs_update=0
+    if [[ -n "$(omp_credential_headers "${source_config}")" ]]; then config_needs_update=1; fi
     for provider in "${providers[@]}"; do
-      if ! PROVIDER="${provider}" GATEWAY_URL="${gateway_url}" GATEWAY_TOKEN="${token}" GATEWAY_TRANSPORT="${omp_transport}" \
+      if ! PROVIDER="${provider}" GATEWAY_URL="${gateway_url}" GATEWAY_TOKEN="${token}" GATEWAY_TRANSPORT="${omp_transport}" OMP_BLOCK="${block}" \
         AGENT_AUTH_YQ_ACTION='route-matches' "${yq_bin}" eval -e \
         "${route_expression}" "${source_config}" >/dev/null 2>&1; then
         config_needs_update=1
@@ -801,6 +1499,8 @@ omp_stage() {
         fi
         source_file="${legacy_agent_dir}/models.yml"
         [[ -f "${source_file}" ]] || fail "OMP did not migrate ${legacy_models/#${HOME}/\~}"
+        # Retain the client's actual legacy migration as the normal-mode baseline.
+        tx_restore_sources[tx_count-1]="${source_file}"
       else
         source_file="${scratch_dir}/empty-models.yml"
         printf '{}\n' > "${source_file}"
@@ -813,6 +1513,10 @@ omp_stage() {
       .providers = (.providers // {}) |
       select((.providers | type) == "!!map")
     '
+    while IFS= read -r credential; do
+      [[ -n "${credential}" ]] || continue
+      merge_expression+=" | del(${credential})"
+    done < <(omp_credential_headers "${source_file}")
     for provider in "${providers[@]}"; do
       merge_expression+=" |
         (
@@ -820,20 +1524,28 @@ omp_stage() {
           (select((.providers[\"${provider}\"] | kind) == \"alias\") | explode(.providers[\"${provider}\"]))
         ) |
         select(.providers[\"${provider}\"] == null or (.providers[\"${provider}\"] | type) == \"!!map\") |
-        .providers[\"${provider}\"] = ((.providers[\"${provider}\"] // {}) * {
-          \"baseUrl\": strenv(GATEWAY_URL),
-          \"apiKey\": strenv(GATEWAY_TOKEN),
-          \"transport\": strenv(GATEWAY_TRANSPORT)
-        })
+        .providers[\"${provider}\"] = ((.providers[\"${provider}\"] // {}) | ${omp_owned_reset})
       "
-      if [[ "${omp_transport}" == provider-wire ]]; then
-        merge_expression+=" | .providers[\"${provider}\"].discovery = {\"type\": \"provider-wire\"}"
+      if [[ "${omp_transport}" == standard ]]; then
+        merge_expression+=" |
+          .providers[\"${provider}\"] = (.providers[\"${provider}\"] * (load(strenv(OMP_BLOCK))[\"${provider}\"] | ... style=\"\")) |
+          .providers[\"${provider}\"].apiKey = strenv(GATEWAY_TOKEN)
+        "
       else
-        merge_expression+=" | del(.providers[\"${provider}\"].discovery)"
+        merge_expression+=" |
+          .providers[\"${provider}\"] = (.providers[\"${provider}\"] * {
+            \"baseUrl\": strenv(GATEWAY_URL),
+            \"apiKey\": strenv(GATEWAY_TOKEN),
+            \"transport\": strenv(GATEWAY_TRANSPORT)
+          })
+        "
+        if [[ "${omp_transport}" == provider-wire ]]; then
+          merge_expression+=" | .providers[\"${provider}\"].discovery = {\"type\": \"provider-wire\"}"
+        fi
       fi
     done
     candidate="${scratch_dir}/candidate-models.yml"
-    if ! GATEWAY_URL="${gateway_url}" GATEWAY_TOKEN="${token}" GATEWAY_TRANSPORT="${omp_transport}" AGENT_AUTH_YQ_ACTION='merge-config' \
+    if ! GATEWAY_URL="${gateway_url}" GATEWAY_TOKEN="${token}" GATEWAY_TRANSPORT="${omp_transport}" OMP_BLOCK="${block}" AGENT_AUTH_YQ_ACTION='merge-config' \
       "${yq_bin}" eval -e "${merge_expression}" "${source_file}" > "${candidate}" 2> "${scratch_dir}/yq.stderr"; then
       fail "could not merge gateway settings into ${models/#${HOME}/\~}"
     fi
@@ -842,24 +1554,91 @@ omp_stage() {
   fi
 
   for provider in "${providers[@]}"; do
-    if ! PROVIDER="${provider}" GATEWAY_URL="${gateway_url}" GATEWAY_TOKEN="${token}" GATEWAY_TRANSPORT="${omp_transport}" \
+    if ! PROVIDER="${provider}" GATEWAY_URL="${gateway_url}" GATEWAY_TOKEN="${token}" GATEWAY_TRANSPORT="${omp_transport}" OMP_BLOCK="${block}" \
       AGENT_AUTH_YQ_ACTION='verify-config' "${yq_bin}" eval -e \
       "${route_expression}" "${config_to_validate}" >/dev/null 2> "${scratch_dir}/yq.stderr"; then
       fail "gateway settings are invalid for ${provider}"
     fi
   done
+  [[ -z "$(omp_credential_headers "${config_to_validate}")" ]] || fail 'a credential header survived the merge; nothing was committed'
 
   # Validate the exact candidate in a fresh isolated registry too. Built-in or
   # ambient providers cannot mask a rejected custom config or unsupported schema.
   cp "${config_to_validate}" "${omp_candidate}"
+  ui_note "Checking the merged models config with ${omp_version}"
   validate_omp_config "${omp_candidate}" catalog "${providers[@]}"
+  omp_stage_default_model
+}
+# A default the gateway does not serve fails on the first prompt. The default
+# role is written only when it has to be: the current default is unserved, or
+# none is set while unserved bundled models are still listed (OMP would pick
+# among them). A served default and OMP's own pick otherwise stay untouched.
+omp_stage_default_model() {
+  local current chosen allowed
+  stage_config "${settings}" yaml settings
+  current="$(AGENT_AUTH_YQ_ACTION='default-role' "${yq_bin}" eval -r '.modelRoles.default // ""' "${source_config}" 2>/dev/null || true)"
+  omp_replaced_default=''; omp_default_model=''; omp_allowed_default=''
+  # A role may carry an effort suffix (provider/model:high); the model part decides.
+  if [[ -n "${current}" ]] && grep -qxF "${current%%:*}" "${model_ids_file}"; then
+    omp_stage_allowed_default "${current%%:*}"
+    return 0
+  fi
+  if [[ -z "${current}" && -z "${omp_extra_models}" ]]; then omp_stage_allowed_default ''; return 0; fi
+  chosen="$(AGENT_AUTH_YQ_ACTION='default-model' "${yq_bin}" eval -r '
+    (.default_models.anthropic // .default_models["openai-codex"] // "") | select(type == "!!str")
+  ' "${catalog_file}" 2>/dev/null || true)"
+  if [[ -z "${chosen}" ]] || ! grep -qxF "${chosen}" "${model_ids_file}"; then
+    chosen="$(grep -m 1 '^anthropic/' "${model_ids_file}" || head -n 1 "${model_ids_file}")"
+  fi
+  [[ -n "${chosen}" ]] || fail 'the gateway catalog names no model this client can use as its default'
+  if [[ -n "${current}" ]]; then omp_replaced_default="${current}"; fi
+  omp_default_model="${chosen}"
+  if ! DEFAULT_MODEL="${chosen}" AGENT_AUTH_YQ_ACTION='set-default-role' "${yq_bin}" eval -e '
+    . = (. // {}) | select(type == "!!map") |
+    select(.modelRoles == null or (.modelRoles | type) == "!!map") |
+    .modelRoles.default = strenv(DEFAULT_MODEL)
+  ' "${source_config}" > "${staged_config}" 2> "${scratch_dir}/yq.stderr"; then
+    fail "could not set the default model in ${settings/#${HOME}/\~}"
+  fi
+  chmod 0600 "${staged_config}"
+  omp_stage_allowed_default "${chosen}"
+}
+# enabledModels is an allow-list of fuzzy patterns OMP applies before the default
+# role; the exact selector of the default is appended when the list is set and
+# does not already name it, so the default can actually be selected.
+omp_stage_allowed_default() {
+  local selector="$1" listed
+  [[ -n "${selector}" ]] || return 0
+  listed="$(AGENT_AUTH_YQ_ACTION='enabled-models' "${yq_bin}" eval -r '
+    (.enabledModels // []) | select(type == "!!seq") | .[] | select(type == "!!str")
+  ' "${staged_config}" 2>/dev/null || true)"
+  [[ -n "${listed}" ]] || return 0
+  if grep -qxF "${selector}" <<< "${listed}"; then return 0; fi
+  if ! DEFAULT_MODEL="${selector}" AGENT_AUTH_YQ_ACTION='allow-default' "${yq_bin}" eval -e -i '
+    select((.enabledModels | type) == "!!seq") | .enabledModels += [strenv(DEFAULT_MODEL)]
+  ' "${staged_config}" 2> "${scratch_dir}/yq.stderr"; then
+    fail "could not allow the default model in ${settings/#${HOME}/\~}"
+  fi
+  omp_allowed_default="${selector}"
 }
 omp_report() {
-  printf '\nOMP gateway ready\n'
+  ui_title 'OMP gateway ready'
   printf '  gateway  %s\n' "${gateway_url}"
-  printf '  protocol %s\n' "${omp_transport}"
+  printf '  protocol %s\n' "$(omp_transport_label "${omp_transport}")"
+  printf '  client   %s\n' "${omp_version}"
+  if [[ -n "${omp_default_model}" ]]; then printf '  default  %s\n' "${omp_default_model}"; fi
   report_transaction
+  if [[ -n "${omp_replaced_default:-}" ]]; then
+    printf '\nThe previous default %s is not served by this gateway; %s is the default while enabled.\n' "${omp_replaced_default}" "${omp_default_model}"
+  fi
+  if [[ -n "${omp_allowed_default:-}" ]]; then
+    printf 'enabledModels did not allow %s; it is added while enabled.\n' "${omp_allowed_default}"
+  fi
+  if [[ -n "${omp_extra_models:-}" ]]; then
+    printf 'Not served by this gateway (bundled in OMP; still listed): %s\n' "${omp_extra_models}"
+  fi
   if [[ -n "${profile}" ]]; then printf '\nRun: omp --profile %s\n' "${profile}"; else printf '\nRun: omp\n'; fi
+  printf 'Undo: rerun this setup and choose Disable (keeps the key), or Unset (removes it).\n'
 }
 
 # --- setup/adapters/claude-code.sh ---
@@ -868,13 +1647,16 @@ claude_code_prepare() {
   local key value
   for key in ANTHROPIC_AUTH_TOKEN ANTHROPIC_API_KEY ANTHROPIC_AWS_API_KEY CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY CLAUDE_CODE_USE_ANTHROPIC_AWS; do
     value="${!key:-}"
-    [[ -z "${value}" || "${value}" == 0 || "${value}" == false ]] || fail 'inherited Claude credentials/cloud routing conflict with setup; use a clean environment and isolated CLAUDE_CONFIG_DIR'
+    [[ "${action}" != configure || -z "${value}" || "${value}" == 0 || "${value}" == false ]] || fail 'inherited Claude credentials/cloud routing conflict with setup; use a clean environment and isolated CLAUDE_CONFIG_DIR'
   done
   client_dir="${CLAUDE_CONFIG_DIR:-${HOME}/.claude}"
   config_target="$(resolve_config_target "${client_dir}/settings.json")"
-  token_dir="${client_dir}/agent-auth"
+  token_dir="$(resolve_token_directory "${client_dir}/agent-auth")"
   token_file="${token_dir}/token"
   setup_targets=("${config_target}" "${token_file}")
+  switch_configs=("${config_target}"); switch_formats=(json); switch_roles=(config)
+  switch_references=("${client_dir}/settings.json")
+  switch_assets=()
 }
 claude_code_stage() {
   stage_config "${config_target}"
@@ -892,12 +1674,16 @@ codex_prepare() {
   base_config="$(resolve_config_target "${client_dir}/config.toml")"
   if [[ -n "${profile}" ]]; then config_target="$(resolve_config_target "${client_dir}/${profile}.config.toml")"
   else config_target="${base_config}"; fi
-  token_root="${client_dir}/agent-auth"
+  token_root="$(resolve_token_directory "${client_dir}/agent-auth")"
   token_dir="${token_root}"
   if [[ -n "${profile}" ]]; then token_dir+="/${profile}"; else token_dir+='/default'; fi
+  token_dir="$(resolve_token_directory "${token_dir}")"
   token_file="${token_dir}/token"
-  catalog_target="$(resolve_config_target "${token_dir}/models.json")"
+  catalog_target="${token_dir}/models.json"
   setup_targets=("${config_target}" "${token_file}" "${catalog_target}")
+  switch_configs=("${config_target}"); switch_formats=(toml); switch_roles=(config)
+  switch_references=("${client_dir}/${profile:+${profile}.}config.toml")
+  switch_assets=("${catalog_target}")
   if [[ -n "${profile}" ]]; then setup_targets+=("${base_config}"); fi
 }
 codex_stage() {
@@ -913,7 +1699,9 @@ codex_stage() {
   "${node_bin}" "${scratch_dir}/native/check.cjs" equal "${scratch_dir}/codex-source.json" "${scratch_dir}/codex-roundtrip.json"
   "${node_bin}" "${scratch_dir}/native/check.cjs" codex-profile "${scratch_dir}/codex-source.json"
   if [[ -n "${profile}" && -f "${base_config}" ]]; then
-    cp -p "${base_config}" "${scratch_dir}/codex-base.toml"
+    register_file "${base_config}" "${base_config}" dependency
+    tx_operations[tx_count-1]=keep
+    cp -p "${tx_originals[tx_count-1]}" "${scratch_dir}/codex-base.toml"
     "${yq_bin}" -p toml -o json '. // {}' "${scratch_dir}/codex-base.toml" > "${scratch_dir}/codex-base.json" 2> "${scratch_dir}/toml.stderr" || fail 'could not decode base Codex TOML'
     "${node_bin}" "${scratch_dir}/native/check.cjs" codex-profile "${scratch_dir}/codex-base.json"
     SOURCE_JSON="${scratch_dir}/codex-source.json" "${yq_bin}" -p json -o json '. * load(strenv(SOURCE_JSON))' "${scratch_dir}/codex-base.json" > "${scratch_dir}/codex-effective.json"
@@ -950,7 +1738,7 @@ codex_stage() {
 # --- setup/adapters/opencode.sh ---
 opencode_prepare() {
   native_prepare opencode
-  if [[ -n "${OPENCODE_CONFIG_CONTENT:-}" || -n "${OPENCODE_CONFIG_DIR:-}" ]]; then
+  if [[ "${action}" == configure && ( -n "${OPENCODE_CONFIG_CONTENT:-}" || -n "${OPENCODE_CONFIG_DIR:-}" ) ]]; then
     fail 'OPENCODE_CONFIG_CONTENT or OPENCODE_CONFIG_DIR can override the selected file; use a clean environment for setup'
   fi
   client_dir="${XDG_CONFIG_HOME:-${HOME}/.config}/opencode"
@@ -967,9 +1755,12 @@ opencode_prepare() {
   fi
   config_display="${config_target}"
   config_target="$(resolve_config_target "${config_target}")"
-  token_dir="$(dirname "${config_target}")/agent-auth"
+  token_dir="$(resolve_token_directory "$(dirname "${config_target}")/agent-auth")"
   token_file="${token_dir}/token"
   setup_targets=("${config_target}" "${token_file}")
+  switch_configs=("${config_target}"); switch_formats=(json); switch_roles=(config)
+  switch_references=("${config_display}")
+  switch_assets=()
 }
 opencode_stage() {
   stage_config "${config_target}"
@@ -992,17 +1783,20 @@ pi_prepare() {
   client_dir="${PI_CODING_AGENT_DIR:-${HOME}/.pi/agent}"
   models_target="$(resolve_config_target "${client_dir}/models.json")"
   settings_target="$(resolve_config_target "${client_dir}/settings.json")"
-  token_dir="${client_dir}/agent-auth"
+  token_dir="$(resolve_token_directory "${client_dir}/agent-auth")"
   token_file="${token_dir}/token"
   setup_targets=("${models_target}" "${settings_target}" "${token_file}")
+  switch_configs=("${models_target}" "${settings_target}"); switch_formats=(json json); switch_roles=(models settings)
+  switch_references=("${client_dir}/models.json" "${client_dir}/settings.json")
+  switch_assets=()
 }
 pi_stage() {
   local models_candidate settings_candidate
-  stage_config "${models_target}"
+  stage_config "${models_target}" json models
   models_candidate="${staged_config}"
   "${node_bin}" "${scratch_dir}/native/pi.cjs" models "${source_config}" "${staged_config}" \
     "${scratch_dir}/native-catalog.json" "${gateway_url}" "${cat_bin}" "${token_file}"
-  stage_config "${settings_target}"
+  stage_config "${settings_target}" json settings
   settings_candidate="${staged_config}"
   "${node_bin}" "${scratch_dir}/native/pi.cjs" settings "${source_config}" "${staged_config}" \
     "${scratch_dir}/native-catalog.json" "${gateway_url}" "${cat_bin}" "${token_file}"
@@ -1028,25 +1822,32 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { object } = require('./config-io.cjs');
 
-function cards(file) {
+function loadCatalog(file) {
   let value;
   try { value = JSON.parse(fs.readFileSync(file, 'utf8')); }
   catch { throw new Error('gateway catalog is not valid JSON'); }
   if (!object(value) || !Array.isArray(value.data) || value.data.length > 4096) throw new Error('invalid or oversized gateway catalog');
-  return value.data;
+  return value;
 }
 function selected(harness, catalog) {
   const wanted = harness === 'claude-code' ? ['anthropic'] : harness === 'codex' ? ['openai-codex'] : ['anthropic', 'openai-codex'];
   return wanted.filter(provider => catalog.some(card => card.owned_by === provider));
 }
 function normalize(harness, catalog, directory) {
-  const providers = selected(harness, catalog);
+  const providers = selected(harness, catalog.data);
   if (!providers.length) throw new Error('gateway advertises no models for the selected client');
+  if (!object(catalog.default_models)) throw new Error('gateway catalog is missing explicit provider defaults');
   const result = {};
   for (const provider of providers) {
-    const native = cards(path.join(directory, `${provider}-catalog.json`));
+    const defaultModel = catalog.default_models[provider];
+    if (typeof defaultModel !== 'string' || !defaultModel.startsWith(`${provider}/`)) {
+      throw new Error(`gateway catalog has no qualified default model for ${provider}`);
+    }
+    const native = loadCatalog(path.join(directory, `${provider}-catalog.json`)).data;
     const seen = new Set();
-    result[provider] = catalog.filter(card => card.owned_by === provider).map(card => {
+    let defaultIndex = -1;
+    result[provider] = catalog.data.filter(card => card.owned_by === provider).map((card, index) => {
+      if (card.id === defaultModel) defaultIndex = index;
       const id = card.request_model_id ?? card.id?.replace(new RegExp(`^${provider}/`), '');
       if (typeof id !== 'string' || !/^[\x21-\x7e]{1,256}$/.test(id) || seen.has(id)) throw new Error('invalid or duplicate raw gateway model ID');
       seen.add(id);
@@ -1062,15 +1863,17 @@ function normalize(harness, catalog, directory) {
       return { ...card, id };
     });
     if (native.length !== result[provider].length) throw new Error('native and authoritative catalog counts disagree');
+    if (defaultIndex === -1) throw new Error(`gateway default model ${defaultModel} is not in its provider catalog`);
+    if (defaultIndex > 0) result[provider].unshift(result[provider].splice(defaultIndex, 1)[0]);
   }
   return result;
 }
 if (require.main === module) {
   try {
     const [action, harness, file, directory] = process.argv.slice(2);
-    const catalog = cards(file);
+    const catalog = loadCatalog(file);
     if (action === 'providers') {
-      const providers = selected(harness, catalog);
+      const providers = selected(harness, catalog.data);
       if (!providers.length) throw new Error('gateway advertises no models for the selected client');
       process.stdout.write(providers.join('\n') + '\n');
     } else if (action === 'normalize') process.stdout.write(JSON.stringify(normalize(harness, catalog, directory)) + '\n');
@@ -1114,6 +1917,27 @@ try {
         throw new Error('Pi did not adopt an expected gateway model');
       }
     }
+  } else if (action === 'omp-list') {
+    // Every gateway model must be listed under its built-in provider id with the
+    // gateway's limits; bundled rows keep their own limits, so a match proves the
+    // staged definitions were applied. Prints bundled models the gateway lacks.
+    const [catalogFile, modelsFile] = args;
+    const catalog = JSON.parse(fs.readFileSync(catalogFile, 'utf8'));
+    let listing;
+    try { listing = JSON.parse(fs.readFileSync(modelsFile, 'utf8')); } catch { throw new Error('OMP returned an unreadable model list'); }
+    const rows = Array.isArray(listing?.models) ? listing.models : [];
+    const expected = new Set();
+    for (const [provider, cards] of Object.entries(catalog)) for (const card of cards) {
+      const selector = `${provider}/${card.id}`;
+      expected.add(selector);
+      const row = rows.find(row => row.selector === selector);
+      if (!row) throw new Error(`OMP did not list gateway model ${selector}`);
+      if (row.contextWindow !== card.context_length || row.maxTokens !== card.max_output_tokens) {
+        throw new Error(`OMP lists ${selector} with different limits than the gateway describes; the staged definition was not applied`);
+      }
+    }
+    const extras = rows.filter(row => Object.hasOwn(catalog, row.provider) && !expected.has(row.selector)).map(row => row.selector);
+    process.stdout.write(extras.join(', ') + '\n');
   } else if (action === 'opencode-projection') {
     const [candidate, destination, dummyToken] = args;
     const config = load(candidate);
@@ -1156,13 +1980,19 @@ try {
     if (value && value !== '0' && value !== 'false') throw new Error('existing Claude credentials or cloud routing conflict with gateway setup; choose an isolated CLAUDE_CONFIG_DIR');
   }
   if (current.forceLoginOrgUUID) throw new Error('Claude organization login policy conflicts with gateway credentials');
-  const model = catalog.find(card => card.id === current.model)?.id ?? catalog[0].id;
+  const previousModel = current.model ?? current.env?.ANTHROPIC_MODEL;
+  const model = catalog.find(card => card.id === previousModel)?.id ?? catalog[0].id;
+  if (previousModel && previousModel !== model) console.error(`Claude Code: replacing unsupported model ${previousModel} with ${model}.`);
+  const previousSmall = current.env?.ANTHROPIC_DEFAULT_HAIKU_MODEL;
+  const small = catalog.find(card => card.id === previousSmall)?.id ?? catalog.find(card => card.id.includes('haiku'))?.id ?? model;
+  if (previousSmall && previousSmall !== small) console.error(`Claude Code: replacing unsupported background model ${previousSmall} with ${small}.`);
+  if (!previousSmall && small === model) console.error(`Claude Code: no Haiku model is advertised; background requests will use ${model}.`);
   patch(source, destination, [
     [['apiKeyHelper'], command(cat, tokenFile)],
     [['model'], model],
     [['env', 'ANTHROPIC_BASE_URL'], `${gateway}/anthropic`],
     [['env', 'ANTHROPIC_MODEL'], model],
-    [['env', 'ANTHROPIC_DEFAULT_HAIKU_MODEL'], model],
+    [['env', 'ANTHROPIC_DEFAULT_HAIKU_MODEL'], small],
     [['env', 'CLAUDE_CODE_MAX_RETRIES'], '0'],
     [['env', 'CLAUDE_CODE_RETRY_WATCHDOG'], '0'],
     [['env', 'CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK'], '1'],
@@ -1192,27 +2022,62 @@ try {
   // gateway card is not a Codex ModelInfo and contains no replacement prompt.
   const nativeModels = new Map(bundled.models.map(model => [model.slug, model]));
   const models = [];
-  let skipped = 0;
+  const skipped = [];
   for (const card of catalog) {
     const native = nativeModels.get(card.id);
-    if (!native) { skipped++; continue; }
+    if (!native) { skipped.push(card.id); continue; }
     const efforts = card.thinking?.efforts;
+    if (!card.reasoning || !Array.isArray(efforts)) {
+      throw new Error(`Codex model ${card.id}: gateway does not advertise compatible reasoning metadata; cannot retain installed defaults`);
+    }
+    // Only advertise efforts the installed client actually implements, keeping
+    // its descriptions and default unless the gateway explicitly chooses one.
+    const supported = native.supported_reasoning_levels?.filter(level => efforts.includes(level.effort)) ?? [];
+    const defaultLevel = card.thinking.defaultLevel ?? native.default_reasoning_level;
+    if (!supported.some(level => level.effort === defaultLevel)) {
+      const source = card.thinking.defaultLevel === undefined ? 'native' : 'gateway';
+      throw new Error(`Codex model ${card.id}: ${source} default reasoning effort ${defaultLevel} is not supported by both the gateway and installed client (allowed: ${supported.map(level => level.effort).join(', ') || 'none'}); choose an explicit compatible gateway default or update the client`);
+    }
+    if (supported.length < efforts.length) {
+      const unavailable = efforts.filter(effort => !supported.some(level => level.effort === effort));
+      console.error(`Codex model ${card.id}: gateway reasoning efforts ${unavailable.join(', ')} are unavailable in the installed client; exposing only ${supported.map(level => level.effort).join(', ')} with default ${defaultLevel}.`);
+    }
+    const reasoning = { supported_reasoning_levels: supported, default_reasoning_level: defaultLevel };
     models.push({
       ...native, slug: card.id, display_name: card.display_name ?? card.id,
-      context_window: card.context_length, max_context_window: card.context_length,
+      context_window: Math.min(native.context_window, card.context_length),
+      max_context_window: Math.min(native.max_context_window ?? native.context_window, card.context_length),
       input_modalities: card.input_modalities, supported_in_api: true,
-      ...(Array.isArray(efforts) ? {
-        supported_reasoning_levels: efforts.map(effort => ({ effort, description: effort })),
-        default_reasoning_level: card.thinking.defaultLevel ?? efforts[0],
-      } : {}),
+      ...reasoning,
     });
   }
   if (!models.length) throw new Error('installed Codex has no native metadata for any gateway model; update the client before setup');
-  if (skipped) console.error(`Codex: excluded ${skipped} gateway models without installed metadata; ${models.length} supported models remain.`);
-  const model = models.find(model => model.slug === current.model)?.slug ?? models[0].slug;
+  if (skipped.length) console.error(`Codex: excluded gateway models without installed native metadata: ${skipped.join(', ')}; ${models.length} supported models remain.`);
+  let selected = models.find(model => model.slug === current.model);
+  const gatewayDefault = models.find(model => model.slug === catalog[0].id);
+  if (!selected) {
+    selected = gatewayDefault;
+    if (!selected) {
+      for (const candidate of models) {
+        if (!Number.isFinite(candidate.priority)) {
+          throw new Error(`Codex model ${candidate.slug} has no native numeric priority; cannot choose a compatible default`);
+        }
+        if (!selected || candidate.priority < selected.priority) selected = candidate;
+      }
+    }
+  }
+  if (current.model && current.model !== selected.slug) console.error(`Codex: replacing unsupported model ${current.model} with ${selected.slug}.`);
+  if (!gatewayDefault) {
+    const reason = selected.slug === current.model ? 'keeping the existing supported selection' : `using the best installed native priority (${selected.priority})`;
+    console.error(`Codex: gateway default ${catalog[0].id} has no installed native metadata; ${reason}: ${selected.slug}. A client release containing that model's native metadata is required to select it.`);
+  }
+  if (current.model_reasoning_effort !== undefined &&
+      !selected.supported_reasoning_levels?.some(level => level.effort === current.model_reasoning_effort)) {
+    throw new Error(`Codex model ${selected.slug}: configured reasoning effort ${current.model_reasoning_effort} is not supported by both the gateway and installed client; resolve the explicit effort before setup`);
+  }
   save(modelsFile, { models });
   save(patchFile, {
-    model, model_provider: 'agent_auth', model_catalog_json: finalModelsFile,
+    model: selected.slug, model_provider: 'agent_auth', model_catalog_json: finalModelsFile,
     features: { enable_request_compression: false },
     model_providers: { agent_auth: {
       name: 'Agent Auth', base_url: baseUrl, wire_api: 'responses',
@@ -1226,10 +2091,19 @@ AGENT_AUTH_174B49BDE65749A4F18F
   "${cat_bin}" > "${scratch_dir}/native/config-io.cjs" <<'AGENT_AUTH_5C44F65AEEC4D5B50F96'
 'use strict';
 const fs = require('node:fs');
-const { isDeepStrictEqual } = require('node:util');
 const jsonc = require('../vendor/jsonc-parser/main.js');
 
 function object(value) { return value !== null && typeof value === 'object' && !Array.isArray(value); }
+// JSONC produces null-prototype objects; saved/constructed JSON values need the
+// same value comparison regardless of that parser detail or object key order.
+function equal(left, right) {
+  if (left === right) return true;
+  if (left === null || right === null || typeof left !== 'object' || typeof right !== 'object'
+    || Array.isArray(left) !== Array.isArray(right)) return false;
+  const keys = Object.keys(left);
+  return keys.length === Object.keys(right).length
+    && keys.every(key => Object.hasOwn(right, key) && equal(left[key], right[key]));
+}
 function parse(text, strict = false) {
   const errors = [];
   const tree = jsonc.parseTree(text.replace(/^\uFEFF/, ' '), errors, { allowTrailingComma: !strict, disallowComments: strict });
@@ -1257,7 +2131,7 @@ function patch(source, destination, changes, strict = false) {
   function apply(path, desired) {
     let existing = value;
     for (const key of path) existing = existing?.[key];
-    if (isDeepStrictEqual(existing, desired)) return;
+    if (equal(existing, desired)) return;
     text = jsonc.applyEdits(text, jsonc.modify(text, path, desired, {
       formattingOptions: { insertSpaces: true, tabSize: 2, eol: text.includes('\r\n') ? '\r\n' : '\n' },
     }));
@@ -1275,8 +2149,75 @@ function checkOwnedProvider(existing, baseUrl, field) {
     throw new Error('the setup-owned provider name is already used by another configuration');
   }
 }
-module.exports = { object, parse, load, patch, save, command, checkOwnedProvider };
+module.exports = { object, equal, parse, load, patch, save, command, checkOwnedProvider };
 AGENT_AUTH_5C44F65AEEC4D5B50F96
+  "${cat_bin}" > "${scratch_dir}/native/omp.cjs" <<'AGENT_AUTH_BD4D881668518F214714'
+'use strict';
+const fs = require('node:fs');
+
+// Stock OMP: models.yml entries under the built-in provider ids patch the bundled
+// models by id, so existing selections such as anthropic/claude-... keep their
+// names while every request goes to the gateway. Codex uses OMP's generic
+// Responses codec: the Codex codec hardcodes a /codex/responses suffix that the
+// gateway's /openai-codex/v1/responses route does not have.
+const EFFORTS = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
+const THINKING_MODES = ['effort', 'budget', 'google-level', 'anthropic-adaptive', 'anthropic-budget-effort'];
+const PROVIDERS = ['anthropic', 'openai-codex'];
+const api = provider => (provider === 'anthropic' ? 'anthropic-messages' : 'openai-responses');
+const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+
+function model(card, provider) {
+  const value = {
+    id: card.id, name: card.display_name ?? card.id, api: api(provider),
+    reasoning: card.reasoning, input: card.input_modalities,
+    contextWindow: card.context_length, maxTokens: card.max_output_tokens,
+    cost: { input: card.cost.input, output: card.cost.output, cacheRead: card.cost.cacheRead, cacheWrite: card.cost.cacheWrite },
+  };
+  const efforts = Array.isArray(card.thinking?.efforts) ? card.thinking.efforts.filter(effort => EFFORTS.includes(effort)) : [];
+  if (efforts.length && THINKING_MODES.includes(card.thinking.mode)) {
+    value.thinking = { mode: card.thinking.mode, efforts };
+    if (EFFORTS.includes(card.thinking.defaultLevel)) value.thinking.defaultLevel = card.thinking.defaultLevel;
+  }
+  // The Codex backend sets its own output ceiling; the generic codec must not send one.
+  if (provider === 'openai-codex') value.omitMaxOutputTokens = true;
+  return value;
+}
+function block(catalogFile, gateway) {
+  const catalog = JSON.parse(fs.readFileSync(catalogFile, 'utf8'));
+  const result = {};
+  for (const [provider, cards] of Object.entries(catalog)) {
+    result[provider] = {
+      baseUrl: `${gateway}/${provider}${provider === 'openai-codex' ? '/v1' : ''}`,
+      api: api(provider), authHeader: true, models: cards.map(card => model(card, provider)),
+    };
+  }
+  return JSON.stringify(result) + '\n';
+}
+// Credential headers on a managed provider (any spelling, at the provider or on
+// a model override) would conflict with the gateway bearer; lease.mjs refuses
+// such requests. Prints one yq selector per header so the merge can drop them.
+const credentialHeader = key => ['x-api-key', 'authorization'].includes(key.toLowerCase());
+const selector = keys => '.' + keys.map(key => `[${JSON.stringify(key)}]`).join('');
+function credentials(configFile) {
+  const config = JSON.parse(fs.readFileSync(configFile, 'utf8'));
+  const lines = [];
+  for (const id of PROVIDERS) {
+    const provider = config?.providers?.[id];
+    if (!object(provider)) continue;
+    for (const key of Object.keys(object(provider.headers) ? provider.headers : {})) if (credentialHeader(key)) lines.push(selector(['providers', id, 'headers', key]));
+    for (const [name, override] of Object.entries(object(provider.modelOverrides) ? provider.modelOverrides : {})) {
+      for (const key of Object.keys(object(override?.headers) ? override.headers : {})) if (credentialHeader(key)) lines.push(selector(['providers', id, 'modelOverrides', name, 'headers', key]));
+    }
+  }
+  return lines.map(line => line + '\n').join('');
+}
+try {
+  const [action, ...args] = process.argv.slice(2);
+  if (action === 'block') process.stdout.write(block(args[0], args[1]));
+  else if (action === 'credentials') process.stdout.write(credentials(args[0]));
+  else throw new Error('unknown OMP configuration action');
+} catch (error) { console.error(`setup failed: ${error.message}`); process.exitCode = 1; }
+AGENT_AUTH_BD4D881668518F214714
   "${cat_bin}" > "${scratch_dir}/native/opencode.cjs" <<'AGENT_AUTH_2464A809E52279A1DF3E'
 'use strict';
 const fs = require('node:fs');
@@ -1318,8 +2259,12 @@ try {
     }]);
   }
   const available = Object.entries(catalog).flatMap(([provider, cards]) => cards.map(card => `agent-auth-${provider}/${card.id}`));
-  changes.push([['model'], available.includes(current.model) ? current.model : available[0]]);
-  changes.push([['small_model'], available.includes(current.small_model) ? current.small_model : available[0]]);
+  for (const key of ['model', 'small_model']) {
+    const previous = current[key];
+    const selected = available.find(value => value === previous || value === `agent-auth-${previous}`) ?? available[0];
+    if (previous && selected !== previous && selected !== `agent-auth-${previous}`) console.error(`OpenCode: replacing unsupported ${key} ${previous} with ${selected}.`);
+    changes.push([[key], selected]);
+  }
   if (Array.isArray(current.enabled_providers)) changes.push([['enabled_providers'], [...new Set([...current.enabled_providers, ...ids])]]);
   patch(source, destination, changes);
 } catch (error) { console.error(`setup failed: ${error.message}`); process.exitCode = 1; }
@@ -1347,9 +2292,7 @@ function model(card, provider) {
     value.samplingParams = { instructions: '', store: false, include: ['reasoning.encrypted_content'] };
   } else {
     // Copy only controls implemented by Pi's Anthropic API, not OMP's compat schema.
-    const keys = ['supportsEagerToolInputStreaming', 'supportsLongCacheRetention', 'sendSessionAffinityHeaders',
-      'supportsCacheControlOnTools', 'supportsTemperature', 'forceAdaptiveThinking', 'allowEmptySignature',
-      'supportsStrictTools', 'supportsMidConvoEffort', 'supportsToolReferences'];
+    const keys = ['supportsEagerToolInputStreaming', 'supportsLongCacheRetention'];
     value.compat = Object.fromEntries(keys.filter(key => typeof card.compat?.[key] === 'boolean').map(key => [key, card.compat[key]]));
     if (card.thinking?.mode === 'anthropic-adaptive') value.compat.forceAdaptiveThinking = true;
   }
@@ -1377,8 +2320,12 @@ try {
     }
     patch(source, destination, changes);
   } else if (kind === 'settings') {
-    const provider = Object.keys(catalog).find(key => current.defaultProvider === `agent-auth-${key}`) ?? selected;
+    const provider = Object.keys(catalog).find(key => current.defaultProvider === key || current.defaultProvider === `agent-auth-${key}`) ?? selected;
     const selectedModel = catalog[provider].find(card => card.id === current.defaultModel)?.id ?? catalog[provider][0].id;
+    if (current.defaultProvider && current.defaultProvider !== provider && current.defaultProvider !== `agent-auth-${provider}`
+      || current.defaultModel && current.defaultModel !== selectedModel) {
+      console.error(`Pi: replacing unsupported selection ${current.defaultProvider ?? ''}/${current.defaultModel ?? ''} with agent-auth-${provider}/${selectedModel}.`);
+    }
     patch(source, destination, [
       [['defaultProvider'], `agent-auth-${provider}`], [['defaultModel'], selectedModel],
       [['retry', 'enabled'], false], [['retry', 'maxRetries'], 0], [['retry', 'provider', 'maxRetries'], 0],
@@ -1429,6 +2376,366 @@ if status:
     print('setup failed: selected client refused isolated validation', file=sys.stderr)
     sys.exit(1)
 AGENT_AUTH_E968C0B43D8C55F66557
+  "${cat_bin}" > "${scratch_dir}/native/switch.cjs" <<'AGENT_AUTH_52ABCB0691AE5994688D'
+'use strict';
+const fs = require('node:fs');
+const { execFileSync } = require('node:child_process');
+const { createHash } = require('node:crypto');
+const { object, equal, parse, load, patch, save } = require('./config-io.cjs');
+
+const absent = Object.freeze({ present: false });
+const own = (value, key) => object(value) && Object.hasOwn(value, key);
+function at(value, keys) {
+  for (const key of keys) {
+    if (!own(value, key)) return absent;
+    value = value[key];
+  }
+  return { present: true, value };
+}
+function put(value, keys, cell) {
+  for (const key of keys.slice(0, -1)) {
+    if (!own(value, key) || !object(value[key])) Object.defineProperty(value, key, { value: {}, enumerable: true, configurable: true, writable: true });
+    value = value[key];
+  }
+  if (cell.present) Object.defineProperty(value, keys.at(-1), { value: cell.value, enumerable: true, configurable: true, writable: true });
+  else delete value[keys.at(-1)];
+}
+const digest = file => createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+const fieldKey = keys => JSON.stringify(keys);
+const providerIds = ['anthropic', 'openai-codex'];
+// Legacy OMP installers (no switch state) wrote only these routing fields.
+const legacyOmpKeys = ['baseUrl', 'apiKey', 'transport', 'discovery'];
+// Conflicting credential headers on a managed provider make the gateway refuse
+// the request (lease.mjs). Header names are matched case-insensitively at the
+// provider and at every model override; the exact spellings found in a config
+// become owned fields so a disable restores them.
+const credentialHeader = key => ['x-api-key', 'authorization'].includes(String(key).toLowerCase());
+function credentialHeaderPaths(value) {
+  const paths = [];
+  for (const id of providerIds) {
+    const provider = value?.providers?.[id];
+    if (!object(provider)) continue;
+    for (const key of Object.keys(object(provider.headers) ? provider.headers : {})) if (credentialHeader(key)) paths.push(['providers', id, 'headers', key]);
+    for (const [model, override] of Object.entries(object(provider.modelOverrides) ? provider.modelOverrides : {})) {
+      for (const key of Object.keys(object(override?.headers) ? override.headers : {})) if (credentialHeader(key)) paths.push(['providers', id, 'modelOverrides', model, 'headers', key]);
+    }
+  }
+  return paths;
+}
+const credentialHeaderPath = keys => keys.length >= 4 && keys[0] === 'providers' && providerIds.includes(keys[1]) && credentialHeader(keys.at(-1))
+  && (keys.length === 4 && keys[2] === 'headers' || keys.length === 6 && keys[2] === 'modelOverrides' && keys[4] === 'headers');
+const legacyTransport = provider => object(provider) && ['provider-wire', 'pi-native'].includes(provider.transport);
+// Static owned paths plus the credential-header spellings present in VALUES.
+function ownedPaths(harness, role, ...values) {
+  switch (harness) {
+    case 'omp': return role === 'settings' ? [['modelRoles', 'default'], ['enabledModels']] : [
+      ...providerIds.flatMap(id => [...legacyOmpKeys, 'authHeader', 'api', 'models'].map(key => ['providers', id, key])),
+      ...values.flatMap(credentialHeaderPaths).filter((keys, index, all) => all.findIndex(other => equal(other, keys)) === index),
+    ];
+    case 'claude-code': return [['apiKeyHelper'], ['model'], ...['ANTHROPIC_BASE_URL', 'ANTHROPIC_MODEL', 'ANTHROPIC_DEFAULT_HAIKU_MODEL',
+      'CLAUDE_CODE_MAX_RETRIES', 'CLAUDE_CODE_RETRY_WATCHDOG', 'CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK'].map(key => ['env', key])];
+    case 'codex': return [['model'], ['model_provider'], ['model_catalog_json'], ['features', 'enable_request_compression'], ['model_providers', 'agent_auth']];
+    case 'opencode': return [['model'], ['small_model'], ['enabled_providers'], ...providerIds.map(id => ['provider', `agent-auth-${id}`])];
+    case 'pi': return role === 'models' ? providerIds.map(id => ['providers', `agent-auth-${id}`]) :
+      [['defaultProvider'], ['defaultModel'], ['retry', 'enabled'], ['retry', 'maxRetries'], ['retry', 'provider', 'maxRetries'], ['transport']];
+    default: throw new Error('unknown switch client');
+  }
+}
+// A config is gateway-marked only by positive installer provenance. The standard
+// OMP protocol (built-in provider pinned to a base URL with explicit models) is
+// also an ordinary custom-provider shape, so it is never inferred: its
+// provenance is the switch state this installer always writes with it.
+function marked(harness, role, value) {
+  switch (harness) {
+    case 'omp': return role === 'models' && providerIds.some(id => legacyTransport(value.providers?.[id]));
+    case 'claude-code': return typeof value.apiKeyHelper === 'string' && /agent-auth[\\/]token/.test(value.apiKeyHelper);
+    case 'codex': return value.model_provider === 'agent_auth' || own(value.model_providers, 'agent_auth');
+    case 'opencode': return providerIds.some(id => own(value.provider, `agent-auth-${id}`)) || [value.model, value.small_model].some(item => typeof item === 'string' && item.startsWith('agent-auth-'));
+    case 'pi': return role === 'models' ? providerIds.some(id => own(value.providers, `agent-auth-${id}`)) : typeof value.defaultProvider === 'string' && value.defaultProvider.startsWith('agent-auth-');
+  }
+}
+function readConfig(file, format, yq, strict) {
+  if (!file) return {};
+  if (format === 'json') return load(file, strict);
+  let decoded;
+  try { decoded = execFileSync(yq, ['-p', format, '-o', 'json', '. // {}', file], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 16 * 1024 * 1024 }); }
+  catch { throw new Error(`could not parse ${format} configuration for local switching`); }
+  const value = parse(decoded, true);
+  if (!object(value)) throw new Error('configuration root must be an object');
+  return value;
+}
+function editConfig(file, changes, expected, yq, strict) {
+  if (!changes.length) return false;
+  if (file.format === 'json') {
+    patch(file.original || file.candidate, file.candidate, changes.map(change => [change.path, change.cell.present ? change.cell.value : undefined]), strict);
+  } else {
+    const dataFile = file.candidate + '.values.json';
+    save(dataFile, changes.map(change => change.cell));
+    const selector = keys => '.' + keys.map(key => `[${JSON.stringify(key)}]`).join('');
+    // Values travel through a private JSON file, never command arguments/logs.
+    const expression = ['. = (. // {})', ...changes.map((change, index) => change.cell.present
+      ? `${selector(change.path)} = load(strenv(AGENT_AUTH_SWITCH_VALUES))[${index}].value`
+      : `del(${selector(change.path)})`)].join(' | ');
+    try {
+      const text = execFileSync(yq, ['-p', file.format, '-o', file.format, expression, file.original || file.candidate],
+        { encoding: 'utf8', env: { ...process.env, AGENT_AUTH_SWITCH_VALUES: dataFile }, stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 16 * 1024 * 1024 });
+      fs.writeFileSync(file.candidate, text, { mode: 0o600 });
+    } catch { throw new Error(`could not safely patch ${file.format} gateway fields`); }
+    finally { fs.rmSync(dataFile, { force: true }); }
+  }
+  if (!equal(readConfig(file.candidate, file.format, yq, strict), expected)) throw new Error('configuration editor changed unrelated values; nothing was committed');
+  return true;
+}
+function normalizedPaths(paths, baseline) {
+  const unique = new Map();
+  for (let keys of paths) {
+    for (let count = 1; count < keys.length; count++) {
+      const parent = at(baseline, keys.slice(0, count));
+      if (parent.present && !object(parent.value)) { keys = keys.slice(0, count); break; }
+    }
+    unique.set(fieldKey(keys), keys);
+  }
+  const result = [...unique.values()];
+  return result.filter(keys => !result.some(other => other.length < keys.length && other.every((key, index) => keys[index] === key)));
+}
+function absentParents(paths, baseline) {
+  const parents = new Map();
+  for (const keys of paths) for (let count = 1; count < keys.length; count++) {
+    const prefix = keys.slice(0, count);
+    if (!at(baseline, prefix).present) parents.set(fieldKey(prefix), prefix);
+  }
+  return [...parents.values()].sort((a, b) => b.length - a.length);
+}
+function cellValid(cell) { return object(cell) && typeof cell.present === 'boolean' && (cell.present ? own(cell, 'value') : !own(cell, 'value')); }
+function validateState(state, harness, tokenFile, files) {
+  // State written by an earlier installer may predate a config file this
+  // version also owns (OMP's config.yml); every recorded file must still match.
+  if (state.version !== 1 || state.harness !== harness || state.tokenFile !== tokenFile || !['enabled', 'disabled'].includes(state.mode) ||
+      !Array.isArray(state.files) || !Array.isArray(state.history) || state.files.length > files.length ||
+      state.gateway !== undefined && typeof state.gateway !== 'string') throw new Error('switch state does not match this client/scope; restore its original state file or select the original profile/config path');
+  const seen = new Set();
+  for (const record of state.files) {
+    const file = files.find(file => file.path === record.path && file.kind === record.kind && file.role === record.role && file.format === record.format);
+    if (!file || seen.has(record.path)) throw new Error('switch state file targets differ from the selected scope');
+    seen.add(record.path);
+    if (file.kind !== 'config') {
+      if (!/^[a-f0-9]{64}$/.test(record.sha256)) throw new Error('switch state contains an invalid credential/asset fingerprint');
+      continue;
+    }
+    if (!Array.isArray(record.fields) || !Array.isArray(record.absentParents)) throw new Error('switch state has invalid owned fields');
+    const allowed = ownedPaths(harness, file.role);
+    const owned = keys => allowed.some(full => keys.length <= full.length && keys.every((key, index) => key === full[index])) || harness === 'omp' && credentialHeaderPath(keys);
+    const fieldNames = new Set();
+    for (const field of record.fields) {
+      if (!Array.isArray(field.path) || !field.path.length || !owned(field.path) ||
+          !cellValid(field.before) || !cellValid(field.gateway) || field.legacy !== undefined && !cellValid(field.legacy) ||
+          fieldNames.has(fieldKey(field.path))) throw new Error('switch state contains an invalid owned field');
+      if (field.members !== undefined && (harness !== 'opencode' || !equal(field.path, ['enabled_providers']) ||
+          !Array.isArray(field.members) || !field.members.every(id => providerIds.some(provider => id === `agent-auth-${provider}`)) ||
+          !Array.isArray(field.before.value) || !Array.isArray(field.gateway.value))) throw new Error('switch state contains invalid provider-list ownership');
+      fieldNames.add(fieldKey(field.path));
+    }
+    for (const keys of record.absentParents) {
+      if (!Array.isArray(keys) || !keys.length || !(allowed.some(full => keys.length < full.length && keys.every((key, index) => key === full[index]))
+          || harness === 'omp' && record.fields.some(field => field.path.length > keys.length && keys.every((key, index) => key === field.path[index])))) throw new Error('switch state contains an invalid parent field');
+    }
+  }
+  for (const history of state.history) {
+    if (typeof history.path !== 'string' || !files.some(file => file.kind === 'config' && history.path.startsWith(file.path + '.pre-agent-auth.')) ||
+        !/^[a-f0-9]{64}$/.test(history.sha256)) throw new Error('switch state contains an invalid backup target');
+  }
+}
+function recoverBaseline(file, history, harness, yq, strict, current) {
+  const candidates = [];
+  const owned = ownedPaths(harness, file.role);
+  for (const backup of history.filter(backup => backup.role === file.path)) {
+    let value;
+    try { value = readConfig(backup.original, file.format, yq, strict); } catch { continue; }
+    if (marked(harness, file.role, value)) continue;
+    const paths = normalizedPaths(owned, value);
+    const projection = { fields: paths.map(keys => [keys, at(value, keys)]), absentParents: absentParents(paths, value) };
+    if (!candidates.some(candidate => equal(candidate.projection, projection))) candidates.push({ value, projection });
+  }
+  if (candidates.length > 1) throw new Error(`cannot recover original gateway-owned settings for ${file.path}: conflicting pre-agent-auth backups. Keep the backup that reflects your normal settings, remove the others, then rerun; no files were changed`);
+  if (candidates.length === 1) return candidates[0].value;
+  if (harness !== 'omp') throw new Error(`cannot recover original gateway-owned settings for ${file.path}: no original pre-agent-auth backup. Restore the original owned settings manually (keep native login/auth records), then run --action configure; no files were changed`);
+  // A legacy OMP installer wrote its routes without a backup (the file did not
+  // exist before it). It only ever wrote the routing fields of the providers it
+  // marked, so normal mode is the file without exactly those; a provider left
+  // empty by that was created by the installer and goes too.
+  const baseline = structuredClone(current);
+  for (const id of providerIds) {
+    if (!legacyTransport(baseline.providers?.[id])) continue;
+    for (const key of legacyOmpKeys) delete baseline.providers[id][key];
+    if (!Object.keys(baseline.providers[id]).length) delete baseline.providers[id];
+  }
+  if (object(baseline.providers) && !Object.keys(baseline.providers).length) delete baseline.providers;
+  console.error(`! no pre-gateway backup exists for ${file.path}; normal mode drops the legacy gateway routes (baseUrl, apiKey, transport, discovery) of the marked providers and keeps everything else`);
+  return baseline;
+}
+function main() {
+  const [action, harness, profile, tokenFile, yq, manifest, gatewayUrl = ''] = process.argv.slice(2);
+  const strict = harness === 'claude-code';
+  const entries = fs.readFileSync(manifest, 'utf8').replace(/\n$/, '').split('\n').map(line => {
+    const [index, target, original, candidate, kind, format, role, restoreSource = ''] = line.split('\t');
+    return { index, path: target, original, candidate, kind, format, role, restoreSource };
+  });
+  const stateFile = entries.find(file => file.kind === 'state');
+  const files = entries.filter(file => ['config', 'token', 'asset'].includes(file.kind));
+  const history = entries.filter(file => file.kind === 'history');
+  const current = new Map(files.filter(file => file.kind === 'config').map(file => [file.path, readConfig(file.original, file.format, yq, strict)]));
+  let state = stateFile.original ? load(stateFile.original, true) : undefined;
+  if (state) validateState(state, harness, tokenFile, files);
+  const previousState = state;
+  const hasGateway = files.some(file => file.kind === 'config' && marked(harness, file.role, current.get(file.path)));
+  const operations = new Map(entries.map(file => [file.index, 'keep']));
+  if (!state && action !== 'configure' && !hasGateway) {
+    if (action === 'enable') throw new Error('no saved gateway configuration in this scope; run --action configure first');
+    if (files.some(file => file.kind !== 'config' && file.original)) throw new Error('a private gateway key/catalog exists but no matching switch state or gateway config was found; select the original profile/config path before switching, or preserve and remove the orphaned private files manually');
+    for (const [index, operation] of operations) console.log(`${index}\t${operation}`);
+    return;
+  }
+  if (!state || action === 'configure') {
+    const records = [];
+    for (const file of files) {
+      const previous = state?.files.find(record => record.path === file.path);
+      if (file.kind !== 'config') {
+        const source = action === 'configure' ? file.candidate : file.original;
+        if (!source) {
+          if (action !== 'enable') {
+            // Restoring normal login must not depend on a still-usable gateway key.
+            records.push({ path: file.path, kind: file.kind, format: file.format, role: file.role, sha256: digest(file.candidate) });
+            continue;
+          }
+          throw new Error(`saved gateway ${file.kind} is missing: ${file.path}; restore the private file or run --action configure`);
+        }
+        records.push({ path: file.path, kind: file.kind, format: file.format, role: file.role, sha256: digest(source) });
+        if (action === 'configure') operations.set(file.index, 'managed');
+        continue;
+      }
+      const value = current.get(file.path);
+      const gateway = action === 'configure' ? readConfig(file.candidate, file.format, yq, strict) : value;
+      const legacy = !state && marked(harness, file.role, value);
+      const baseline = legacy ? recoverBaseline(file, history, harness, yq, strict, value) :
+        file.restoreSource ? readConfig(file.restoreSource, file.format, yq, strict) : value;
+      const paths = normalizedPaths([...ownedPaths(harness, file.role, value, gateway), ...(previous?.fields.map(field => field.path) ?? [])], baseline);
+      const fields = [];
+      for (const keys of paths) {
+        let before = at(baseline, keys);
+        const old = previous?.fields.find(field => equal(field.path, keys));
+        // Enabled edits belong to the gateway, never to normal login. Only an
+        // explicit reconfigure while disabled may update the saved normal value.
+        if (old && state.mode === 'enabled') before = old.before;
+        if (old?.members && Array.isArray(at(value, keys).value)) {
+          before = { present: true, value: at(value, keys).value.filter(id => state.mode !== 'enabled' || !old.members.includes(id)) };
+        }
+        const after = at(gateway, keys);
+        const now = at(value, keys);
+        if (!equal(before, after) || !equal(now, before)) {
+          const field = { path: keys, before, gateway: after };
+          // What the file holds right now (a legacy route, or the previous gateway
+          // value) is what an interrupted cutover leaves behind; switching
+          // recognizes it as the gateway's own residue, never as an outside edit.
+          if (!equal(now, before) && !equal(now, after)) field.legacy = now;
+          if (harness === 'opencode' && equal(keys, ['enabled_providers']) && Array.isArray(before.value) && Array.isArray(after.value)) {
+            field.members = after.value.filter(id => !before.value.includes(id) && providerIds.some(provider => id === `agent-auth-${provider}`));
+            if (!field.members.length) continue;
+            field.before = { present: true, value: after.value.filter(id => !field.members.includes(id)) };
+          }
+          fields.push(field);
+        }
+      }
+      const parents = previous && state.mode === 'enabled' ? previous.absentParents : absentParents(paths, baseline);
+      records.push({ path: file.path, kind: file.kind, format: file.format, role: file.role, fields, absentParents: parents });
+      // A config that gains no gateway field is left alone (not created, not rewritten).
+      if (action === 'configure') operations.set(file.index, !fields.length ? 'keep' : previousState || legacy ? 'managed' : 'write');
+    }
+    const retiredHistory = new Map((state?.history ?? []).map(item => [item.path, item]));
+    for (const backup of history) {
+      const owner = files.find(file => file.path === backup.role);
+      if (!owner) throw new Error('backup does not belong to the selected config scope');
+      let value;
+      try { value = readConfig(backup.original, owner.format, yq, strict); } catch { continue; }
+      if (marked(harness, owner.role, value) && !retiredHistory.has(backup.path)) retiredHistory.set(backup.path, { path: backup.path, sha256: digest(backup.original) });
+    }
+    state = { version: 1, harness, profile, tokenFile, mode: 'enabled', files: records, history: [...retiredHistory.values()] };
+    // Which gateway issued the stored key: a later configure elsewhere can warn
+    // before reusing it. Older state has no record.
+    if (action === 'configure' && gatewayUrl) state.gateway = gatewayUrl;
+    else if (typeof previousState?.gateway === 'string') state.gateway = previousState.gateway;
+  }
+  if (action !== 'configure') {
+    const desiredMode = action === 'enable' ? 'enabled' : 'disabled';
+    for (const file of files) {
+      const record = state.files.find(record => record.path === file.path);
+      // A config file this state never recorded has no gateway fields to switch.
+      if (record === undefined && file.kind === 'config') continue;
+      if (file.kind !== 'config') {
+        // Disable does not need working credentials. Enable/unset must not use or
+        // remove a later key/catalog written by someone else.
+        if (action === 'disable') continue;
+        if (!file.original) {
+          if (action === 'unset') continue;
+          // OMP's routes embed the complete key; old installations have no file.
+          if (harness === 'omp' && file.kind === 'token') continue;
+          throw new Error(`saved gateway ${file.kind} is missing: ${file.path}; restore it or run --action configure`);
+        }
+        if (digest(file.original) !== record.sha256) throw new Error(`gateway ${file.kind} changed outside setup: ${file.path}; restore the saved version or reconfigure explicitly`);
+        if (action === 'unset') operations.set(file.index, 'delete');
+        continue;
+      }
+      const value = current.get(file.path);
+      const expected = structuredClone(value);
+      const changes = [];
+      for (const field of record.fields) {
+        for (let count = 1; count < field.path.length; count++) {
+          const parent = at(value, field.path.slice(0, count));
+          if (parent.present && !object(parent.value)) throw new Error(`gateway-owned field parent changed outside setup: ${file.path} (${field.path.slice(0, count).join('.')}); preserve or restore that edit before switching`);
+        }
+        const actual = at(value, field.path);
+        let to = field[desiredMode === 'enabled' ? 'gateway' : 'before'];
+        if (field.members) {
+          if (!Array.isArray(actual.value) || (field.members.some(id => actual.value.includes(id)) &&
+              !field.members.every(id => actual.value.includes(id)))) throw new Error(`gateway provider-list membership changed outside setup: ${file.path}; restore the gateway entries before switching`);
+          to = { present: true, value: desiredMode === 'enabled'
+            ? [...actual.value.filter(id => !field.members.includes(id)), ...field.members]
+            : actual.value.filter(id => !field.members.includes(id)) };
+        } else if (!equal(actual, field.before) && !equal(actual, field.gateway) && !(field.legacy !== undefined && equal(actual, field.legacy))) throw new Error(`gateway-owned field changed outside setup: ${file.path} (${field.path.join('.')}); preserve your edit, or restore that field to its saved value before switching`);
+        if (!equal(actual, to)) { changes.push({ path: field.path, cell: to }); put(expected, field.path, to); }
+      }
+      if (desiredMode === 'disabled') for (const keys of record.absentParents) {
+        const parent = at(expected, keys);
+        if (parent.present && object(parent.value) && !Object.keys(parent.value).length) {
+          changes.push({ path: keys, cell: absent }); put(expected, keys, absent);
+        }
+      }
+      if (editConfig(file, changes, expected, yq, strict)) operations.set(file.index, 'managed');
+    }
+    if (action === 'unset') {
+      for (const old of state.history) {
+        const backup = history.find(file => file.path === old.path);
+        if (!backup) {
+          if (fs.existsSync(old.path)) throw new Error('saved gateway backup is no longer a safe regular file');
+          continue;
+        }
+        if (digest(backup.original) !== old.sha256) throw new Error(`gateway backup changed outside setup: ${old.path}; preserve it separately before unsetting`);
+        operations.set(backup.index, 'delete');
+      }
+      operations.set(stateFile.index, stateFile.original ? 'delete' : 'keep');
+    } else {
+      state.mode = desiredMode;
+      save(stateFile.candidate, state);
+      operations.set(stateFile.index, 'managed');
+    }
+  } else {
+    save(stateFile.candidate, state);
+    operations.set(stateFile.index, 'managed');
+  }
+  for (const [index, operation] of operations) console.log(`${index}\t${operation}`);
+}
+try { main(); }
+catch (error) { console.error(`setup failed: ${error.message}`); process.exitCode = 1; }
+AGENT_AUTH_52ABCB0691AE5994688D
   "${cat_bin}" > "${scratch_dir}/native/validate-schema.py" <<'AGENT_AUTH_E695311683A398F9FCFC'
 #!/usr/bin/env python3
 """Validate an exact staged JSON value without resolving network references."""
@@ -15782,15 +17089,31 @@ AGENT_AUTH_44434D20A9A2D72C71B4
 main() {
   parse_options "$@"
   init_scratch
+  if [[ "${action}" == configure ]]; then
+    collect_endpoint
+    confirm_gateway_reachable
+  fi
   adapter="${harness//-/_}"
   "${adapter}_prepare"
+  if [[ "${action}" != configure ]]; then
+    overwrite=1
+    switch_begin
+    switch_stage_local
+    switch_finish
+    commit_transaction
+    ui_title "${harness} gateway ${action} completed locally"
+    report_transaction
+    return
+  fi
   confirm_existing_setup
+  switch_begin
   load_stored_key
   choose_key
   if [[ "${harness}" != omp ]]; then native_validate_client; fi
   validate_gateway
   "${adapter}_stage"
   stage_key
+  switch_finish
   commit_transaction
   if [[ "${harness}" == omp ]]; then omp_report; else native_report; fi
 }
