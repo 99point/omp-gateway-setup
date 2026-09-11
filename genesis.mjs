@@ -73,14 +73,49 @@ function acceptKey(token) {
   secrets.add(token);
   return true;
 }
+// Before anything is printed, the exported AGENT_AUTH_TOKEN and the stored
+// session key are registered, so a key pasted into the wrong prompt, typed
+// into a URL or quoted by a child is rendered as <key>. Nothing is reported
+// here; the command that needs the session explains what is wrong with it.
+function primeSecrets() {
+  acceptKey(process.env.AGENT_AUTH_TOKEN);
+  let text = null;
+  try { text = readSessionText(); } catch { return; }
+  if (text === null) return;
+  try { acceptKey(JSON.parse(text)?.token); } catch { /* loadSession reports */ }
+}
 
 // ── install layout ──────────────────────────────────────────────────────────
 const here = path.dirname(fileURLToPath(import.meta.url));
+const octal = mode => (mode & 0o777).toString(8).padStart(4, '0');
+// release.json is trusted only when nobody else could have written it: opened
+// without following a link and without blocking (a FIFO in its place is
+// refused, never waited on), then judged by fstat as a regular file owned by
+// this user that only this user may write, inside an install directory with
+// the same properties. Absent (a source checkout) is null.
 function releaseInfo() {
+  const file = path.join(here, 'release.json');
+  let fd;
+  try { fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK); } catch (error) {
+    if (error.code === 'ENOENT') return null;
+    if (error.code === 'ELOOP') throw new CliError(`${file} must not be a symlink; remove it and rerun the published install line`);
+    throw error;
+  }
+  let text;
   try {
-    const value = JSON.parse(fs.readFileSync(path.join(here, 'release.json'), 'utf8'));
-    return record(value) ? value : null;
-  } catch { return null; }
+    const directory = fs.statSync(here);
+    if (directory.uid !== process.getuid()) throw new CliError(`${here} is not owned by this user; fix it and rerun the published install line`);
+    if ((directory.mode & 0o022) !== 0) throw new CliError(`${here} must not be writable by others, found ${octal(directory.mode)}; run chmod 0755 on it`);
+    const stat = fs.fstatSync(fd);
+    if (!stat.isFile()) throw new CliError(`${file} is not a regular file; remove it and rerun the published install line`);
+    if (stat.uid !== process.getuid()) throw new CliError(`${file} is not owned by this user; remove it and rerun the published install line`);
+    if ((stat.mode & 0o022) !== 0) throw new CliError(`${file} must not be writable by others, found ${octal(stat.mode)}; run chmod 0644 on it`);
+    text = fs.readFileSync(fd, 'utf8');
+  } finally { fs.closeSync(fd); }
+  let value;
+  try { value = JSON.parse(text); } catch { throw new CliError(`${file} is not valid JSON; rerun the published install line`); }
+  if (!record(value)) throw new CliError(`${file} is not a release record; rerun the published install line`);
+  return value;
 }
 // Installed: beside genesis.mjs. Source checkout: the assembled artifact one directory up.
 function setupScript() {
@@ -98,13 +133,14 @@ export function configDir() {
   return path.join(xdg && path.isAbsolute(xdg) ? xdg : path.join(os.homedir(), '.config'), 'genesis');
 }
 export const sessionFile = () => path.join(configDir(), 'session.json');
-const octal = mode => (mode & 0o777).toString(8).padStart(4, '0');
-// The directory must be a real directory owned by this user; null when absent.
+// The directory must be a real directory owned by this user, mode exactly
+// 0700; null when absent.
 function checkSessionDir(directory) {
   let stat;
   try { stat = fs.lstatSync(directory); } catch (error) { if (error.code === 'ENOENT') return null; throw error; }
   if (stat.isSymbolicLink() || !stat.isDirectory()) throw new CliError(`${directory} must be a directory, not a symlink; fix it and run genesis login`);
   if (stat.uid !== process.getuid()) throw new CliError(`${directory} is not owned by this user; fix it and run genesis login`);
+  if ((stat.mode & 0o777) !== 0o700) throw new CliError(`${directory} must be mode 0700, found ${octal(stat.mode)}; run chmod 0700 on it`);
   return stat;
 }
 function refuseSymlink(file) {
@@ -116,13 +152,14 @@ function readPrivate(file) {
   refuseSymlink(file);
   try { return fs.readFileSync(file, 'utf8'); } catch (error) { if (error.code === 'ENOENT') return null; throw error; }
 }
-// Opened without following a link and judged by fstat: a regular file, owned
+// Opened without following a link and without blocking (a FIFO in its place
+// is refused, never waited on), then judged by fstat: a regular file, owned
 // by this user, mode exactly 0600. Anything else is refused in one line.
 function readSessionText() {
   const file = sessionFile();
   if (checkSessionDir(path.dirname(file)) === null) return null;
   let fd;
-  try { fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW); } catch (error) {
+  try { fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK); } catch (error) {
     if (error.code === 'ENOENT') return null;
     if (error.code === 'ELOOP') throw new CliError(`${file} must not be a symlink; remove it and run genesis login`);
     throw error;
@@ -139,8 +176,7 @@ function readSessionText() {
 function writeSessionText(text) {
   const file = sessionFile();
   const directory = path.dirname(file);
-  if (checkSessionDir(directory) === null) fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
-  fs.chmodSync(directory, 0o700);
+  if (checkSessionDir(directory) === null) { fs.mkdirSync(directory, { recursive: true, mode: 0o700 }); fs.chmodSync(directory, 0o700); }
   refuseSymlink(file);
   const temporary = `${file}.${process.pid}.tmp`;
   const fd = fs.openSync(temporary, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o600);
@@ -248,6 +284,23 @@ const out = text => { process.stdout.write(`${redact(text)}\n`); };
 const note = text => out(`${glyph.step} ${text}`);
 const done = (label, value) => out(`${paint('32', glyph.ok)} ${label.padEnd(9)} ${value}`);
 const warn = text => out(`${paint('33', '!')} ${text}`);
+// Child output (the installer) is relayed line by line through redact():
+// bytes are held until their newline arrives, so a key split across two
+// chunks is still caught, and the remainder is flushed when the stream
+// closes. latin1 maps every byte to one character and back, so nothing else
+// about the child's bytes changes.
+function relay(source, target) {
+  let held = '';
+  source.setEncoding('latin1');
+  source.on('data', chunk => {
+    held += chunk;
+    const cut = held.lastIndexOf('\n') + 1;
+    if (cut === 0) return;
+    target.write(redact(held.slice(0, cut)), 'latin1');
+    held = held.slice(cut);
+  });
+  source.on('close', () => { if (held !== '') target.write(redact(held), 'latin1'); });
+}
 
 let terminal = null;
 function tty() {
@@ -264,9 +317,12 @@ function tty() {
 export const interactive = () => process.stdout.isTTY === true && tty() !== null;
 const colorTty = () => ansi() && !process.env.NO_COLOR;
 const tint = (code, text) => paint(code, text, colorTty());
+// The one way anything reaches the terminal: prompts, echoes, menus and
+// summaries all pass through redact() like stdout does.
+const term = text => { tty().output.write(redact(text)); };
 function restoreTerminal() {
   if (terminal === null) return;
-  if (terminal.cursorHidden) { terminal.output.write('\x1b[?25h'); terminal.cursorHidden = false; }
+  if (terminal.cursorHidden) { term('\x1b[?25h'); terminal.cursorHidden = false; }
   if (terminal.raw) { terminal.input.setRawMode(false); terminal.raw = false; }
   terminal.input.pause();
 }
@@ -293,90 +349,85 @@ function readChunk() {
 // One line from the terminal in raw mode: no echo when hidden, backspace and
 // Ctrl-U edit, Ctrl-C interrupts, escape sequences (arrows) are ignored.
 async function readLine(hidden) {
-  const { output } = tty();
   let line = '';
   for (;;) {
     const chunk = await readChunk();
     if (chunk.startsWith('\x1b')) continue;
     for (const char of chunk) {
-      if (char === '\r' || char === '\n') { output.write('\n'); return line; }
-      if (char === '\x03') { output.write('\n'); throw new Interrupt(); }
-      if (char === '\x04' && line === '') { output.write('\n'); throw new CliError('cancelled', 1); }
+      if (char === '\r' || char === '\n') { term('\n'); return line; }
+      if (char === '\x03') { term('\n'); throw new Interrupt(); }
+      if (char === '\x04' && line === '') { term('\n'); throw new CliError('cancelled', 1); }
       if (char === '\x7f' || char === '\b') {
-        if (line !== '') { line = line.slice(0, -1); if (!hidden) output.write('\b \b'); }
+        if (line !== '') { line = line.slice(0, -1); if (!hidden) term('\b \b'); }
         continue;
       }
-      if (char === '\x15') { if (!hidden) output.write('\b \b'.repeat(line.length)); line = ''; continue; }
+      if (char === '\x15') { if (!hidden) term('\b \b'.repeat(line.length)); line = ''; continue; }
       if (char < ' ') continue;
       line += char;
-      if (!hidden) output.write(char);
+      if (!hidden) term(char);
     }
   }
 }
 const columns = () => tty()?.output.columns || 80;
-const summary = (label, value) => tty().output.write(`${tint('32', glyph.ok)} ${label.padEnd(9)} ${value}\n`);
+const summary = (label, value) => term(`${tint('32', glyph.ok)} ${label.padEnd(9)} ${value}\n`);
 // ask(label, validate): validate returns {value} or {error}; the typed line is
 // replaced by a one-line summary once accepted.
 async function ask(label, validate, summaryLabel = label) {
-  const { output } = tty();
   for (;;) {
     const prompt = `? ${label} ${glyph.step} `;
-    output.write(`${tint('36', '?')} ${tint('1', label)} ${glyph.step} `);
+    term(`${tint('36', '?')} ${tint('1', label)} ${glyph.step} `);
     const line = await readLine(false);
     const result = validate(line);
     if (result.error === undefined) {
-      if (ansi()) output.write(`\x1b[${Math.floor((prompt.length + line.length) / columns()) + 1}A\x1b[J`);
+      if (ansi()) term(`\x1b[${Math.floor((prompt.length + line.length) / columns()) + 1}A\x1b[J`);
       summary(summaryLabel, result.value);
       return result.value;
     }
-    output.write(`${tint('33', '!')} ${result.error}\n`);
+    term(`${tint('33', '!')} ${result.error}\n`);
   }
 }
 async function secret(label, summaryLabel) {
-  const { output } = tty();
   for (;;) {
-    output.write(`${tint('36', '?')} ${tint('1', label)} ${tint('2', '(hidden)')} ${glyph.step} `);
+    term(`${tint('36', '?')} ${tint('1', label)} ${tint('2', '(hidden)')} ${glyph.step} `);
     const line = await readLine(true);
-    if (line === '') { output.write(`${tint('33', '!')} nothing was entered\n`); continue; }
-    if (/\s/.test(line)) { output.write(`${tint('33', '!')} a key is one word with no spaces\n`); continue; }
-    if (ansi()) output.write('\x1b[1A\x1b[J');
+    if (line === '') { term(`${tint('33', '!')} nothing was entered\n`); continue; }
+    if (/\s/.test(line)) { term(`${tint('33', '!')} a key is one word with no spaces\n`); continue; }
+    if (ansi()) term('\x1b[1A\x1b[J');
     summary(summaryLabel, 'received');
     return line;
   }
 }
 async function confirm(question, defaultYes = false) {
-  const { output } = tty();
   for (;;) {
-    output.write(`${tint('36', '?')} ${question} ${tint('2', defaultYes ? '(Y/n)' : '(y/N)')} ${glyph.step} `);
+    term(`${tint('36', '?')} ${question} ${tint('2', defaultYes ? '(Y/n)' : '(y/N)')} ${glyph.step} `);
     const line = (await readLine(false)).trim().toLowerCase();
     if (line === '') return defaultYes;
     if (['y', 'yes'].includes(line)) return true;
     if (['n', 'no'].includes(line)) return false;
-    output.write(`${tint('33', '!')} answer y or n\n`);
+    term(`${tint('33', '!')} answer y or n\n`);
   }
 }
 // select(label, [{value, label, hint}], defaultIndex) -> value. Arrow keys, j/k
 // or a digit move the highlight; Enter confirms. Without ANSI (TERM=dumb or a
 // pane too narrow to redraw in place) a numbered prompt is used instead.
 async function select(label, options, defaultIndex = 0) {
-  const { output } = tty();
   const width = Math.max(...options.map(option => option.label.length));
   let selected = Math.max(0, Math.min(defaultIndex, options.length - 1));
   const finish = () => { summary(label, options[selected].label); return options[selected].value; };
   if (!ansi() || columns() < width + 6) {
-    output.write(`? ${label}\n`);
-    options.forEach((option, index) => output.write(`  ${index + 1}) ${option.label}${option.hint ? `  ${option.hint}` : ''}\n`));
+    term(`? ${label}\n`);
+    options.forEach((option, index) => term(`  ${index + 1}) ${option.label}${option.hint ? `  ${option.hint}` : ''}\n`));
     for (;;) {
-      output.write(`Choice [1-${options.length}, default ${selected + 1}]: `);
+      term(`Choice [1-${options.length}, default ${selected + 1}]: `);
       const line = (await readLine(false)).trim();
       if (line === '') return finish();
       if (/^[0-9]+$/.test(line) && Number(line) >= 1 && Number(line) <= options.length) { selected = Number(line) - 1; return finish(); }
-      output.write(`Enter a number from 1 to ${options.length}.\n`);
+      term(`Enter a number from 1 to ${options.length}.\n`);
     }
   }
-  output.write('\x1b[?25l');
+  term('\x1b[?25l');
   terminal.cursorHidden = true;
-  output.write(`${tint('36', '?')} ${tint('1', label)}\n`);
+  term(`${tint('36', '?')} ${tint('1', label)}\n`);
   try {
     for (;;) {
       const room = columns() - width - 8;
@@ -387,19 +438,19 @@ async function select(label, options, defaultIndex = 0) {
         const text = index === selected
           ? `  ${tint('36', `${glyph.pick} ${option.label.padEnd(width)}`)}  ${tint('2', hint)}`
           : `    ${option.label.padEnd(width)}  ${tint('2', hint)}`;
-        output.write(`${text}\x1b[K\n`);
+        term(`${text}\x1b[K\n`);
       });
       const key = await readChunk();
       if (key === '\r' || key === '\n') break;
-      if (key === '\x03') { output.write(`\x1b[${options.length + 1}A\x1b[J`); throw new Interrupt(); }
+      if (key === '\x03') { term(`\x1b[${options.length + 1}A\x1b[J`); throw new Interrupt(); }
       if (key === 'k' || key === 'K' || key === '\x1b[A' || key === '\x1bOA') selected = (selected + options.length - 1) % options.length;
       else if (key === 'j' || key === 'J' || key === '\x1b[B' || key === '\x1bOB') selected = (selected + 1) % options.length;
       else if (/^[1-9]$/.test(key) && Number(key) <= options.length) selected = Number(key) - 1;
-      output.write(`\x1b[${options.length}A`);
+      term(`\x1b[${options.length}A`);
     }
-    output.write(`\x1b[${options.length + 1}A\x1b[J`);
+    term(`\x1b[${options.length + 1}A\x1b[J`);
   } finally {
-    output.write('\x1b[?25h');
+    term('\x1b[?25h');
     terminal.cursorHidden = false;
   }
   return finish();
@@ -546,7 +597,7 @@ export function readState(file, clientId) {
     const provider = fieldAt(state, 'settings', ['defaultProvider']);
     model = id === null ? null : provider === null ? id : `${provider.replace(/^agent-auth-/, '')}/${id}`;
   } else model = fieldAt(state, 'config', ['model'])?.replace(/^agent-auth-/, '') ?? null;
-  return { mode: state.mode, gateway: typeof state.gateway === 'string' ? state.gateway : null, model, profile: typeof state.profile === 'string' ? state.profile : '' };
+  return { mode: state.mode, gateway: typeof state.gateway === 'string' ? state.gateway : null, model };
 }
 // connected | disabled | not configured | foreign gateway | not installed
 export function scopeStatus(state, isInstalled, endpoint) {
@@ -563,13 +614,12 @@ function statusRows(session, profile) {
     const profiles = client.id === 'codex' ? [profile ?? '', ...codexProfiles().filter(name => name !== profile)] : [client.id === 'omp' ? profile ?? '' : ''];
     for (const scopeProfile of profiles) {
       const isInstalled = installed(client.binary);
-      let scope = null, state = null, problem = null;
+      let state = null, problem = null;
       try {
-        if (client.id !== 'omp' || isInstalled) scope = resolveScope(client, scopeProfile || undefined);
-        if (scope !== null) state = readState(scope.stateFile, client.id);
+        if (client.id !== 'omp' || isInstalled) state = readState(resolveScope(client, scopeProfile || undefined).stateFile, client.id);
       } catch (error) { problem = error.message; }
       rows.push({
-        client, profile: scopeProfile, scope, state, installed: isInstalled, problem,
+        client, profile: scopeProfile, state, installed: isInstalled, problem,
         status: problem ?? scopeStatus(state, isInstalled, session.endpoint),
         label: scopeProfile ? `${client.label} (${scopeProfile})` : client.label,
       });
@@ -586,15 +636,18 @@ const header = session => out(paint('1', `${session.endpoint} ${glyph.dot} ${ses
 
 // ── installer ───────────────────────────────────────────────────────────────
 // AGENT_AUTH_URL/AGENT_AUTH_TOKEN carry the session into the installer; the key
-// never appears on a command line. Output streams straight through.
+// never appears on a command line. Its output is relayed through the redactor;
+// its prompts, when any, come from /dev/tty, which it opens itself.
 async function runSetup(session, client, action, args, withToken) {
   const env = { ...process.env, AGENT_AUTH_URL: session.endpoint };
   delete env.AUTH_GATEWAY_TOKEN;
   delete env.AGENT_AUTH_KEY_CHOICE;
   delete env.AGENT_AUTH_TOKEN;
   if (withToken) env.AGENT_AUTH_TOKEN = session.token;
-  const child = spawn('bash', [setupScript(), '--harness', client.id, '--action', action, '--unattended', ...args], { env, stdio: ['ignore', 'inherit', 'inherit'] });
-  const [code, signal] = await once(child, 'exit');
+  const child = spawn('bash', [setupScript(), '--harness', client.id, '--action', action, '--unattended', ...args], { env, stdio: ['ignore', 'pipe', 'pipe'] });
+  relay(child.stdout, process.stdout);
+  relay(child.stderr, process.stderr);
+  const [code, signal] = await once(child, 'close');
   if (code === 0) return;
   if (signal === 'SIGINT' || code === 130) throw new Interrupt();
   throw new CliError(code === 1 ? '' : `setup exited ${code ?? signal}`);
@@ -759,7 +812,7 @@ export async function login(flags) {
       endpoint = await ask('Gateway host or URL', normalizeEndpoint, 'Gateway');
       const problem = await reachable(endpoint);
       if (problem === null) break;
-      tty().output.write(redact(`${tint('33', '!')} ${problem}\n`));
+      term(`${tint('33', '!')} ${problem}\n`);
     }
   }
   let token = process.env.AGENT_AUTH_TOKEN ?? '';
@@ -779,7 +832,7 @@ export async function login(flags) {
       }
     }
     if (!interactive() || source === 'env' || attempts >= 2) throw new CliError(refusal);
-    tty().output.write(redact(`${tint('33', '!')} ${refusal}\n`));
+    term(`${tint('33', '!')} ${refusal}\n`);
     if (await select('Key refused', [{ value: 'retry', label: 'Paste a different key' }, { value: 'quit', label: 'Quit without changing anything' }]) === 'quit') {
       throw new CliError('Left the login alone; nothing was stored.');
     }
@@ -863,8 +916,10 @@ function listen(server, host, port) {
 }
 // Anthropic redirects the browser to http://localhost:<port>/callback; the
 // worker's authorization URL names the port and a 32-hex state. The code is
-// forwarded to link/input once and the servers close.
-async function anthropicCallback(session, link, onLink) {
+// forwarded to link/input once; the servers close after that answer is sent.
+// A request line the handler cannot parse gets the failure page; anything
+// else that goes wrong in it reaches `fail`, never the server.
+async function anthropicCallback(session, link, onLink, fail) {
   const authorize = new URL(link.url);
   const redirect = authorize.searchParams.get('redirect_uri');
   const expectedState = authorize.searchParams.get('state');
@@ -873,29 +928,30 @@ async function anthropicCallback(session, link, onLink) {
   const port = Number(callbackUrl.port || 80);
   const servers = [];
   let consumed = false;
-  const close = () => { for (const server of servers) server.close(); servers.length = 0; };
+  const close = () => { for (const server of servers) { server.closeAllConnections?.(); server.close(); } servers.length = 0; };
   const handler = async (req, res) => {
-    const callback = new URL(req.url ?? '/', callbackUrl.origin);
+    let callback = null;
+    try { callback = new URL(req.url ?? '/', callbackUrl.origin); } catch { /* the failure page */ }
     const local = ['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(req.socket.remoteAddress);
     let page = callbackPage(false);
-    if (req.method === 'GET' && local && callback.pathname === '/callback' && callback.searchParams.get('state') === expectedState
+    if (callback !== null && req.method === 'GET' && local && callback.pathname === '/callback' && callback.searchParams.get('state') === expectedState
       && callback.searchParams.get('code') !== null && !consumed) {
       consumed = true;
       try { onLink(validateLink(await api(session, 'POST', '/admin/api/cli/link/input', linkBody(link, { input: callback.toString() })))); page = callbackPage(true); }
       catch (error) { warn(error.message); }
-      finally { close(); }
     }
-    res.writeHead(page.status, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'Content-Length': Buffer.byteLength(page.body) });
-    res.end(page.body);
+    res.writeHead(page.status, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', Connection: 'close', 'Content-Length': Buffer.byteLength(page.body) });
+    res.end(page.body, () => { if (consumed) close(); });
   };
-  const ipv4 = http.createServer((req, res) => { void handler(req, res); });
+  const serve = () => http.createServer((req, res) => { handler(req, res).catch(fail); });
+  const ipv4 = serve();
   try { await listen(ipv4, '127.0.0.1', port); } catch (error) {
     ipv4.close();
     if (error?.code === 'EADDRINUSE' || error?.code === 'EACCES') throw new CliError(`port ${port} on 127.0.0.1 is ${error.code === 'EACCES' ? 'not permitted' : 'in use'}; the Anthropic callback needs it, so free it and try again`);
     throw error;
   }
   servers.push(ipv4);
-  const ipv6 = http.createServer((req, res) => { void handler(req, res); });
+  const ipv6 = serve();
   try { await listen(ipv6, '::1', port); servers.push(ipv6); } catch { ipv6.close(); }
   return close;
 }
@@ -920,9 +976,13 @@ async function addConnection(session, flags) {
       ...slot.availableWorkerIds.filter(id => typeof id === 'string').map(id => ({ value: id, label: id })),
     ]) || null;
   }
-  // Ctrl-C from here on cancels the worker's attempt instead of abandoning it.
+  // Ctrl-C from here on cancels the worker's attempt instead of abandoning it;
+  // it and a callback failure also cut the poll wait short.
+  const stop = new AbortController();
   let interrupted = false;
-  const onInterrupt = () => { interrupted = true; };
+  let failure = null;
+  const onInterrupt = () => { interrupted = true; stop.abort(); };
+  const fail = error => { failure ??= error; stop.abort(); };
   process.on('SIGINT', onInterrupt);
   let link = null;
   let closeCallback = null;
@@ -935,7 +995,7 @@ async function addConnection(session, flags) {
     if (link.url !== null && shownUrl !== link.url) {
       shownUrl = link.url;
       if (link.provider === 'anthropic' && closeCallback === null && !LINK_TERMINAL.has(link.status)) {
-        closeCallback = await anthropicCallback(session, link, next => { link = next; });
+        closeCallback = await anthropicCallback(session, link, next => { link = next; }, fail);
       }
       out(`open ${link.url}`);
       openBrowser(link.url);
@@ -944,12 +1004,25 @@ async function addConnection(session, flags) {
   };
   // Whatever ends this command, a started link that has not settled is
   // cancelled on the worker once. Returns the cancel failure, if any, so an
-  // interrupt reports it while another error keeps its own reason.
+  // interrupt reports it while another error keeps its own reason; once the
+  // worker has taken the cancel, an interrupt exits 130 even when a stale
+  // poll failed on the way.
+  let asked = false;
   let cancelled = false;
   const cancel = async () => {
-    if (cancelled || link === null || LINK_TERMINAL.has(link.status)) return null;
-    cancelled = true;
-    try { link = validateLink(await api(session, 'POST', '/admin/api/cli/link/cancel', linkBody(link))); return null; } catch (error) { return error; }
+    if (asked || link === null || LINK_TERMINAL.has(link.status)) return null;
+    asked = true;
+    try { link = validateLink(await api(session, 'POST', '/admin/api/cli/link/cancel', linkBody(link))); cancelled = true; return null; } catch (error) { return error; }
+  };
+  // Checked after every wait and every request: a callback failure ends the
+  // command with its error; an interrupt or the deadline ends it by cancelling.
+  const deadline = Date.now() + LINK_LIMIT_MS;
+  const settled = async () => {
+    if (failure !== null) throw failure;
+    if (!interrupted && Date.now() <= deadline) return false;
+    const problem = await cancel();
+    if (problem !== null) throw problem;
+    return true;
   };
   try {
     const started = await api(session, 'POST', '/admin/api/cli/link/start', { provider, workerId }, 60_000);
@@ -960,12 +1033,11 @@ async function addConnection(session, flags) {
     link = validateLink(started);
     note(`${link.workerId} ${glyph.dot} ${link.status}`);
     await show();
-    const deadline = Date.now() + LINK_LIMIT_MS;
     let last = link.status;
     while (!LINK_TERMINAL.has(link.status)) {
-      if (interrupted || Date.now() > deadline) { const problem = await cancel(); if (problem !== null) throw problem; break; }
-      await sleep(LINK_POLL_MS);
-      if (LINK_TERMINAL.has(link.status)) break;
+      if (await settled()) break;
+      await sleep(LINK_POLL_MS, undefined, { signal: stop.signal }).catch(() => {});
+      if (await settled() || LINK_TERMINAL.has(link.status)) break;
       const next = validateLink(await api(session, 'POST', '/admin/api/cli/link/status', linkBody(link)));
       if (next.attemptId === link.attemptId) link = next;
       if (link.status !== last) { last = link.status; note(`${link.workerId} ${glyph.dot} ${link.status}`); }
@@ -973,6 +1045,7 @@ async function addConnection(session, flags) {
     }
   } catch (error) {
     await cancel();
+    if (interrupted && cancelled) throw new Interrupt();
     throw error;
   } finally {
     process.off('SIGINT', onInterrupt);
@@ -988,8 +1061,11 @@ async function addConnection(session, flags) {
 // The new session is committed (on disk and, through `commit`, in memory)
 // before any scope is touched. Every enumerable scope configured for this
 // endpoint is then staged again with the new key and its saved model; a scope
-// that was disabled is disabled again. What was restaged, what could not be
-// checked, and what is never enumerated (OMP profiles) is reported after.
+// that was disabled is disabled again. configure and disable are judged
+// apart, since a failed configure leaves the old key in place while a failed
+// disable leaves the new key enabled; each such scope, each scope that could
+// not be checked, and what is never enumerated (OMP profiles) is reported
+// after, and any of the first two exits 1 with the new session kept.
 async function rotateToken(session, flags, commit = () => {}) {
   if (!flags.yes) {
     if (!interactive()) throw usage('token rotate needs --yes without a terminal');
@@ -1005,44 +1081,63 @@ async function rotateToken(session, flags, commit = () => {}) {
   saveSession(next);
   commit(next);
   done('Rotated', `${next.name}; the previous key is revoked`);
+  const stage = async (row, action, args, withToken) => {
+    try { await runSetup(next, row.client, action, args, withToken); return true; } catch (error) {
+      if (error instanceof Interrupt) throw error;
+      if (error.message) warn(error.message);
+      return false;
+    }
+  };
   const restaged = [];
-  const failed = [];
+  const stale = [];
+  const enabled = [];
   for (const row of scopes) {
     note(`re-staging ${row.label}`);
     const profile = profileArgs(row.profile || undefined);
     const model = row.state.model ? ['--model', rawModelId(row.state.model)] : [];
-    try {
-      await runSetup(next, row.client, 'configure', ['--new-key', '--overwrite', ...model, ...profile], true);
-      if (row.state.mode === 'disabled') await runSetup(next, row.client, 'disable', profile, false);
-      restaged.push(row.state.mode === 'disabled' ? `${row.label} ${glyph.dot} disabled` : row.label);
-    } catch (error) {
-      if (error instanceof Interrupt) throw error;
-      failed.push(row);
-      if (error.message) warn(error.message);
-    }
+    if (!(await stage(row, 'configure', ['--new-key', '--overwrite', ...model, ...profile], true))) { stale.push(row); continue; }
+    if (row.state.mode === 'disabled' && !(await stage(row, 'disable', profile, false))) { enabled.push(row); continue; }
+    restaged.push(row.state.mode === 'disabled' ? `${row.label} ${glyph.dot} disabled` : row.label);
   }
   done('Restaged', restaged.join(', ') || 'none');
-  for (const row of rows) {
-    if (row.problem === null) continue;
-    warn(`${row.label} was not checked: ${row.problem}; run genesis configure ${row.client.id}${row.profile ? ` --profile ${row.profile}` : ''} once it works`);
-  }
+  const command = (row, action) => `genesis ${action} ${row.client.id}${row.profile ? ` --profile ${row.profile}` : ''}`;
+  for (const row of stale) warn(`${row.label} still holds the old key — run ${command(row, 'configure')}`);
+  for (const row of enabled) warn(`${row.label} holds the new key but is enabled — run ${command(row, 'disable')}`);
+  const unchecked = rows.filter(row => row.problem !== null);
+  for (const row of unchecked) warn(`${row.label} was not checked: ${row.problem}`);
   note('OMP profiles other than default are not enumerated; run genesis configure omp --profile <name> for each');
-  if (failed.length > 0) throw new CliError(`the new key is stored, but these scopes still hold the old one: ${failed.map(row => row.label).join(', ')}; run genesis configure <client> for each`);
+  const problems = stale.length + enabled.length + unchecked.length;
+  if (problems > 0) throw new CliError(`the new key is stored; ${problems} scope${problems === 1 ? '' : 's'} above need${problems === 1 ? 's' : ''} attention`);
 }
 
 // ── update ──────────────────────────────────────────────────────────────────
 // The only code source is the publisher URL the install recorded in
-// release.json; a gateway endpoint never supplies code. The script runs with
-// the same stdin it would get from curl | bash and does not relaunch the dashboard.
+// release.json; a gateway endpoint never supplies code. Redirects are followed
+// by hand, at most five, and every hop must be a trusted location before it
+// is requested. The script runs with the same stdin it would get from
+// curl | bash, its output relayed through the redactor, and does not relaunch
+// the dashboard.
 const trustedUrl = url => typeof url === 'string' && (url.startsWith('https://') || /^http:\/\/(localhost|127\.0\.0\.1|\[::1\])(:[0-9]+)?(\/|$)/.test(url));
+const REDIRECTS = new Set([301, 302, 303, 307, 308]);
 async function fetchScript(url) {
-  let response;
-  try { response = await fetch(url, { redirect: 'follow', signal: AbortSignal.timeout(HTTP_TIMEOUT_MS) }); } catch (error) { throw new CliError(`could not download ${url}: ${reasonOf(error)}`); }
-  if (!response.ok) throw new CliError(`could not download ${url}: HTTP ${response.status}`);
-  if (!trustedUrl(response.url)) throw new CliError(`${url} redirected to ${response.url}, which is not an https location`);
-  const text = await response.text();
-  if (!text.startsWith('#!')) throw new CliError(`${url} did not return an installer script`);
-  return text;
+  let current = url;
+  for (let hops = 0; ; hops++) {
+    let response;
+    try { response = await fetch(current, { redirect: 'manual', signal: AbortSignal.timeout(HTTP_TIMEOUT_MS) }); } catch (error) { throw new CliError(`could not download ${current}: ${reasonOf(error)}`); }
+    if (!REDIRECTS.has(response.status)) {
+      if (!response.ok) throw new CliError(`could not download ${current}: HTTP ${response.status}`);
+      const text = await response.text();
+      if (!text.startsWith('#!')) throw new CliError(`${current} did not return an installer script`);
+      return text;
+    }
+    await response.body?.cancel();
+    const location = response.headers.get('location');
+    let next = null;
+    if (location !== null) { try { next = new URL(location, current).href; } catch { /* refused below */ } }
+    if (next === null || !trustedUrl(next)) throw new CliError(`${current} redirected to ${location ?? 'nowhere'}, which is not an https location`);
+    if (hops === 5) throw new CliError(`${url} redirected more than 5 times`);
+    current = next;
+  }
 }
 async function update() {
   const release = releaseInfo();
@@ -1050,9 +1145,11 @@ async function update() {
   if (!trustedUrl(release.installUrl)) throw new CliError(`${path.join(here, 'release.json')} records no https install URL; rerun the published install line`);
   const script = await fetchScript(release.installUrl);
   note(`installing from ${release.installUrl}`);
-  const child = spawn('bash', ['-s'], { env: { ...process.env, GENESIS_NO_LAUNCH: '1' }, stdio: ['pipe', 'inherit', 'inherit'] });
+  const child = spawn('bash', ['-s'], { env: { ...process.env, GENESIS_NO_LAUNCH: '1' }, stdio: ['pipe', 'pipe', 'pipe'] });
+  relay(child.stdout, process.stdout);
+  relay(child.stderr, process.stderr);
   child.stdin.end(script);
-  const [code] = await once(child, 'exit');
+  const [code] = await once(child, 'close');
   if (code !== 0) throw new CliError(`update exited ${code}`);
 }
 
@@ -1168,6 +1265,7 @@ export function parseArgs(argv) {
   return { positionals, flags };
 }
 async function main(argv) {
+  primeSecrets();
   const { positionals, flags } = parseArgs(argv);
   const [command, ...rest] = positionals;
   if (flags.help || command === 'help') { out(HELP); return; }
