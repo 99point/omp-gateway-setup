@@ -6,12 +6,12 @@
 // (/admin/api/cli/*). Nothing privileged lives here: the server decides what a
 // key may do from its role.
 import { spawn, spawnSync } from 'node:child_process';
+import crypto from 'node:crypto';
 import { once } from 'node:events';
 import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
-import { setTimeout as sleep } from 'node:timers/promises';
 import ttyModule from 'node:tty';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
@@ -22,7 +22,7 @@ const KEY_SHAPE = 'those start with s99dev. followed by 20-512 letters, digits, 
 const ROLES = new Set(['owner', 'admin', 'viewer', 'client']);
 const HTTP_TIMEOUT_MS = 30_000;
 const LINK_POLL_MS = 2_000;
-const LINK_LIMIT_MS = 10 * 60_000;
+const LOCAL_BODY_CAP = 16 * 1024;
 const ATTEMPT_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const LINK_STATUSES = new Set(['starting', 'awaiting-browser', 'exchanging', 'done', 'failed', 'cancelled']);
 const LINK_TERMINAL = new Set(['done', 'failed', 'cancelled']);
@@ -730,12 +730,22 @@ export function renderUsage(payload) {
   const types = payload.barTypes.filter(type => record(type) && typeof type.id === 'string' && typeof type.label === 'string');
   const rows = WINDOWS.map(key => {
     const window = payload.windows[key];
-    // null counters mean the gateway's recorder checkpoint is unreadable, not an idle account.
+    const { tokens } = window;
+    // null counters mean the gateway's recorder checkpoint is unreadable, not
+    // an idle account; null detail means no folded call measured it (write
+    // TTLs are Anthropic-only, reasoning counts Codex-only).
     const count = value => (number(value) === null ? '—' : integer(value));
+    const prompt = [tokens.input, tokens.cacheRead, tokens.cacheWrite].some(value => number(value) === null)
+      ? null : tokens.input + tokens.cacheRead + tokens.cacheWrite;
+    const ttl = record(tokens.cacheWriteTtl) ? tokens.cacheWriteTtl : null;
     return [key, ...types.map(type => bars(window.bars[type.id])), count(window.calls),
-      ...['input', 'output', 'cacheRead', 'cacheWrite'].map(field => count(window.tokens[field]))];
+      count(prompt), count(tokens.input), count(tokens.cacheRead), count(tokens.cacheWrite),
+      ttl === null ? '—' : `${count(ttl.ephemeral5m)}/${count(ttl.ephemeral1h)}`,
+      count(tokens.output), count(tokens.reasoningTokens),
+      number(window.cost) === null ? '—' : `$${window.cost.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`];
   });
-  const head = ['window', ...types.map(type => `${type.label} bars`), 'calls', 'input', 'output', 'cache read', 'cache write'];
+  const head = ['window', ...types.map(type => `${type.label} bars`), 'calls',
+    'prompt', 'uncached', 'cache read', 'cache write', '5m/1h', 'output', 'reasoning', 'cost'];
   return table(head, rows, new Set(head.map((_, index) => index).slice(1)));
 }
 export function renderCapacity(payload, nowMs = Date.now()) {
@@ -885,8 +895,12 @@ async function showConnections(session) {
 
 // ── add connection ──────────────────────────────────────────────────────────
 // A port of login-runtime/local-admin.mjs: the worker runs the OAuth exchange;
-// this process only relays the browser's callback (Anthropic) or shows the
-// device code (Codex) and polls until the link settles.
+// this process serves one page on 127.0.0.1 that picks the provider and
+// worker, starts the link, shows the authorization URL or device code and
+// reflects the link as it settles; it relays the browser's callback
+// (Anthropic) and reports every settled link in the terminal. It never opens
+// a browser: the user opens the printed URL in one of their choice, and
+// nothing starts without a click on the page.
 function validateLink(value) {
   if (!record(value) || typeof value.attemptId !== 'string' || !ATTEMPT_ID.test(value.attemptId)
     || typeof value.provider !== 'string' || typeof value.workerId !== 'string' || !LINK_STATUSES.has(value.status)
@@ -898,14 +912,29 @@ function validateLink(value) {
   return { attemptId: value.attemptId, provider: value.provider, workerId: value.workerId, status: value.status, url: value.url, userCode: value.userCode, error: value.error };
 }
 const linkBody = (link, extra = {}) => ({ workerId: link.workerId, attemptId: link.attemptId, provider: link.provider, ...extra });
-function openBrowser(url) {
-  const command = process.platform === 'darwin' ? 'open' : 'xdg-open';
-  try {
-    const child = spawn(command, [url], { detached: true, stdio: 'ignore' });
-    child.on('error', () => {});
-    child.unref();
-  } catch { /* the URL is printed; opening is best effort */ }
+// Every local response is uncacheable and sized; JSON passes through redact()
+// like the terminal does, since a gateway error may quote the key.
+function send(res, status, type, body, sent) {
+  res.writeHead(status, { 'Content-Type': `${type}; charset=utf-8`, 'Cache-Control': 'no-store', 'Content-Length': Buffer.byteLength(body) });
+  res.end(body, sent);
 }
+const sendJson = (res, status, value) => send(res, status, 'application/json', redact(JSON.stringify(value)));
+// A request body of at most LOCAL_BODY_CAP bytes; a larger one is cut off.
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    req.on('data', chunk => {
+      size += chunk.length;
+      if (size > LOCAL_BODY_CAP) { reject(new CliError('body too large')); req.destroy(); return; }
+      chunks.push(chunk);
+    });
+    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+    req.on('error', reject);
+  });
+}
+// JSON for the page's script: a < never ends the script element.
+const inline = value => JSON.stringify(value).replace(/</g, '\\u003c');
 function callbackPage(ok) {
   const body = `<!doctype html><meta charset="utf-8"><title>genesis</title><body>${ok ? 'Authorization received. Return to the terminal.' : 'Connection failed. Return to the terminal.'}</body>`;
   return { status: ok ? 200 : 400, body };
@@ -920,8 +949,8 @@ function listen(server, host, port) {
 // worker's authorization URL names the port and a 32-hex state. The code is
 // forwarded to link/input once; the servers close after that answer is sent.
 // A request line the handler cannot parse gets the failure page; anything
-// else that goes wrong in it reaches `fail`, never the server.
-async function anthropicCallback(session, link, onLink, fail) {
+// else that goes wrong in it is reported, never thrown at the server.
+async function anthropicCallback(session, link, onLink) {
   const authorize = new URL(link.url);
   const redirect = authorize.searchParams.get('redirect_uri');
   const expectedState = authorize.searchParams.get('state');
@@ -942,10 +971,10 @@ async function anthropicCallback(session, link, onLink, fail) {
       try { onLink(validateLink(await api(session, 'POST', '/admin/api/cli/link/input', linkBody(link, { input: callback.toString() })))); page = callbackPage(true); }
       catch (error) { warn(error.message); }
     }
-    res.writeHead(page.status, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', Connection: 'close', 'Content-Length': Buffer.byteLength(page.body) });
-    res.end(page.body, () => { if (consumed) close(); });
+    res.setHeader('Connection', 'close');
+    send(res, page.status, 'text/html', page.body, () => { if (consumed) close(); });
   };
-  const serve = () => http.createServer((req, res) => { handler(req, res).catch(fail); });
+  const serve = () => http.createServer((req, res) => { handler(req, res).catch(error => warn(error.message)); });
   const ipv4 = serve();
   try { await listen(ipv4, '127.0.0.1', port); } catch (error) {
     ipv4.close();
@@ -957,105 +986,300 @@ async function anthropicCallback(session, link, onLink, fail) {
   try { await listen(ipv6, '::1', port); servers.push(ipv6); } catch { ipv6.close(); }
   return close;
 }
+// The page: the signed-in identity, the current connections, the provider and
+// worker picks, one link at a time with its Open provider link or device code
+// (copied with one click), and the state poll every LINK_POLL_MS. Every
+// /api/* request carries the per-process nonce in X-S99-Local.
+function launcherPage(session, nonce, preset) {
+  return `<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>genesis</title>
+<style>
+  :root { color-scheme: dark; }
+  body { background:#101014; color:#d6d6dc; font:14px/1.6 ui-monospace,monospace; margin:2rem auto; max-width:64rem; padding:0 1rem; }
+  button,select { background:#17171d; color:#d6d6dc; border:1px solid #33465e; padding:.35rem .6rem; font:inherit; }
+  a { color:#9ecfff; } .muted { color:#7a7a85; } .bad { color:#f0917f; }
+  ul { list-style:none; padding:0; } li { border-top:1px solid #24242d; padding:.4rem 0; }
+  #authCodeRow { margin:.5rem 0; }
+  #authCode { cursor:pointer; user-select:all; overflow-wrap:anywhere; }
+</style>
+<div id="session" class="muted"></div>
+<ul id="connections"></ul>
+<select id="provider"></select>
+<select id="worker"><option value="">automatic</option></select>
+<button id="add" disabled>Add new connection</button> <button id="cancel" disabled>cancel</button>
+<div id="destination"></div>
+<div id="link"></div>
+<div id="authCodeRow" hidden>
+  <button id="authCode" type="button" title="Copy code" aria-label="Copy auth code"></button>
+  <button id="copyCode" type="button">Copy</button>
+  <span id="copyStatus" role="status"></span>
+</div>
+<div id="error" class="bad" role="alert"></div>
+<script>
+const localNonce = ${inline(nonce)};
+const labels = ${inline(PROVIDER_LABELS)};
+let preset = ${inline(preset)};
+document.title = 'genesis · ' + ${inline(hostOf(session.endpoint))};
+document.querySelector('#session').textContent = ${inline(`${session.endpoint} · ${session.name} · ${session.role}`)};
+const $ = selector => document.querySelector(selector);
+const esc = value => String(value ?? '').replace(/[&<>"]/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[char]));
+async function api(path, body) {
+  const init = body === undefined ? { headers: { 'X-S99-Local': localNonce } }
+    : { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-S99-Local': localNonce }, body: JSON.stringify(body) };
+  const response = await fetch(path, init);
+  const result = await response.json();
+  if (!response.ok) throw new Error(result.error || response.status);
+  return result;
+}
+let placement = [];
+let provisioning = null;
+let link = null;
+let wantedWorker = null;
+let refreshFailed = false;
+const busy = () => link !== null && !['done', 'failed', 'cancelled'].includes(link.status);
+function paintLink() {
+  const target = $('#link');
+  if (link === null) target.textContent = '';
+  else {
+    const open = link.url && busy() ? ' · <a href="' + esc(link.url) + '" target="_blank" rel="noopener">Open provider</a>' : '';
+    const error = link.error ? ' · <span class="bad">' + esc(link.error) + '</span>' : '';
+    target.innerHTML = esc(labels[link.provider] || link.provider) + ' · ' + esc(link.workerId) + ' · ' + esc(link.status) + open + error;
+  }
+  const code = busy() && link.userCode ? link.userCode : '';
+  const codeButton = $('#authCode');
+  $('#authCodeRow').hidden = !code;
+  if (codeButton.textContent !== code) { codeButton.textContent = code; $('#copyStatus').textContent = ''; }
+  $('#cancel').disabled = !busy();
+}
+async function copyAuthCode() {
+  const code = link?.userCode;
+  const attemptId = link?.attemptId;
+  if (!code) return;
+  let message = 'Copied';
+  try { await navigator.clipboard.writeText(code); } catch { message = 'Copy failed'; }
+  if (link?.attemptId === attemptId && link?.userCode === code) $('#copyStatus').textContent = message;
+}
+$('#copyCode').onclick = copyAuthCode;
+$('#authCode').onclick = copyAuthCode;
+function paintDestination() {
+  const next = placement.find(entry => entry.provider === $('#provider').value);
+  const destination = $('#destination');
+  const workerSelect = $('#worker');
+  const wanted = wantedWorker ?? workerSelect.value;
+  wantedWorker = null;
+  const offered = Array.isArray(next?.availableWorkerIds) ? next.availableWorkerIds.filter(workerId => typeof workerId === 'string') : [];
+  const selected = offered.includes(wanted) ? wanted : '';
+  workerSelect.innerHTML = '<option value="">' + esc(next?.workerId ? 'automatic · ' + next.workerId : 'automatic') + '</option>'
+    + offered.map(workerId => '<option value="' + esc(workerId) + '">' + esc(workerId) + '</option>').join('');
+  workerSelect.value = selected;
+  workerSelect.disabled = !next?.available || busy();
+  if (next === undefined || next.unavailable) { destination.className = 'bad'; destination.textContent = 'topology unavailable'; }
+  else if (next.available) { destination.className = ''; destination.textContent = 'next: ' + (selected || next.workerId); }
+  else if (['provisioning', 'admitting'].includes(provisioning?.state)) { destination.className = ''; destination.textContent = provisioning.state + ' · ' + provisioning.workerId; }
+  else { destination.className = 'bad'; destination.textContent = provisioning?.error || 'no slot'; }
+  $('#add').disabled = !next?.available || busy();
+  paintLink();
+}
+function paintError(error) {
+  paintDestination();
+  $('#error').textContent = String(error.message || error);
+}
+const clearError = () => { $('#error').textContent = ''; };
+async function refresh() {
+  try {
+    const state = await api('/api/state');
+    const selector = $('#provider');
+    const selectedProvider = selector.value;
+    placement = Array.isArray(state.workers?.placement) ? state.workers.placement.filter(entry => typeof entry?.provider === 'string') : [];
+    provisioning = state.workers?.provision ?? null;
+    const options = placement.map(entry => '<option value="' + esc(entry.provider) + '">' + esc(labels[entry.provider] || entry.provider) + '</option>').join('');
+    if (selector.innerHTML !== options) { selector.innerHTML = options; if (placement.some(entry => entry.provider === selectedProvider)) selector.value = selectedProvider; }
+    if (preset !== null) {
+      if (placement.some(entry => entry.provider === preset.provider)) selector.value = preset.provider;
+      wantedWorker = preset.workerId;
+      preset = null;
+    }
+    link = state.link;
+    const rows = Array.isArray(state.connections?.connections) ? state.connections.connections.filter(row => row !== null && typeof row === 'object') : [];
+    $('#connections').innerHTML = rows.map(row => '<li><b>' + esc(labels[row.provider] || row.provider) + '</b> ' + esc(row.email || row.id)
+      + ' <span class="muted">· ' + esc(row.workerId) + ' · ' + esc(row.state) + '</span></li>').join('');
+    paintDestination();
+    if (refreshFailed) { refreshFailed = false; clearError(); }
+  } catch (error) {
+    refreshFailed = true;
+    paintError(error);
+  }
+  setTimeout(refresh, ${LINK_POLL_MS});
+}
+$('#provider').onchange = paintDestination;
+$('#add').onclick = () => {
+  clearError();
+  $('#add').disabled = true;
+  api('/api/link/start', { provider: $('#provider').value, workerId: $('#worker').value || null }).then(result => {
+    link = result.link;
+    if (result.provisioning) {
+      provisioning = result.provisioning;
+      placement = placement.map(entry => ({ ...entry, available: false, workerId: null, availableWorkerIds: [] }));
+    }
+    paintDestination();
+  }).catch(paintError);
+};
+$('#cancel').onclick = () => {
+  clearError();
+  $('#cancel').disabled = true;
+  api('/api/link/cancel', {}).then(result => { link = result.link; paintDestination(); }).catch(paintError);
+};
+refresh();
+</script>`;
+}
 async function addConnection(session, flags) {
+  let port = 0;
+  if (flags.port !== undefined) {
+    port = /^[0-9]{1,5}$/.test(flags.port) ? Number(flags.port) : 0;
+    if (port < 1 || port > 65_535) throw usage('--port takes a number from 1 to 65535; the page is only ever served on 127.0.0.1');
+  }
   const topology = await api(session, 'GET', '/admin/api/cli/workers');
   const placement = record(topology) && Array.isArray(topology.placement) ? topology.placement.filter(record) : [];
   if (placement.length === 0) throw new CliError('worker topology is unavailable; try again shortly');
-  let provider = flags.provider;
-  if (provider === undefined) {
-    if (!interactive()) throw usage('pass --provider anthropic|openai-codex (and optionally --worker ID) when no terminal is available');
-    provider = await select('Provider', placement.map(entry => ({
-      value: entry.provider, label: PROVIDER_LABELS[entry.provider] ?? String(entry.provider),
-      hint: entry.available === true ? `next: ${entry.workerId}` : 'no slot',
-    })));
-  }
-  const slot = placement.find(entry => entry.provider === provider);
-  if (slot === undefined) throw usage(`unknown provider ${provider}; use ${placement.map(entry => entry.provider).join(', ')}`);
-  let workerId = flags.worker ?? null;
-  if (workerId === null && interactive() && Array.isArray(slot.availableWorkerIds) && slot.availableWorkerIds.length > 0) {
-    workerId = await select('Worker', [
-      { value: '', label: slot.workerId ? `automatic ${glyph.dot} ${slot.workerId}` : 'automatic' },
-      ...slot.availableWorkerIds.filter(id => typeof id === 'string').map(id => ({ value: id, label: id })),
-    ]) || null;
-  }
-  // Ctrl-C from here on cancels the worker's attempt instead of abandoning it;
-  // it and a callback failure also cut the poll wait short.
-  const stop = new AbortController();
-  let interrupted = false;
-  let failure = null;
-  const onInterrupt = () => { interrupted = true; stop.abort(); };
-  const fail = error => { failure ??= error; stop.abort(); };
-  process.on('SIGINT', onInterrupt);
+  // --provider and --worker only preselect on the page; each must name what the topology offers.
+  const slots = flags.provider === undefined ? placement : placement.filter(entry => entry.provider === flags.provider);
+  if (slots.length === 0) throw usage(`unknown provider ${flags.provider}; use ${placement.map(entry => entry.provider).join(', ')}`);
+  const workers = [...new Set(slots.flatMap(entry => [entry.workerId, ...(Array.isArray(entry.availableWorkerIds) ? entry.availableWorkerIds : [])]).filter(id => typeof id === 'string'))];
+  if (flags.worker !== undefined && !workers.includes(flags.worker)) throw usage(`unknown worker ${flags.worker}${workers.length === 0 ? '' : `; use ${workers.join(', ')}`}`);
+  const nonce = crypto.randomBytes(32).toString('base64url');
+  const nonceMatches = value => {
+    if (typeof value !== 'string') return false;
+    const supplied = Buffer.from(value);
+    const expected = Buffer.from(nonce);
+    return supplied.length === expected.length && crypto.timingSafeEqual(supplied, expected);
+  };
+  const page = launcherPage(session, nonce, { provider: flags.provider ?? null, workerId: flags.worker ?? null });
   let link = null;
   let closeCallback = null;
-  let shownUrl = null;
-  let shownCode = null;
-  // The authorization URL and the device code are each shown once, as soon as
-  // the worker reports them. Anthropic's loopback callback is bound before the
-  // URL is shown or opened, so a browser can never race an unbound port.
-  const show = async () => {
-    if (link.url !== null && shownUrl !== link.url) {
-      shownUrl = link.url;
-      if (link.provider === 'anthropic' && closeCallback === null && !LINK_TERMINAL.has(link.status)) {
-        closeCallback = await anthropicCallback(session, link, next => { link = next; }, fail);
-      }
-      out(`open ${link.url}`);
-      openBrowser(link.url);
-    }
-    if (link.userCode !== null && shownCode !== link.userCode) { shownCode = link.userCode; done('Code', link.userCode); }
+  let starting = null;
+  let cancelling = null;
+  let closing = false;
+  const busy = () => link !== null && !LINK_TERMINAL.has(link.status);
+  // Every link answer lands here. A status change is reported in the
+  // terminal (a settled link as Connected or a failure, otherwise the new
+  // state) and a settled link releases Anthropic's callback port.
+  const settle = next => {
+    const changed = link === null || next.attemptId !== link.attemptId || next.status !== link.status;
+    link = next;
+    if (changed && link.status === 'done') done('Connected', `${PROVIDER_LABELS[link.provider] ?? link.provider} on ${link.workerId}`);
+    else if (changed && link.status === 'failed') warn(`connection failed${link.error ? `: ${link.error}` : ''}`);
+    else if (changed) note(`${link.workerId} ${glyph.dot} ${link.status}`);
+    if (LINK_TERMINAL.has(link.status) && closeCallback !== null) { closeCallback(); closeCallback = null; }
   };
-  // Whatever ends this command, a started link that has not settled is
-  // cancelled on the worker once. Returns the cancel failure, if any, so an
-  // interrupt reports it while another error keeps its own reason; once the
-  // worker has taken the cancel, an interrupt exits 130 even when a stale
-  // poll failed on the way.
-  let asked = false;
-  let cancelled = false;
+  // Answers for the current attempt only: a callback or poll still in flight
+  // when its link was replaced is dropped.
+  const adopt = next => { if (link !== null && next.attemptId === link.attemptId) settle(next); };
+  // A link that has not settled is cancelled on the worker once. When that
+  // fails it is marked cancelled here, since the worker's copy is taken over
+  // by the next start on it (or ends with its own timeout) and the page must
+  // not stay wedged behind it.
   const cancel = async () => {
-    if (asked || link === null || LINK_TERMINAL.has(link.status)) return null;
-    asked = true;
-    try { link = validateLink(await api(session, 'POST', '/admin/api/cli/link/cancel', linkBody(link))); cancelled = true; return null; } catch (error) { return error; }
+    if (!busy()) return link;
+    cancelling ??= (async () => {
+      try { settle(validateLink(await api(session, 'POST', '/admin/api/cli/link/cancel', linkBody(link)))); }
+      catch (error) { warn(error.message); settle({ ...link, status: 'cancelled', error: error.message }); }
+      finally { cancelling = null; }
+    })();
+    await cancelling;
+    return link;
   };
-  // Checked after every wait and every request: a callback failure ends the
-  // command with its error; an interrupt or the deadline ends it by cancelling.
-  const deadline = Date.now() + LINK_LIMIT_MS;
-  const settled = async () => {
-    if (failure !== null) throw failure;
-    if (!interrupted && Date.now() <= deadline) return false;
-    const problem = await cancel();
-    if (problem !== null) throw problem;
-    return true;
+  // Anthropic's callback port is bound before the URL leaves this process,
+  // so a browser can never race an unbound port; when it cannot be bound the
+  // link is cancelled and kept without its URL.
+  const bindCallback = async () => {
+    if (!busy() || link.provider !== 'anthropic' || link.url === null || closeCallback !== null) return;
+    try { closeCallback = await anthropicCallback(session, link, adopt); }
+    catch (error) { await cancel(); settle({ ...link, url: null, error: error.message }); throw error; }
   };
-  try {
-    const started = await api(session, 'POST', '/admin/api/cli/link/start', { provider, workerId }, 60_000);
-    if (record(started) && record(started.provisioning) && started.workerId === null) {
-      note(`${started.provisioning.state} ${glyph.dot} ${started.provisioning.workerId ?? 'worker'}; run this again when it is ready`);
+  const refresh = async () => {
+    if (!busy()) return;
+    const current = link;
+    const next = validateLink(await api(session, 'POST', '/admin/api/cli/link/status', linkBody(current)));
+    if (link !== current) return;
+    adopt(next);
+    await bindCallback();
+  };
+  const start = async (provider, workerId) => {
+    if (closing) throw new CliError('shutting down');
+    if (starting !== null || busy()) throw new CliError('a connection is already being added');
+    starting = (async () => {
+      const started = await api(session, 'POST', '/admin/api/cli/link/start', { provider, workerId }, 60_000);
+      if (record(started) && record(started.provisioning) && started.workerId === null) {
+        note(`${started.provisioning.state} ${glyph.dot} ${started.provisioning.workerId ?? 'worker'}`);
+        return { link, provisioning: started.provisioning };
+      }
+      settle(validateLink(started));
+      await bindCallback();
+      return { link };
+    })();
+    try { return await starting; } finally { starting = null; }
+  };
+  const server = http.createServer();
+  try { await listen(server, '127.0.0.1', port); } catch (error) {
+    server.close();
+    if (error?.code === 'EADDRINUSE' || error?.code === 'EACCES') throw new CliError(`port ${port} on 127.0.0.1 is ${error.code === 'EACCES' ? 'not permitted' : 'in use'}; pass another --port`);
+    throw error;
+  }
+  const local = `127.0.0.1:${server.address().port}`;
+  // The Host must be this bind and, on /api/*, the nonce must match and any
+  // Origin must be this page's: a page from anywhere else, or a rebound name,
+  // gets 403 and nothing about the link.
+  const serve = async (req, res) => {
+    if (req.headers.host !== local) { sendJson(res, 403, { error: 'invalid local host' }); return; }
+    const raw = req.url ?? '/';
+    if (raw.startsWith('/api/') && (!nonceMatches(req.headers['x-s99-local']) || (req.headers.origin !== undefined && req.headers.origin !== `http://${local}`))) {
+      sendJson(res, 403, { error: 'local request authentication required' });
       return;
     }
-    link = validateLink(started);
-    note(`${link.workerId} ${glyph.dot} ${link.status}`);
-    await show();
-    let last = link.status;
-    while (!LINK_TERMINAL.has(link.status)) {
-      if (await settled()) break;
-      await sleep(LINK_POLL_MS, undefined, { signal: stop.signal }).catch(() => {});
-      if (await settled() || LINK_TERMINAL.has(link.status)) break;
-      const next = validateLink(await api(session, 'POST', '/admin/api/cli/link/status', linkBody(link)));
-      if (next.attemptId === link.attemptId) link = next;
-      if (link.status !== last) { last = link.status; note(`${link.workerId} ${glyph.dot} ${link.status}`); }
-      await show();
+    if (closing) { res.setHeader('Connection', 'close'); sendJson(res, 503, { error: 'shutting down' }); return; }
+    const url = new URL(raw, `http://${local}`);
+    if (req.method === 'GET' && url.pathname === '/') { send(res, 200, 'text/html', page); return; }
+    if (req.method === 'GET' && url.pathname === '/api/state') {
+      const [workers, connections] = await Promise.all([api(session, 'GET', '/admin/api/cli/workers'), api(session, 'GET', '/admin/api/cli/connections'), refresh()]);
+      sendJson(res, 200, { workers, connections, link });
+      return;
     }
-  } catch (error) {
-    await cancel();
-    if (interrupted && cancelled) throw new Interrupt();
-    throw error;
-  } finally {
-    process.off('SIGINT', onInterrupt);
-    if (closeCallback !== null) closeCallback();
-  }
-  if (link.status === 'done') { done('Connected', `${PROVIDER_LABELS[link.provider] ?? link.provider} on ${link.workerId}`); return; }
-  if (interrupted) throw new Interrupt();
-  throw new CliError(`connection ${link.status}${link.error ? `: ${link.error}` : ''}`);
+    if (req.method === 'POST' && url.pathname === '/api/link/start') {
+      const body = JSON.parse(await readBody(req));
+      if (!record(body) || typeof body.provider !== 'string' || (body.workerId !== null && typeof body.workerId !== 'string')) throw new CliError('invalid link request');
+      const result = await start(body.provider, body.workerId);
+      sendJson(res, result.provisioning ? 202 : 200, result);
+      return;
+    }
+    if (req.method === 'POST' && url.pathname === '/api/link/cancel') { await readBody(req); sendJson(res, 200, { link: await cancel() }); return; }
+    sendJson(res, 404, { error: 'not found' });
+  };
+  server.on('request', (req, res) => { serve(req, res).catch(error => sendJson(res, error instanceof HttpError ? error.status : 400, { error: String(error?.message ?? error) })); });
+  out(`open http://${local}/`);
+  // Ctrl-C or SIGTERM ends the command: the page stops being served, a start
+  // still in flight is waited for, a link that has not settled is cancelled
+  // once, and the exit is 130. A second signal exits at once.
+  let finish = null;
+  const finished = new Promise(resolve => { finish = resolve; });
+  const shutdown = () => {
+    if (closing) process.exit(130);
+    closing = true;
+    server.close();
+    server.closeIdleConnections?.();
+    (async () => {
+      await starting?.catch(() => {});
+      await cancel();
+      if (closeCallback !== null) { closeCallback(); closeCallback = null; }
+      server.closeAllConnections?.();
+      finish();
+    })();
+  };
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
+  try { await finished; } finally { process.off('SIGINT', shutdown); process.off('SIGTERM', shutdown); }
+  throw new Interrupt();
 }
 
 // ── key rotation ────────────────────────────────────────────────────────────
@@ -1239,14 +1463,14 @@ const HELP = `Usage: genesis [command] [options]
   model <client> [ID] [--profile P]         list or pick the client's default model
   usage                                     your recorded usage
   capacity                                  owner/admin
-  connections [list | add]                  owner/admin; add: owner [--provider P] [--worker ID]
+  connections [list | add]                  owner/admin; add: owner, serves a local page [--provider P] [--worker ID] [--port N]
   token rotate [--yes]                      owner
   update | --update
   --version | --help
 
 Clients: ${CLIENTS.map(client => client.id).join(', ')}
 Exit codes: 0 ok, 1 failure, 2 usage`;
-const VALUE_FLAGS = new Set(['url', 'model', 'profile', 'provider', 'worker']);
+const VALUE_FLAGS = new Set(['url', 'model', 'profile', 'provider', 'worker', 'port']);
 const SWITCH_FLAGS = new Set(['overwrite', 'yes', 'version', 'help', 'update']);
 export function parseArgs(argv) {
   const positionals = [];
