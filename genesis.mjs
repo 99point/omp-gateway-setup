@@ -730,8 +730,10 @@ export function renderUsage(payload) {
   const types = payload.barTypes.filter(type => record(type) && typeof type.id === 'string' && typeof type.label === 'string');
   const rows = WINDOWS.map(key => {
     const window = payload.windows[key];
-    return [key, ...types.map(type => bars(window.bars[type.id])), integer(number(window.calls) ?? 0),
-      ...['input', 'output', 'cacheRead', 'cacheWrite'].map(field => integer(number(window.tokens[field]) ?? 0))];
+    // null counters mean the gateway's recorder checkpoint is unreadable, not an idle account.
+    const count = value => (number(value) === null ? '—' : integer(value));
+    return [key, ...types.map(type => bars(window.bars[type.id])), count(window.calls),
+      ...['input', 'output', 'cacheRead', 'cacheWrite'].map(field => count(window.tokens[field]))];
   });
   const head = ['window', ...types.map(type => `${type.label} bars`), 'calls', 'input', 'output', 'cache read', 'cache write'];
   return table(head, rows, new Set(head.map((_, index) => index).slice(1)));
