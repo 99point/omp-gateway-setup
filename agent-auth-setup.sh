@@ -182,7 +182,7 @@ usage() {
   cat <<'EOF'
 Usage: agent-auth-setup.sh [--harness NAME] [--unattended] [--url URL]
                            [--profile NAME] [--reuse-key|--new-key] [--overwrite]
-                           [--transport auto|provider-wire|standard|pi-native]
+                           [--model ID] [--transport auto|provider-wire|standard|pi-native]
                            [--action configure|disable|enable|unset]
 
   --harness NAME  omp (default), claude-code, codex, opencode, or pi
@@ -194,6 +194,9 @@ Usage: agent-auth-setup.sh [--harness NAME] [--unattended] [--url URL]
   --reuse-key     Explicitly choose the stored gateway key
   --new-key       Use AGENT_AUTH_TOKEN or securely prompt for a new key
   --overwrite     Allow replacing existing selected-client config/key files
+  --model ID      Make the gateway model with this raw provider id (for example
+                  claude-fable-5-1) the client's default; it must be one the
+                  gateway serves for the selected client
   --transport     OMP protocol: auto (default) picks what the gateway and the
                   installed OMP both support; provider-wire (native-capable OMP),
                   standard (stock OMP codecs on the gateway's provider routes),
@@ -218,12 +221,13 @@ parse_options() {
   unattended=0
   overwrite=0
   omp_transport='auto'
+  requested_model=''
   key_choice="${AGENT_AUTH_KEY_CHOICE:-}"
   while (( $# > 0 )); do
     case "$1" in
-      --url|--profile|--harness|--transport|--action)
+      --url|--profile|--harness|--transport|--action|--model)
         (( $# >= 2 )) || fail "$1 needs a value"
-        case "$1" in --url) gateway_url_input="$2";; --profile) profile="$2";; --harness) harness="$2";; --transport) omp_transport="$2";; --action) action="$2";; esac
+        case "$1" in --url) gateway_url_input="$2";; --profile) profile="$2";; --harness) harness="$2";; --transport) omp_transport="$2";; --action) action="$2";; --model) requested_model="$2";; esac
         [[ -n "$2" ]] || fail "$1 needs a nonempty value"
         shift 2 ;;
       --url=*) gateway_url_input="${1#*=}"; shift ;;
@@ -233,6 +237,7 @@ parse_options() {
       --action=*) action="${1#*=}"; [[ -n "${action}" ]] || fail '--action needs a value'; shift ;;
       --overwrite) overwrite=1; shift ;;
       --transport=*) omp_transport="${1#*=}"; shift ;;
+      --model=*) requested_model="${1#*=}"; shift ;;
       --reuse-key)
         [[ -z "${key_choice}" || "${key_choice}" == same ]] || fail '--reuse-key conflicts with --new-key'
         key_choice='same'; shift ;;
@@ -276,6 +281,11 @@ parse_options() {
   if [[ -n "${profile}" ]]; then
     [[ "${profile}" =~ ^[a-z0-9][a-z0-9._-]{0,63}$ ]] || fail 'profile names are [a-z0-9][a-z0-9._-]{0,63}'
     case "${harness}" in omp|codex) ;; *) fail '--profile is only supported by OMP and Codex; use the selected client config-directory environment for other scopes';; esac
+  fi
+  if [[ -n "${requested_model}" ]]; then
+    # Byte range 0x21-0x7e; the C locale keeps the bracket range a code-point range.
+    (export LC_ALL=C; [[ "${requested_model}" =~ ^[!-~]{1,256}$ ]]) || fail 'model ids are 1-256 printable ASCII characters without spaces'
+    [[ "${action}" == configure ]] || fail '--model applies to configure only'
   fi
 }
 # Prints the normalized gateway URL, or one reason and exit 1. A bare host
@@ -921,6 +931,9 @@ validate_gateway() {
       if [[ "${seen_providers}" != *" ${provider} "* ]]; then providers+=("${provider}"); seen_providers+="${provider} "; fi
     done < "${catalog_ids_file}"
     (( ${#providers[@]} > 0 )) || fail 'gateway advertises no supported providers'
+    # A requested default that this gateway does not serve is refused before any
+    # protocol probe or client validation runs.
+    if [[ -n "${requested_model}" ]]; then omp_requested_selector >/dev/null; fi
     omp_select_transport
     omp_validate_client
   fi
@@ -965,6 +978,7 @@ native_schema() {
 native_report() {
   ui_title "${harness} gateway configuration installed"
   printf '  gateway  %s\n' "${gateway_url}"
+  if [[ -n "${requested_model}" ]]; then printf '  model    %s\n' "${requested_model}"; fi
   report_transaction
   printf '\nCatalog/config validation only; no provider inference was submitted.\n'
   printf 'Undo: rerun this setup and choose Disable (keeps the key), or Unset (removes it).\n'
@@ -1570,15 +1584,23 @@ omp_stage() {
   omp_stage_default_model
 }
 # A default the gateway does not serve fails on the first prompt. The default
-# role is written only when it has to be: the current default is unserved, or
-# none is set while unserved bundled models are still listed (OMP would pick
-# among them). A served default and OMP's own pick otherwise stay untouched.
+# role is written only when it has to be: a model was requested with --model,
+# the current default is unserved, or none is set while unserved bundled models
+# are still listed (OMP would pick among them). A served default and OMP's own
+# pick otherwise stay untouched.
 omp_stage_default_model() {
-  local current chosen allowed
+  local current chosen
   stage_config "${settings}" yaml settings
   current="$(AGENT_AUTH_YQ_ACTION='default-role' "${yq_bin}" eval -r '.modelRoles.default // ""' "${source_config}" 2>/dev/null || true)"
   omp_replaced_default=''; omp_default_model=''; omp_allowed_default=''
   # A role may carry an effort suffix (provider/model:high); the model part decides.
+  if [[ -n "${requested_model}" ]]; then
+    chosen="$(omp_requested_selector)"
+    if [[ "${current%%:*}" == "${chosen}" ]]; then omp_stage_allowed_default "${chosen}"; return 0; fi
+    omp_default_model="${chosen}"
+    omp_write_default_role "${chosen}"
+    return 0
+  fi
   if [[ -n "${current}" ]] && grep -qxF "${current%%:*}" "${model_ids_file}"; then
     omp_stage_allowed_default "${current%%:*}"
     return 0
@@ -1593,6 +1615,10 @@ omp_stage_default_model() {
   [[ -n "${chosen}" ]] || fail 'the gateway catalog names no model this client can use as its default'
   if [[ -n "${current}" ]]; then omp_replaced_default="${current}"; fi
   omp_default_model="${chosen}"
+  omp_write_default_role "${chosen}"
+}
+omp_write_default_role() {
+  local chosen="$1"
   if ! DEFAULT_MODEL="${chosen}" AGENT_AUTH_YQ_ACTION='set-default-role' "${yq_bin}" eval -e '
     . = (. // {}) | select(type == "!!map") |
     select(.modelRoles == null or (.modelRoles | type) == "!!map") |
@@ -1602,6 +1628,19 @@ omp_stage_default_model() {
   fi
   chmod 0600 "${staged_config}"
   omp_stage_allowed_default "${chosen}"
+}
+# --model names a raw provider id; OMP selects models as provider/id, so the one
+# served selector carrying that id becomes the default role.
+omp_requested_selector() {
+  local selector found='' served=''
+  while IFS= read -r selector; do
+    served+="${served:+, }${selector#*/}"
+    [[ "${selector#*/}" == "${requested_model}" ]] || continue
+    [[ -z "${found}" ]] || fail "model ${requested_model} is served by more than one provider (${found%%/*}, ${selector%%/*}); omp cannot pick one default"
+    found="${selector}"
+  done < "${model_ids_file}"
+  [[ -n "${found}" ]] || fail "model ${requested_model} is not served by this gateway for omp; served models: ${served}"
+  printf '%s' "${found}"
 }
 # enabledModels is an allow-list of fuzzy patterns OMP applies before the default
 # role; the exact selector of the default is appended when the list is set and
@@ -1661,7 +1700,7 @@ claude_code_prepare() {
 claude_code_stage() {
   stage_config "${config_target}"
   "${node_bin}" "${scratch_dir}/native/claude-code.cjs" "${source_config}" "${staged_config}" \
-    "${scratch_dir}/native-catalog.json" "${gateway_url}" "${cat_bin}" "${token_file}"
+    "${scratch_dir}/native-catalog.json" "${gateway_url}" "${cat_bin}" "${token_file}" "${requested_model}"
   native_schema "${staged_config}" strict
   # Claude has no supported offline config-validation command. Its exact staged
   # JSON is validated against the bundled schema; help or -p would not prove it.
@@ -1711,7 +1750,7 @@ codex_stage() {
   native_client "${validation_home}" "${scratch_dir}/bundled-models.json" "${scratch_dir}/bundled.stderr" debug models --bundled
   "${node_bin}" "${scratch_dir}/native/codex.cjs" "${scratch_dir}/codex-effective.json" "${scratch_dir}/native-catalog.json" \
     "${scratch_dir}/bundled-models.json" "${scratch_dir}/codex-patch.json" "${scratch_dir}/codex-models.json" \
-    "${catalog_target}" "${gateway_url}" "${cat_bin}" "${token_file}"
+    "${catalog_target}" "${gateway_url}" "${cat_bin}" "${token_file}" "${requested_model}"
   PATCH_JSON="${scratch_dir}/codex-patch.json" "${yq_bin}" -p toml -o toml \
     '(. // {}) * load(strenv(PATCH_JSON)) | .model_providers.agent_auth = load(strenv(PATCH_JSON)).model_providers.agent_auth' \
     "${source_config}" > "${config_candidate}" 2> "${scratch_dir}/toml.stderr" || fail 'could not merge Codex gateway settings'
@@ -1765,7 +1804,7 @@ opencode_prepare() {
 opencode_stage() {
   stage_config "${config_target}"
   "${node_bin}" "${scratch_dir}/native/opencode.cjs" "${source_config}" "${staged_config}" \
-    "${scratch_dir}/native-catalog.json" "${gateway_url}" "${token_file}"
+    "${scratch_dir}/native-catalog.json" "${gateway_url}" "${token_file}" "${requested_model}"
   native_schema "${staged_config}"
   mkdir -p "${validation_home}"
   printf 'agent-auth-schema-probe\n' > "${validation_home}/dummy-token"
@@ -1799,7 +1838,7 @@ pi_stage() {
   stage_config "${settings_target}" json settings
   settings_candidate="${staged_config}"
   "${node_bin}" "${scratch_dir}/native/pi.cjs" settings "${source_config}" "${staged_config}" \
-    "${scratch_dir}/native-catalog.json" "${gateway_url}" "${cat_bin}" "${token_file}"
+    "${scratch_dir}/native-catalog.json" "${gateway_url}" "${cat_bin}" "${token_file}" "${requested_model}"
   mkdir -p "${validation_home}/pi-agent"
   cp "${models_candidate}" "${validation_home}/pi-agent/models.json"
   # List-models validates the exact models file; Pi's auth-presence checks do not
@@ -1868,6 +1907,35 @@ function normalize(harness, catalog, directory) {
   }
   return result;
 }
+// A requested raw model id must be one the gateway serves for this client, and
+// it must name exactly one provider; the served ids are listed on refusal.
+function select(harness, catalog, requested) {
+  const matches = Object.entries(catalog).filter(([, cards]) => cards.some(card => card.id === requested));
+  if (matches.length === 1) return { provider: matches[0][0], card: matches[0][1].find(card => card.id === requested) };
+  if (matches.length > 1) throw new Error(`model ${requested} is served by more than one provider (${matches.map(([provider]) => provider).join(', ')}); ${harness} cannot pick one default`);
+  const served = Object.values(catalog).flatMap(cards => cards.map(card => card.id));
+  throw new Error(`model ${requested} is not served by this gateway for ${harness}; served models: ${served.join(', ')}`);
+}
+// Haiku ids: claude-3-haiku-20240307, claude-3-5-haiku-20241022, claude-haiku-4-5,
+// claude-haiku-4-5-20251001. The newest version wins; within one version the
+// undated alias (the provider's current pointer) ranks above dated snapshots
+// and a later date above an earlier one. Ids that merely contain "haiku" rank last.
+function haikuRank(id) {
+  const found = /^claude-(?:(\d+)(?:-(\d+))?-)?haiku(?:-(\d+)(?:-(\d+))?)?(?:-(\d{8}))?$/.exec(id);
+  if (!found) return [0, 0, 0, 0];
+  return [Number(found[1] ?? found[3] ?? 0), Number(found[2] ?? found[4] ?? 0), found[5] === undefined ? 1 : 0, Number(found[5] ?? 0)];
+}
+function newestHaiku(cards) {
+  let best;
+  for (const card of cards) {
+    if (!card.id.includes('haiku')) continue;
+    if (best === undefined) { best = card; continue; }
+    const left = haikuRank(card.id), right = haikuRank(best.id);
+    const first = left.findIndex((value, index) => value !== right[index]);
+    if (first !== -1 && left[first] > right[first]) best = card;
+  }
+  return best;
+}
 if (require.main === module) {
   try {
     const [action, harness, file, directory] = process.argv.slice(2);
@@ -1880,7 +1948,7 @@ if (require.main === module) {
     else throw new Error('unknown catalog action');
   } catch (error) { console.error(`setup failed: ${error.message}`); process.exitCode = 1; }
 }
-module.exports = { normalize };
+module.exports = { normalize, select, newestHaiku };
 AGENT_AUTH_3E314562121AA341A6CD
   "${cat_bin}" > "${scratch_dir}/native/check.cjs" <<'AGENT_AUTH_9F39659DDFD5722A6E76'
 'use strict';
@@ -1969,10 +2037,12 @@ AGENT_AUTH_9F39659DDFD5722A6E76
 'use strict';
 const fs = require('node:fs');
 const { load, patch, command } = require('./config-io.cjs');
+const { select, newestHaiku } = require('./catalog.cjs');
 try {
-  const [source, destination, catalogFile, gateway, cat, tokenFile] = process.argv.slice(2);
+  const [source, destination, catalogFile, gateway, cat, tokenFile, requested] = process.argv.slice(2);
   const current = load(source, true);
-  const catalog = JSON.parse(fs.readFileSync(catalogFile, 'utf8')).anthropic;
+  const normalized = JSON.parse(fs.readFileSync(catalogFile, 'utf8'));
+  const catalog = normalized.anthropic;
   const conflict = ['ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_API_KEY', 'ANTHROPIC_AWS_API_KEY', 'CLAUDE_CODE_USE_BEDROCK',
     'CLAUDE_CODE_USE_VERTEX', 'CLAUDE_CODE_USE_FOUNDRY', 'CLAUDE_CODE_USE_ANTHROPIC_AWS'];
   for (const key of conflict) {
@@ -1981,12 +2051,16 @@ try {
   }
   if (current.forceLoginOrgUUID) throw new Error('Claude organization login policy conflicts with gateway credentials');
   const previousModel = current.model ?? current.env?.ANTHROPIC_MODEL;
-  const model = catalog.find(card => card.id === previousModel)?.id ?? catalog[0].id;
-  if (previousModel && previousModel !== model) console.error(`Claude Code: replacing unsupported model ${previousModel} with ${model}.`);
+  const model = requested ? select('claude-code', normalized, requested).card.id
+    : catalog.find(card => card.id === previousModel)?.id ?? catalog[0].id;
+  if (!requested && previousModel && previousModel !== model) console.error(`Claude Code: replacing unsupported model ${previousModel} with ${model}.`);
+  // Background model: an existing supported pin, else the newest advertised
+  // Haiku; only when neither exists does it fall back to the default model.
   const previousSmall = current.env?.ANTHROPIC_DEFAULT_HAIKU_MODEL;
-  const small = catalog.find(card => card.id === previousSmall)?.id ?? catalog.find(card => card.id.includes('haiku'))?.id ?? model;
+  const haiku = newestHaiku(catalog);
+  const small = catalog.find(card => card.id === previousSmall)?.id ?? haiku?.id ?? model;
   if (previousSmall && previousSmall !== small) console.error(`Claude Code: replacing unsupported background model ${previousSmall} with ${small}.`);
-  if (!previousSmall && small === model) console.error(`Claude Code: no Haiku model is advertised; background requests will use ${model}.`);
+  if (!previousSmall && haiku === undefined) console.error(`Claude Code: no Haiku model is advertised; background requests will use ${model}.`);
   patch(source, destination, [
     [['apiKeyHelper'], command(cat, tokenFile)],
     [['model'], model],
@@ -2003,10 +2077,12 @@ AGENT_AUTH_59C29AB800A7942E5E9C
 'use strict';
 const fs = require('node:fs');
 const { load, save, checkOwnedProvider } = require('./config-io.cjs');
+const { select } = require('./catalog.cjs');
 try {
-  const [configFile, catalogFile, bundledFile, patchFile, modelsFile, finalModelsFile, gateway, cat, tokenFile] = process.argv.slice(2);
+  const [configFile, catalogFile, bundledFile, patchFile, modelsFile, finalModelsFile, gateway, cat, tokenFile, requested] = process.argv.slice(2);
   const current = load(configFile, true);
-  const catalog = JSON.parse(fs.readFileSync(catalogFile, 'utf8'))['openai-codex'];
+  const normalized = JSON.parse(fs.readFileSync(catalogFile, 'utf8'));
+  const catalog = normalized['openai-codex'];
   const bundled = JSON.parse(fs.readFileSync(bundledFile, 'utf8'));
   if (!Array.isArray(bundled.models)) throw new Error('Codex did not return its native bundled model catalog');
   const baseUrl = `${gateway}/openai-codex/v1`;
@@ -2053,7 +2129,12 @@ try {
   }
   if (!models.length) throw new Error('installed Codex has no native metadata for any gateway model; update the client before setup');
   if (skipped.length) console.error(`Codex: excluded gateway models without installed native metadata: ${skipped.join(', ')}; ${models.length} supported models remain.`);
-  let selected = models.find(model => model.slug === current.model);
+  let selected;
+  if (requested) {
+    select('codex', normalized, requested);
+    selected = models.find(model => model.slug === requested);
+    if (!selected) throw new Error(`Codex model ${requested} has no installed native metadata; update the client (installed metadata covers: ${models.map(model => model.slug).join(', ')})`);
+  } else selected = models.find(model => model.slug === current.model);
   const gatewayDefault = models.find(model => model.slug === catalog[0].id);
   if (!selected) {
     selected = gatewayDefault;
@@ -2066,8 +2147,8 @@ try {
       }
     }
   }
-  if (current.model && current.model !== selected.slug) console.error(`Codex: replacing unsupported model ${current.model} with ${selected.slug}.`);
-  if (!gatewayDefault) {
+  if (!requested && current.model && current.model !== selected.slug) console.error(`Codex: replacing unsupported model ${current.model} with ${selected.slug}.`);
+  if (!gatewayDefault && !requested) {
     const reason = selected.slug === current.model ? 'keeping the existing supported selection' : `using the best installed native priority (${selected.priority})`;
     console.error(`Codex: gateway default ${catalog[0].id} has no installed native metadata; ${reason}: ${selected.slug}. A client release containing that model's native metadata is required to select it.`);
   }
@@ -2222,8 +2303,9 @@ AGENT_AUTH_BD4D881668518F214714
 'use strict';
 const fs = require('node:fs');
 const { load, patch, checkOwnedProvider } = require('./config-io.cjs');
+const { select } = require('./catalog.cjs');
 try {
-  const [source, destination, catalogFile, gateway, tokenFile] = process.argv.slice(2);
+  const [source, destination, catalogFile, gateway, tokenFile, requested] = process.argv.slice(2);
   if (/[{}]/.test(tokenFile)) throw new Error('OpenCode file-reference paths cannot contain braces');
   const catalog = JSON.parse(fs.readFileSync(catalogFile, 'utf8'));
   const current = load(source);
@@ -2259,8 +2341,10 @@ try {
     }]);
   }
   const available = Object.entries(catalog).flatMap(([provider, cards]) => cards.map(card => `agent-auth-${provider}/${card.id}`));
+  const wanted = requested ? select('opencode', catalog, requested) : null;
   for (const key of ['model', 'small_model']) {
     const previous = current[key];
+    if (key === 'model' && wanted) { changes.push([[key], `agent-auth-${wanted.provider}/${wanted.card.id}`]); continue; }
     const selected = available.find(value => value === previous || value === `agent-auth-${previous}`) ?? available[0];
     if (previous && selected !== previous && selected !== `agent-auth-${previous}`) console.error(`OpenCode: replacing unsupported ${key} ${previous} with ${selected}.`);
     changes.push([[key], selected]);
@@ -2273,6 +2357,7 @@ AGENT_AUTH_2464A809E52279A1DF3E
 'use strict';
 const fs = require('node:fs');
 const { load, patch, command, checkOwnedProvider } = require('./config-io.cjs');
+const { select } = require('./catalog.cjs');
 
 // Stock Pi 0.85.1: custom generic Responses avoids its JWT-only Codex adapter.
 // samplingParams is applied after Pi's generated request fields. The empty
@@ -2299,7 +2384,7 @@ function model(card, provider) {
   return value;
 }
 try {
-  const [kind, source, destination, catalogFile, gateway, cat, tokenFile] = process.argv.slice(2);
+  const [kind, source, destination, catalogFile, gateway, cat, tokenFile, requested] = process.argv.slice(2);
   const catalog = JSON.parse(fs.readFileSync(catalogFile, 'utf8'));
   const current = load(source);
   const selected = Object.keys(catalog)[0];
@@ -2320,10 +2405,12 @@ try {
     }
     patch(source, destination, changes);
   } else if (kind === 'settings') {
-    const provider = Object.keys(catalog).find(key => current.defaultProvider === key || current.defaultProvider === `agent-auth-${key}`) ?? selected;
-    const selectedModel = catalog[provider].find(card => card.id === current.defaultModel)?.id ?? catalog[provider][0].id;
-    if (current.defaultProvider && current.defaultProvider !== provider && current.defaultProvider !== `agent-auth-${provider}`
-      || current.defaultModel && current.defaultModel !== selectedModel) {
+    const wanted = requested ? select('pi', catalog, requested) : null;
+    const provider = wanted?.provider
+      ?? Object.keys(catalog).find(key => current.defaultProvider === key || current.defaultProvider === `agent-auth-${key}`) ?? selected;
+    const selectedModel = wanted?.card.id ?? catalog[provider].find(card => card.id === current.defaultModel)?.id ?? catalog[provider][0].id;
+    if (!wanted && (current.defaultProvider && current.defaultProvider !== provider && current.defaultProvider !== `agent-auth-${provider}`
+      || current.defaultModel && current.defaultModel !== selectedModel)) {
       console.error(`Pi: replacing unsupported selection ${current.defaultProvider ?? ''}/${current.defaultModel ?? ''} with agent-auth-${provider}/${selectedModel}.`);
     }
     patch(source, destination, [
@@ -2362,6 +2449,23 @@ environment = {
 # Applies to the subprocess as well. Bounds accidental diagnostic output and
 # client scratch files, not only HTTP downloads. No credential appears in argv.
 resource.setrlimit(resource.RLIMIT_FSIZE, (16 * 1024 * 1024, 16 * 1024 * 1024))
+process = None
+
+
+# The client runs in its own session, so a Ctrl-C on the installer's terminal
+# never reaches it: this runner forwards the interruption by killing the whole
+# client process group and exits with the conventional signal status.
+def interrupted(signum, _frame):
+    if process is not None:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    sys.exit(130 if signum == signal.SIGINT else 143)
+
+
+signal.signal(signal.SIGINT, interrupted)
+signal.signal(signal.SIGTERM, interrupted)
 with open(stdout_path, 'wb') as stdout, open(stderr_path, 'wb') as stderr:
     process = subprocess.Popen(command, env=environment, cwd=root, stdin=subprocess.DEVNULL,
                                stdout=stdout, stderr=stderr, start_new_session=True)
