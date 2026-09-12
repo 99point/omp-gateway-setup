@@ -7,8 +7,8 @@
 set +x
 set -euo pipefail
 
-RELEASE_COMMIT='7bb03b78647292c263e5926fc30881ee04ef4a86'
-GENESIS_SHA256='aa980f80457025d62bf3346165e6aed47cb8cde269e2b9f1a0e7c15759bf9631'
+RELEASE_COMMIT='3feeb31b6f73d3b1c7db32f484a2c040aa09cb3e'
+GENESIS_SHA256='a514fe0174818e913764ead4f2fcb328cf557d073c76a359d7be5f155bc120e3'
 SETUP_SHA256='d764ae1f997956252d07ee0431a967e3b2025eee8785a1eef9b6bd8501e10798'
 # GENESIS_SOURCE overrides the download base for mirrors and local checks;
 # GENESIS_INSTALL_URL is the publisher `genesis update` re-fetches this script from.
