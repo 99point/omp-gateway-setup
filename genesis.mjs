@@ -768,7 +768,14 @@ export function renderCapacity(payload, nowMs = Date.now()) {
       ]);
     });
   }
-  return table(['provider', 'metric', 'bars', 'next bar', 'eligible', 'reset'], rows, new Set([2, 3]));
+  const rendered = table(['provider', 'metric', 'bars', 'next bar', 'eligible', 'reset'], rows, new Set([2, 3]));
+  // A view the server is serving from its last good read (a fresh read
+  // failed) is stamped with that read's time, so old numbers never pass as new.
+  if (payload.stale === true) {
+    const at = number(payload.generatedAt) === null ? null : new Date(payload.generatedAt).toISOString().slice(0, 16).replace('T', ' ');
+    return `${rendered}\nstale${at === null ? '' : ` ${glyph.dot} as of ${at}Z`}`;
+  }
+  return rendered;
 }
 export function renderConnections(payload, nowMs = Date.now()) {
   if (!record(payload) || !Array.isArray(payload.connections)) throw new CliError('the connections payload is not in the expected shape');
@@ -1233,13 +1240,16 @@ async function addConnection(session, flags) {
   // gets 403 and nothing about the link.
   const serve = async (req, res) => {
     if (req.headers.host !== local) { sendJson(res, 403, { error: 'invalid local host' }); return; }
-    const raw = req.url ?? '/';
-    if (raw.startsWith('/api/') && (!nonceMatches(req.headers['x-s99-local']) || (req.headers.origin !== undefined && req.headers.origin !== `http://${local}`))) {
+    // Judged on the parsed path: an absolute-form request target would
+    // otherwise slip past a prefix test on the raw line.
+    let url;
+    try { url = new URL(req.url ?? '/', `http://${local}`); } catch { sendJson(res, 400, { error: 'invalid request target' }); return; }
+    if (url.origin !== `http://${local}`) { sendJson(res, 403, { error: 'invalid local host' }); return; }
+    if (url.pathname.startsWith('/api/') && (!nonceMatches(req.headers['x-s99-local']) || (req.headers.origin !== undefined && req.headers.origin !== `http://${local}`))) {
       sendJson(res, 403, { error: 'local request authentication required' });
       return;
     }
     if (closing) { res.setHeader('Connection', 'close'); sendJson(res, 503, { error: 'shutting down' }); return; }
-    const url = new URL(raw, `http://${local}`);
     if (req.method === 'GET' && url.pathname === '/') { send(res, 200, 'text/html', page); return; }
     if (req.method === 'GET' && url.pathname === '/api/state') {
       const [workers, connections] = await Promise.all([api(session, 'GET', '/admin/api/cli/workers'), api(session, 'GET', '/admin/api/cli/connections'), refresh()]);
