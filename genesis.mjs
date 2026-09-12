@@ -12,6 +12,7 @@ import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
+import { emitKeypressEvents } from 'node:readline';
 import ttyModule from 'node:tty';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
@@ -28,7 +29,7 @@ const LINK_STATUSES = new Set(['starting', 'awaiting-browser', 'exchanging', 'do
 const LINK_TERMINAL = new Set(['done', 'failed', 'cancelled']);
 const PROFILE = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 const MODEL_ID = /^[\x21-\x7e]{1,256}$/;
-const PROVIDER_LABELS = { anthropic: 'Fable', 'openai-codex': 'Codex' };
+const PROVIDER_LABELS = { anthropic: 'Anthropic', 'openai-codex': 'OpenAI' };
 const WINDOWS = ['today', '7d', '30d', 'all'];
 
 // One row per supported client. `providers` are the gateway providers whose
@@ -278,9 +279,15 @@ const api = (session, method, pathname, body, timeoutMs) => request(session.endp
 const utf8 = /utf-?8/i.test(process.env.LC_ALL || process.env.LC_CTYPE || process.env.LANG || '');
 const glyph = utf8 ? { ok: '✓', pick: '❯', step: '›', dot: '·' } : { ok: '+', pick: '>', step: '>', dot: '.' };
 const ansi = () => process.env.TERM !== 'dumb';
-const colorOut = () => process.stdout.isTTY === true && ansi() && !process.env.NO_COLOR;
+let screenOutput = null;
+const colorOut = () => screenOutput === null && process.stdout.isTTY === true && ansi() && !process.env.NO_COLOR;
 const paint = (code, text, enabled = colorOut()) => (enabled ? `\x1b[${code}m${text}\x1b[0m` : text);
-const out = text => { process.stdout.write(`${redact(text)}\n`); };
+const writeOutput = (target, text, encoding = 'utf8') => {
+  const safe = redact(text);
+  if (screenOutput !== null) screenOutput.push(encoding === 'latin1' ? Buffer.from(safe, 'latin1').toString('utf8') : safe);
+  else target.write(safe, encoding);
+};
+const out = text => writeOutput(process.stdout, `${text}\n`);
 const note = text => out(`${glyph.step} ${text}`);
 const done = (label, value) => out(`${paint('32', glyph.ok)} ${label.padEnd(9)} ${value}`);
 const warn = text => out(`${paint('33', '!')} ${text}`);
@@ -296,10 +303,10 @@ function relay(source, target) {
     held += chunk;
     const cut = held.lastIndexOf('\n') + 1;
     if (cut === 0) return;
-    target.write(redact(held.slice(0, cut)), 'latin1');
+    writeOutput(target, held.slice(0, cut), 'latin1');
     held = held.slice(cut);
   });
-  source.on('close', () => { if (held !== '') target.write(redact(held), 'latin1'); });
+  source.on('close', () => { if (held !== '') writeOutput(target, held, 'latin1'); });
 }
 
 let terminal = null;
@@ -308,17 +315,17 @@ function tty() {
   let fd;
   try { fd = fs.openSync('/dev/tty', 'r+'); } catch { return null; }
   const input = new ttyModule.ReadStream(fd);
+  emitKeypressEvents(input);
   const output = new ttyModule.WriteStream(fd);
   input.pause();
-  terminal = { input, output, cursorHidden: false, raw: false };
+  terminal = { fd, input, output, cursorHidden: false, raw: false, alternateScreen: false };
   return terminal;
 }
 // Prompts need a terminal for output and /dev/tty for input; stdin may be a pipe.
 export const interactive = () => process.stdout.isTTY === true && tty() !== null;
 const colorTty = () => ansi() && !process.env.NO_COLOR;
 const tint = (code, text) => paint(code, text, colorTty());
-// The one way anything reaches the terminal: prompts, echoes, menus and
-// summaries all pass through redact() like stdout does.
+// Terminal text — prompts, echoes, menus and summaries — is always redacted.
 const term = text => { tty().output.write(redact(text)); };
 function restoreTerminal() {
   if (terminal === null) return;
@@ -329,6 +336,7 @@ function restoreTerminal() {
 function closeTerminal() {
   if (terminal === null) return;
   restoreTerminal();
+  if (terminal.alternateScreen) fs.writeSync(terminal.fd, '\x1b[?1049l');
   terminal.input.destroy();
   terminal = null;
 }
@@ -407,53 +415,85 @@ async function confirm(question, defaultYes = false) {
     term(`${tint('33', '!')} answer y or n\n`);
   }
 }
-// select(label, [{value, label, hint}], defaultIndex) -> value. Arrow keys, j/k
-// or a digit move the highlight; Enter confirms. Without ANSI (TERM=dumb or a
-// pane too narrow to redraw in place) a numbered prompt is used instead.
-async function select(label, options, defaultIndex = 0) {
-  const width = Math.max(...options.map(option => option.label.length));
-  let selected = Math.max(0, Math.min(defaultIndex, options.length - 1));
-  const finish = () => { summary(label, options[selected].label); return options[selected].value; };
-  if (!ansi() || columns() < width + 6) {
-    term(`? ${label}\n`);
-    options.forEach((option, index) => term(`  ${index + 1}) ${option.label}${option.hint ? `  ${option.hint}` : ''}\n`));
-    for (;;) {
-      term(`Choice [1-${options.length}, default ${selected + 1}]: `);
-      const line = (await readLine(false)).trim();
-      if (line === '') return finish();
-      if (/^[0-9]+$/.test(line) && Number(line) >= 1 && Number(line) <= options.length) { selected = Number(line) - 1; return finish(); }
-      term(`Enter a number from 1 to ${options.length}.\n`);
-    }
+const BACK = Symbol('back');
+const backOption = { value: BACK, label: 'Back' };
+const clearScreen = () => term(ansi() ? '\x1b[H\x1b[2J' : '\f');
+function renderScreen(view) {
+  const width = Math.max(20, columns() - 1);
+  const height = Math.max(8, tty().output.rows || 24);
+  const options = view.options;
+  view.selected = Math.max(0, Math.min(view.selected ?? 0, options.length - 1));
+  const body = [view.body, view.notice].filter(Boolean).join('\n\n');
+  const lines = redact(body).split('\n').flatMap(line => {
+    const wrapped = [];
+    for (let offset = 0; offset < line.length; offset += width) wrapped.push(line.slice(offset, offset + width));
+    return wrapped.length === 0 ? [''] : wrapped;
+  });
+  const menuRows = Math.min(options.length, Math.max(1, height - 5));
+  const bodyRows = Math.max(0, height - menuRows - 5);
+  view.offset = Math.max(0, Math.min(view.offset ?? 0, Math.max(0, lines.length - bodyRows)));
+  const firstOption = Math.max(0, Math.min(view.selected - menuRows + 1, options.length - menuRows));
+  clearScreen();
+  const title = redact(view.title);
+  term(`${tint('1', title.length > width ? `…${title.slice(1 - width)}` : title)}\n\n`);
+  if (bodyRows > 0 && body) {
+    term(`${lines.slice(view.offset, view.offset + bodyRows).join('\n')}\n`);
+    if (lines.length > bodyRows) term(`${tint('2', `${view.offset + 1}–${Math.min(lines.length, view.offset + bodyRows)}/${lines.length}`)}\n`);
   }
-  term('\x1b[?25l');
-  terminal.cursorHidden = true;
-  term(`${tint('36', '?')} ${tint('1', label)}\n`);
+  term('\n');
+  options.slice(firstOption, firstOption + menuRows).forEach((option, offset) => {
+    const index = firstOption + offset;
+    const prefix = `${index === view.selected ? glyph.pick : ' '} ${index + 1}  `;
+    const label = `${prefix}${option.label}`;
+    const hint = option.hint ? `  ${option.hint}` : '';
+    const line = `${label}${hint}`;
+    const clipped = line.length >= width ? `${line.slice(0, width - 2)}…` : line;
+    term(`${index === view.selected ? tint('36', clipped) : clipped}\n`);
+  });
+}
+// One screen owns terminal input until it is left. The route keeps its cursor
+// and scroll position; Escape never confirms a highlighted action.
+async function selectScreen(view, signal) {
+  const { input, output } = tty();
+  if (signal?.aborted) return BACK;
+  let keypress, resize, abort, ended;
   try {
-    for (;;) {
-      const room = columns() - width - 8;
-      options.forEach((option, index) => {
-        let hint = option.hint ?? '';
-        if (room < 4) hint = '';
-        else if (hint.length > room) hint = `${hint.slice(0, room - 1)}…`;
-        const text = index === selected
-          ? `  ${tint('36', `${glyph.pick} ${option.label.padEnd(width)}`)}  ${tint('2', hint)}`
-          : `    ${option.label.padEnd(width)}  ${tint('2', hint)}`;
-        term(`${text}\x1b[K\n`);
-      });
-      const key = await readChunk();
-      if (key === '\r' || key === '\n') break;
-      if (key === '\x03') { term(`\x1b[${options.length + 1}A\x1b[J`); throw new Interrupt(); }
-      if (key === 'k' || key === 'K' || key === '\x1b[A' || key === '\x1bOA') selected = (selected + options.length - 1) % options.length;
-      else if (key === 'j' || key === 'J' || key === '\x1b[B' || key === '\x1bOB') selected = (selected + 1) % options.length;
-      else if (/^[1-9]$/.test(key) && Number(key) <= options.length) selected = Number(key) - 1;
-      term(`\x1b[${options.length}A`);
-    }
-    term(`\x1b[${options.length + 1}A\x1b[J`);
+    return await new Promise((resolve, reject) => {
+      keypress = (text, key) => {
+        if (key?.ctrl && key.name === 'c') { reject(new Interrupt()); return; }
+        if (key?.name === 'escape' || key?.name === 'left' || (key?.ctrl && key.name === 'd')) { resolve(BACK); return; }
+        if (key?.name === 'return' || key?.name === 'enter') { resolve(view.options[view.selected ?? 0].value); return; }
+        const count = view.options.length;
+        if (key?.name === 'up' || text === 'k' || text === 'K') view.selected = ((view.selected ?? 0) + count - 1) % count;
+        else if (key?.name === 'down' || text === 'j' || text === 'J') view.selected = ((view.selected ?? 0) + 1) % count;
+        else if (key?.name === 'home') view.selected = 0;
+        else if (key?.name === 'end') view.selected = count - 1;
+        else if (key?.name === 'pageup') view.offset = Math.max(0, (view.offset ?? 0) - 5);
+        else if (key?.name === 'pagedown') view.offset = (view.offset ?? 0) + 5;
+        else if (/^[1-9]$/.test(text ?? '') && Number(text) <= count) view.selected = Number(text) - 1;
+        else return;
+        renderScreen(view);
+      };
+      resize = () => renderScreen(view);
+      abort = () => resolve(BACK);
+      ended = () => resolve(BACK);
+      input.on('keypress', keypress);
+      input.once('end', ended);
+      output.on('resize', resize);
+      signal?.addEventListener('abort', abort, { once: true });
+      input.setRawMode(true);
+      terminal.raw = true;
+      input.resume();
+      if (ansi()) { term('\x1b[?25l'); terminal.cursorHidden = true; }
+      renderScreen(view);
+    });
   } finally {
-    term('\x1b[?25h');
-    terminal.cursorHidden = false;
+    input.off('keypress', keypress);
+    input.off('end', ended);
+    output.off('resize', resize);
+    signal?.removeEventListener('abort', abort);
+    restoreTerminal();
   }
-  return finish();
 }
 // Aligned columns, two spaces apart; `right` marks right-aligned columns.
 export function table(header, rows, right = new Set()) {
@@ -717,6 +757,10 @@ export function renderModels(models, current) {
 // The raw provider id of a saved selector: the provider prefix and an OMP
 // effort suffix (anthropic/claude-haiku-4-5:low) are not part of the id.
 export const rawModelId = selector => selector.slice(selector.lastIndexOf('/') + 1).split(':')[0];
+const modelOptions = (models, current) => models.map(entry => ({
+  value: entry.id, label: entry.id,
+  hint: [PROVIDER_LABELS[entry.provider] ?? entry.provider, entry.name !== entry.id ? entry.name : '', entry.id === current ? 'current' : ''].filter(Boolean).join(` ${glyph.dot} `),
+}));
 const currentModelId = state => (state?.model ? rawModelId(state.model) : null);
 
 // ── renderers ───────────────────────────────────────────────────────────────
@@ -852,7 +896,7 @@ export async function login(flags) {
     }
     if (!interactive() || source === 'env' || attempts >= 2) throw new CliError(refusal);
     term(`${tint('33', '!')} ${refusal}\n`);
-    if (await select('Key refused', [{ value: 'retry', label: 'Paste a different key' }, { value: 'quit', label: 'Quit without changing anything' }]) === 'quit') {
+    if (await selectScreen({ title: 'Key refused', options: [{ value: 'retry', label: 'Paste a different key' }, backOption] }) !== 'retry') {
       throw new CliError('Left the login alone; nothing was stored.');
     }
     token = await secret('Gateway key', 'Key');
@@ -881,10 +925,12 @@ async function model(session, client, requested, flags) {
     return configure(session, client, { ...flags, model: requested });
   }
   if (!interactive()) { out(renderModels(models, current)); return true; }
-  const choice = await select('Model', models.map(entry => ({
-    value: entry.id, label: entry.id,
-    hint: [PROVIDER_LABELS[entry.provider] ?? entry.provider, entry.name !== entry.id ? entry.name : '', entry.id === current ? 'current' : ''].filter(Boolean).join(` ${glyph.dot} `),
-  })), Math.max(0, models.findIndex(entry => entry.id === current)));
+  const choice = await selectScreen({
+    title: `${client.label} ${glyph.step} Model`,
+    selected: Math.max(0, models.findIndex(entry => entry.id === current)),
+    options: [...modelOptions(models, current), backOption],
+  });
+  if (choice === BACK) return false;
   return configure(session, client, { ...flags, model: choice });
 }
 async function showUsage(session) {
@@ -957,7 +1003,7 @@ function listen(server, host, port) {
 // forwarded to link/input once; the servers close after that answer is sent.
 // A request line the handler cannot parse gets the failure page; anything
 // else that goes wrong in it is reported, never thrown at the server.
-async function anthropicCallback(session, link, onLink) {
+async function anthropicCallback(session, link, onLink, onError) {
   const authorize = new URL(link.url);
   const redirect = authorize.searchParams.get('redirect_uri');
   const expectedState = authorize.searchParams.get('state');
@@ -976,12 +1022,12 @@ async function anthropicCallback(session, link, onLink) {
       && callback.searchParams.get('code') !== null && !consumed) {
       consumed = true;
       try { onLink(validateLink(await api(session, 'POST', '/admin/api/cli/link/input', linkBody(link, { input: callback.toString() })))); page = callbackPage(true); }
-      catch (error) { warn(error.message); }
+      catch (error) { onError(error.message); }
     }
     res.setHeader('Connection', 'close');
     send(res, page.status, 'text/html', page.body, () => { if (consumed) close(); });
   };
-  const serve = () => http.createServer((req, res) => { handler(req, res).catch(error => warn(error.message)); });
+  const serve = () => http.createServer((req, res) => { handler(req, res).catch(error => onError(error.message)); });
   const ipv4 = serve();
   try { await listen(ipv4, '127.0.0.1', port); } catch (error) {
     ipv4.close();
@@ -1013,9 +1059,9 @@ function launcherPage(session, nonce, preset) {
 </style>
 <div id="session" class="muted"></div>
 <ul id="connections"></ul>
-<select id="provider"></select>
-<select id="worker"><option value="">automatic</option></select>
-<button id="add" disabled>Add new connection</button> <button id="cancel" disabled>cancel</button>
+<select id="provider" aria-label="Provider"></select>
+<select id="worker" aria-label="Worker"><option value="">automatic</option></select>
+<button id="add" disabled>Add</button> <button id="cancel" disabled>Cancel</button>
 <div id="destination"></div>
 <div id="link"></div>
 <div id="authCodeRow" hidden>
@@ -1050,7 +1096,7 @@ function paintLink() {
   const target = $('#link');
   if (link === null) target.textContent = '';
   else {
-    const open = link.url && busy() ? ' · <a href="' + esc(link.url) + '" target="_blank" rel="noopener">Open provider</a>' : '';
+    const open = link.url && busy() ? ' · <a href="' + esc(link.url) + '" target="_blank" rel="noopener">Open ' + esc(labels[link.provider] || link.provider) + '</a>' : '';
     const error = link.error ? ' · <span class="bad">' + esc(link.error) + '</span>' : '';
     target.innerHTML = esc(labels[link.provider] || link.provider) + ' · ' + esc(link.workerId) + ' · ' + esc(link.status) + open + error;
   }
@@ -1086,6 +1132,7 @@ function paintDestination() {
   else if (next.available) { destination.className = ''; destination.textContent = 'next: ' + (selected || next.workerId); }
   else if (['provisioning', 'admitting'].includes(provisioning?.state)) { destination.className = ''; destination.textContent = provisioning.state + ' · ' + provisioning.workerId; }
   else { destination.className = 'bad'; destination.textContent = provisioning?.error || 'no slot'; }
+  $('#add').textContent = 'Add' + ($('#provider').value ? ' ' + (labels[$('#provider').value] || $('#provider').value) : '');
   $('#add').disabled = !next?.available || busy();
   paintLink();
 }
@@ -1141,7 +1188,7 @@ $('#cancel').onclick = () => {
 refresh();
 </script>`;
 }
-async function addConnection(session, flags) {
+async function addConnection(session, flags, view = null) {
   let port = 0;
   if (flags.port !== undefined) {
     port = /^[0-9]{1,5}$/.test(flags.port) ? Number(flags.port) : 0;
@@ -1168,6 +1215,14 @@ async function addConnection(session, flags) {
   let starting = null;
   let cancelling = null;
   let closing = false;
+  let localUrl = '';
+  let cancellationError = null;
+  const report = (text, failed = false) => {
+    if (view === null) { (failed ? warn : note)(text); return; }
+    if (closing) return;
+    view.body = `${localUrl}\n\n${text}`;
+    renderScreen(view);
+  };
   const busy = () => link !== null && !LINK_TERMINAL.has(link.status);
   // Every link answer lands here. A status change is reported in the
   // terminal (a settled link as Connected or a failure, otherwise the new
@@ -1175,14 +1230,16 @@ async function addConnection(session, flags) {
   const settle = next => {
     const changed = link === null || next.attemptId !== link.attemptId || next.status !== link.status;
     link = next;
-    if (changed && link.status === 'done') done('Connected', `${PROVIDER_LABELS[link.provider] ?? link.provider} on ${link.workerId}`);
-    else if (changed && link.status === 'failed') warn(`connection failed${link.error ? `: ${link.error}` : ''}`);
-    else if (changed) note(`${link.workerId} ${glyph.dot} ${link.status}`);
+    if (changed && link.status === 'done') {
+      const connected = `${PROVIDER_LABELS[link.provider] ?? link.provider} on ${link.workerId}`;
+      if (view === null) done('Connected', connected);
+      else report(`Connected ${glyph.dot} ${connected}`);
+    } else if (changed && link.status === 'failed') report(`connection failed${link.error ? `: ${link.error}` : ''}`, true);
+    else if (changed) report(`${PROVIDER_LABELS[link.provider] ?? link.provider} ${glyph.dot} ${link.workerId} ${glyph.dot} ${link.status}`);
     if (LINK_TERMINAL.has(link.status) && closeCallback !== null) { closeCallback(); closeCallback = null; }
   };
-  // Answers for the current attempt only: a callback or poll still in flight
-  // when its link was replaced is dropped.
-  const adopt = next => { if (link !== null && next.attemptId === link.attemptId) settle(next); };
+  // Late polls and callbacks must not revive a cancelled or replaced attempt.
+  const adopt = next => { if (!closing && link !== null && !LINK_TERMINAL.has(link.status) && next.attemptId === link.attemptId) settle(next); };
   // A link that has not settled is cancelled on the worker once. When that
   // fails it is marked cancelled here, since the worker's copy is taken over
   // by the next start on it (or ends with its own timeout) and the page must
@@ -1191,7 +1248,7 @@ async function addConnection(session, flags) {
     if (!busy()) return link;
     cancelling ??= (async () => {
       try { settle(validateLink(await api(session, 'POST', '/admin/api/cli/link/cancel', linkBody(link)))); }
-      catch (error) { warn(error.message); settle({ ...link, status: 'cancelled', error: error.message }); }
+      catch (error) { cancellationError = error.message; report(error.message, true); settle({ ...link, status: 'cancelled', error: error.message }); }
       finally { cancelling = null; }
     })();
     await cancelling;
@@ -1201,12 +1258,12 @@ async function addConnection(session, flags) {
   // so a browser can never race an unbound port; when it cannot be bound the
   // link is cancelled and kept without its URL.
   const bindCallback = async () => {
-    if (!busy() || link.provider !== 'anthropic' || link.url === null || closeCallback !== null) return;
-    try { closeCallback = await anthropicCallback(session, link, adopt); }
+    if (closing || !busy() || link.provider !== 'anthropic' || link.url === null || closeCallback !== null) return;
+    try { closeCallback = await anthropicCallback(session, link, adopt, text => report(text, true)); }
     catch (error) { await cancel(); settle({ ...link, url: null, error: error.message }); throw error; }
   };
   const refresh = async () => {
-    if (!busy()) return;
+    if (closing || !busy()) return;
     const current = link;
     const next = validateLink(await api(session, 'POST', '/admin/api/cli/link/status', linkBody(current)));
     if (link !== current) return;
@@ -1216,10 +1273,11 @@ async function addConnection(session, flags) {
   const start = async (provider, workerId) => {
     if (closing) throw new CliError('shutting down');
     if (starting !== null || busy()) throw new CliError('a connection is already being added');
+    cancellationError = null;
     starting = (async () => {
       const started = await api(session, 'POST', '/admin/api/cli/link/start', { provider, workerId }, 60_000);
       if (record(started) && record(started.provisioning) && started.workerId === null) {
-        note(`${started.provisioning.state} ${glyph.dot} ${started.provisioning.workerId ?? 'worker'}`);
+        report(`${started.provisioning.state} ${glyph.dot} ${started.provisioning.workerId ?? 'worker'}`);
         return { link, provisioning: started.provisioning };
       }
       settle(validateLink(started));
@@ -1267,29 +1325,54 @@ async function addConnection(session, flags) {
     sendJson(res, 404, { error: 'not found' });
   };
   server.on('request', (req, res) => { serve(req, res).catch(error => sendJson(res, error instanceof HttpError ? error.status : 400, { error: String(error?.message ?? error) })); });
-  out(`open http://${local}/`);
-  // Ctrl-C or SIGTERM ends the command: the page stops being served, a start
-  // still in flight is waited for, a link that has not settled is cancelled
-  // once, and the exit is 130. A second signal exits at once.
-  let finish = null;
+  localUrl = `open http://${local}/`;
+  const navigation = new AbortController();
+  let finish;
+  let shutdownTask = null;
+  let interrupted = false;
   const finished = new Promise(resolve => { finish = resolve; });
+  // Back and signals share one cleanup. A start already in flight is joined
+  // before cancelling, so leaving cannot orphan its newly returned attempt.
   const shutdown = () => {
-    if (closing) process.exit(130);
+    if (shutdownTask !== null) return shutdownTask;
     closing = true;
     server.close();
     server.closeIdleConnections?.();
-    (async () => {
+    if (closeCallback !== null) { closeCallback(); closeCallback = null; }
+    shutdownTask = (async () => {
       await starting?.catch(() => {});
       await cancel();
       if (closeCallback !== null) { closeCallback(); closeCallback = null; }
       server.closeAllConnections?.();
       finish();
+      return cancellationError;
     })();
+    return shutdownTask;
   };
-  process.on('SIGINT', shutdown);
-  process.on('SIGTERM', shutdown);
-  try { await finished; } finally { process.off('SIGINT', shutdown); process.off('SIGTERM', shutdown); }
-  throw new Interrupt();
+  const interrupt = () => {
+    if (interrupted) { closeTerminal(); process.exit(130); }
+    interrupted = true;
+    navigation.abort();
+    void shutdown();
+  };
+  process.on('SIGINT', interrupt);
+  process.on('SIGTERM', interrupt);
+  try {
+    if (view === null) { out(localUrl); await finished; }
+    else {
+      view.body = localUrl;
+      view.options = [backOption];
+      try { await selectScreen(view, navigation.signal); }
+      catch (error) { if (error instanceof Interrupt) interrupted = true; else throw error; }
+    }
+  } finally {
+    const cleanup = shutdown();
+    if (view === null || interrupted) await cleanup;
+    process.off('SIGINT', interrupt);
+    process.off('SIGTERM', interrupt);
+  }
+  if (interrupted) throw new Interrupt();
+  return { cleanup: shutdownTask };
 }
 
 // ── key rotation ────────────────────────────────────────────────────────────
@@ -1390,23 +1473,6 @@ async function update() {
 }
 
 // ── dashboard ───────────────────────────────────────────────────────────────
-const clientMenu = rows => rows.map(row => ({ value: row, label: row.label, hint: `${row.status}${row.state?.model ? ` ${glyph.dot} ${row.state.model}` : ''}` }));
-async function clientActions(session) {
-  const rows = statusRows(session);
-  const row = await select('Client', clientMenu(rows));
-  const flags = { profile: row.profile || undefined };
-  const action = await select('Action', [
-    { value: 'configure', label: 'Configure' },
-    { value: 'model', label: 'Model' },
-    { value: 'enable', label: 'Enable' },
-    { value: 'disable', label: 'Disable' },
-    { value: 'unset', label: 'Unset' },
-    { value: 'back', label: 'Back' },
-  ]);
-  if (action === 'configure') await configure(session, row.client, flags);
-  else if (action === 'model') await model(session, row.client, undefined, flags);
-  else if (action !== 'back') await switchScope(session, row.client, action, flags);
-}
 async function refreshIdentity(session) {
   try {
     const identity = validateMe(await api(session, 'GET', '/admin/api/cli/me'));
@@ -1429,35 +1495,141 @@ async function dashboard() {
   if (!interactive()) throw usage('no terminal; run a command instead (genesis --help)');
   let session = loadSession();
   session = session === null ? await login({}) : await refreshIdentity(session);
-  for (;;) {
-    out('');
-    header(session);
-    out('');
-    out(renderStatus(statusRows(session)));
-    out('');
-    const privileged = ['owner', 'admin'].includes(session.role);
-    const owner = session.role === 'owner';
-    const choice = await select('Menu', [
-      { value: 'client', label: 'Configure a client' },
-      { value: 'usage', label: 'Show usage' },
-      ...(privileged ? [{ value: 'capacity', label: 'Capacity' }, { value: 'connections', label: 'Connections' }] : []),
-      ...(owner ? [{ value: 'add', label: 'Add connection' }, { value: 'rotate', label: 'Rotate my key' }] : []),
-      { value: 'update', label: 'Update' },
-      { value: 'quit', label: 'Quit' },
-    ]);
-    if (choice === 'quit') return;
-    try {
-      if (choice === 'client') await clientActions(session);
-      else if (choice === 'usage') await showUsage(session);
-      else if (choice === 'capacity') await showCapacity(session);
-      else if (choice === 'connections') await showConnections(session);
-      else if (choice === 'add') await addConnection(session, {});
-      else if (choice === 'rotate') await rotateToken(session, {}, next => { session = next; });
-      else if (choice === 'update') { await update(); return; }
-    } catch (error) {
-      if (error instanceof Interrupt || !(error instanceof CliError)) throw error;
-      if (error.message !== '') warn(error.message);
+  const stack = [{ route: 'dashboard', title: 'genesis', selected: 0 }];
+  const pendingClosures = new Set();
+  const navigation = new AbortController();
+  let activeView = null;
+  const interrupt = () => {
+    if (navigation.signal.aborted) { closeTerminal(); process.exit(130); }
+    navigation.abort();
+  };
+  process.on('SIGINT', interrupt);
+  process.on('SIGTERM', interrupt);
+  const push = (route, label, fields = {}) => stack.push({
+    route, title: `${stack.at(-1).title} ${glyph.step} ${label}`, selected: 0, ...fields,
+  });
+  const pop = () => {
+    stack.pop();
+    const parent = stack.at(-1);
+    if (parent !== undefined) parent.ready = false;
+  };
+  const actions = [
+    { value: 'configure', label: 'Configure' }, { value: 'model', label: 'Model' },
+    { value: 'enable', label: 'Enable' }, { value: 'disable', label: 'Disable' }, { value: 'unset', label: 'Unset' },
+  ];
+  if (ansi()) { terminal.alternateScreen = true; term('\x1b[?1049h'); }
+  try {
+    while (stack.length > 0) {
+      const view = stack.at(-1);
+      if (navigation.signal.aborted) throw new Interrupt();
+      try {
+        if (view.route === 'add') {
+          const { cleanup } = await addConnection(session, { provider: view.provider }, view);
+          const parent = stack.at(-2);
+          const closing = cleanup.then(error => {
+            if (error !== null) {
+              parent.notice = error;
+              if (activeView === parent) renderScreen(parent);
+            }
+          }).finally(() => pendingClosures.delete(closing));
+          pendingClosures.add(closing);
+          pop();
+          continue;
+        }
+        if (!view.ready) {
+          if (view.route === 'dashboard') {
+            view.body = `${session.endpoint} ${glyph.dot} ${session.name} ${glyph.dot} ${session.role}\n\n${renderStatus(statusRows(session))}`;
+            view.options = [
+              { value: 'clients', label: 'Clients' }, { value: 'usage', label: 'Usage' },
+              ...(['owner', 'admin'].includes(session.role) ? [{ value: 'capacity', label: 'Capacity' }, { value: 'connections', label: 'Connections' }] : []),
+              ...(session.role === 'owner' ? [{ value: 'rotate', label: 'Rotate my key' }] : []),
+              { value: 'update', label: 'Update' }, { value: BACK, label: 'Quit' },
+            ];
+          } else if (view.route === 'clients') {
+            view.options = [...statusRows(session).map(row => ({
+              value: row, label: row.label,
+              hint: `${row.status}${row.state?.model ? ` ${glyph.dot} ${row.state.model}` : ''}`,
+            })), backOption];
+          } else if (view.route === 'actions') {
+            view.options = [...actions, backOption];
+            const row = statusRows(session, view.row.profile || undefined).find(entry => entry.client.id === view.row.client.id && entry.profile === view.row.profile);
+            if (row !== undefined) view.row = row;
+            view.body = renderStatus([view.row]);
+          } else if (view.route === 'model') {
+            const models = servedModels(await api(session, 'GET', '/v1/models'), view.row.client);
+            const current = currentModelId(readState(resolveScope(view.row.client, view.row.profile || undefined).stateFile, view.row.client.id));
+            if (view.options === undefined) view.selected = Math.max(0, models.findIndex(entry => entry.id === current));
+            view.options = [...modelOptions(models, current), backOption];
+          } else if (view.route === 'usage') {
+            view.body = renderUsage(await api(session, 'GET', '/admin/api/cli/usage'));
+            view.options = [backOption];
+          } else if (view.route === 'capacity') {
+            view.body = renderCapacity(await api(session, 'GET', '/admin/api/cli/capacity'));
+            view.options = [backOption];
+          } else if (view.route === 'connections') {
+            view.body = renderConnections(await api(session, 'GET', '/admin/api/cli/connections'));
+            view.options = [...(session.role === 'owner' ? Object.entries(PROVIDER_LABELS).map(([provider, label]) => ({ value: provider, label: `Add ${label}` })) : []), backOption];
+          } else if (view.route === 'confirm') {
+            view.options = [{ value: 'apply', label: view.actionLabel }, backOption];
+          }
+          view.ready = true;
+        }
+        activeView = view;
+        let choice;
+        try { choice = await selectScreen(view, navigation.signal); } finally { activeView = null; }
+        if (navigation.signal.aborted) throw new Interrupt();
+        if (choice === BACK) { pop(); continue; }
+        if (view.route === 'dashboard') {
+          const label = view.options.find(option => option.value === choice).label;
+          if (choice === 'rotate' || choice === 'update') push('confirm', label, { action: choice, actionLabel: label, selected: 1 });
+          else push(choice, label);
+        } else if (view.route === 'clients') {
+          push('actions', choice.label, { row: choice });
+        } else if (view.route === 'actions') {
+          const label = actions.find(action => action.value === choice).label;
+          if (choice === 'model') push('model', label, { row: view.row });
+          else push('confirm', label, { row: view.row, action: choice, actionLabel: label, selected: 1 });
+        } else if (view.route === 'model') {
+          push('confirm', choice, { row: view.row, action: 'configure', actionLabel: 'Configure', model: choice, selected: 1 });
+        } else if (view.route === 'connections') {
+          push('add', `Add ${PROVIDER_LABELS[choice]}`, { provider: choice });
+        } else if (view.route === 'confirm') {
+          const output = [];
+          screenOutput = output;
+          renderScreen({ title: view.title, body: '', options: [] });
+          try {
+            if (view.action === 'rotate') await Promise.all(pendingClosures);
+            const flags = { profile: view.row?.profile || undefined, model: view.model, overwrite: true };
+            if (view.action === 'configure') await configure(session, view.row.client, flags);
+            else if (['enable', 'disable', 'unset'].includes(view.action)) await switchScope(session, view.row.client, view.action, flags);
+            else if (view.action === 'rotate') await rotateToken(session, { yes: true }, next => { session = next; });
+            else if (view.action === 'update') await update();
+          } catch (error) {
+            if (error instanceof Interrupt || !(error instanceof CliError)) throw error;
+            if (error.message !== '') warn(error.message);
+          } finally {
+            screenOutput = null;
+            view.body = output.join('').trim();
+            view.options = [backOption];
+            view.selected = 0;
+            view.route = 'result';
+          }
+        }
+      } catch (error) {
+        if (error instanceof Interrupt || !(error instanceof CliError)) throw error;
+        view.route = 'result';
+        view.body = error.message;
+        view.options = [backOption];
+        view.selected = 0;
+        view.ready = true;
+      }
     }
+  } finally {
+    activeView = null;
+    await Promise.all(pendingClosures);
+    process.off('SIGINT', interrupt);
+    process.off('SIGTERM', interrupt);
+    closeTerminal();
   }
 }
 
