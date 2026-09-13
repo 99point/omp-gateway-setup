@@ -1524,7 +1524,7 @@ async function dashboard() {
       if (navigation.signal.aborted) throw new Interrupt();
       try {
         if (view.route === 'add') {
-          const { cleanup } = await addConnection(session, { provider: view.provider }, view);
+          const { cleanup } = await addConnection(session, {}, view);
           const parent = stack.at(-2);
           const closing = cleanup.then(error => {
             if (error !== null) {
@@ -1568,7 +1568,7 @@ async function dashboard() {
             view.options = [backOption];
           } else if (view.route === 'connections') {
             view.body = renderConnections(await api(session, 'GET', '/admin/api/cli/connections'));
-            view.options = [...(session.role === 'owner' ? Object.entries(PROVIDER_LABELS).map(([provider, label]) => ({ value: provider, label: `Add ${label}` })) : []), backOption];
+            view.options = [...(session.role === 'owner' ? [{ value: 'add', label: 'Add connection' }] : []), backOption];
           } else if (view.route === 'confirm') {
             view.options = [{ value: 'apply', label: view.actionLabel }, backOption];
           }
@@ -1592,7 +1592,7 @@ async function dashboard() {
         } else if (view.route === 'model') {
           push('confirm', choice, { row: view.row, action: 'configure', actionLabel: 'Configure', model: choice, selected: 1 });
         } else if (view.route === 'connections') {
-          push('add', `Add ${PROVIDER_LABELS[choice]}`, { provider: choice });
+          push('add', 'Add connection');
         } else if (view.route === 'confirm') {
           const output = [];
           screenOutput = output;
