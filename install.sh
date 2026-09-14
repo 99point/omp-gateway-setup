@@ -7,17 +7,43 @@
 set +x
 set -euo pipefail
 
-RELEASE_COMMIT='c71a425f265c67b47643c55b3d2eda675d6776f8'
-GENESIS_SHA256='428e4b7bd6902c77286ce3d099bf4643f46fa9a02809b82945eca46ecf752e11'
+RELEASE_COMMIT='8030858611269f8df81ca6b7ef50bded82e7425e'
+GENESIS_SHA256='e3d1b7d267bd9634b66320ed09af4b1ef4508f69c81c3223a0c395944e25b043'
 SETUP_SHA256='d764ae1f997956252d07ee0431a967e3b2025eee8785a1eef9b6bd8501e10798'
 # GENESIS_SOURCE overrides the download base for mirrors and local checks;
 # GENESIS_INSTALL_URL is the publisher `genesis update` re-fetches this script from.
-source_base="${GENESIS_SOURCE:-https://raw.githubusercontent.com/99point/omp-gateway-setup/${RELEASE_COMMIT}}"
+source_base="${GENESIS_SOURCE:-https://raw.githubusercontent.com/99point/omp-gateway-setup/8030858611269f8df81ca6b7ef50bded82e7425e}"
 install_url="${GENESIS_INSTALL_URL:-https://raw.githubusercontent.com/99point/omp-gateway-setup/main/install.sh}"
 share="${HOME}/.local/share/genesis"
 bin_dir="${HOME}/.local/bin"
 
-fail() { printf 'genesis install failed: %s\n' "$*" >&2; exit 1; }
+# Read from the terminal, never curl's stdin. Discard keys entered during the
+# download before offering the result's acknowledgement (Bash 3.2 / macOS).
+hold_result() {
+  [[ -z "${GENESIS_NO_LAUNCH:-}" && -t 1 ]] || return 1
+  { exec 9<>/dev/tty; } 2>/dev/null || return 1
+  local ignored
+  if command -v node >/dev/null 2>&1; then
+    node -e '
+      const fs = require("node:fs"), tty = require("node:tty");
+      const fd = fs.openSync("/dev/tty", fs.constants.O_RDWR | fs.constants.O_NONBLOCK);
+      const input = new tty.ReadStream(fd);
+      input.setRawMode(true);
+      try {
+        const bytes = Buffer.alloc(256);
+        while (fs.readSync(fd, bytes, 0, bytes.length, null) > 0) {}
+      } catch (error) { if (error.code !== "EAGAIN") throw error; }
+      finally { input.setRawMode(false); input.destroy(); }
+    '
+  fi
+  printf '%s\n' "$1"
+  IFS= read -r ignored <&9
+}
+fail() {
+  printf 'genesis install failed: %s\n' "$*" >&2
+  hold_result 'Press Enter to exit' || true
+  exit 1
+}
 sha256_file() {
   local output
   if command -v sha256sum >/dev/null 2>&1; then output="$(sha256sum "$1")"
@@ -26,12 +52,14 @@ sha256_file() {
   printf '%s\n' "${output%% *}"
 }
 download() {
+  printf 'Downloading %s\n' "${1##*/}"
   local proto='=https'
   [[ "${source_base}" != http://* ]] || proto='=http,https'
   curl --fail --location --silent --show-error --proto "${proto}" --proto-redir "${proto}" --tlsv1.2 \
     --connect-timeout 15 --max-time 120 --output "$2" "$1" || fail "could not download $1"
 }
 
+printf 'Checking install requirements\n'
 command -v curl >/dev/null 2>&1 || fail 'curl is required'
 command -v node >/dev/null 2>&1 || fail 'Node.js 18 or newer is required (https://nodejs.org); install it and rerun'
 node_major="$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || printf 0)"
@@ -52,6 +80,7 @@ scratch="$(mktemp -d "${share}/.install.XXXXXXXX")"
 trap 'rm -rf "${scratch}"' EXIT
 download "${source_base}/genesis.mjs" "${scratch}/genesis.mjs"
 download "${source_base}/agent-auth-setup.sh" "${scratch}/agent-auth-setup.sh"
+printf 'Verifying downloaded files\n'
 [[ "$(sha256_file "${scratch}/genesis.mjs")" == "${GENESIS_SHA256}" ]] || fail "checksum mismatch for genesis.mjs (expected ${GENESIS_SHA256})"
 [[ "$(sha256_file "${scratch}/agent-auth-setup.sh")" == "${SETUP_SHA256}" ]] || fail "checksum mismatch for agent-auth-setup.sh (expected ${SETUP_SHA256})"
 node --check "${scratch}/genesis.mjs" || fail 'the downloaded genesis.mjs does not parse with this Node.js'
@@ -60,6 +89,7 @@ previous=''
 if [[ -f "${share}/release.json" ]]; then
   previous="$(node -e 'try { process.stdout.write(String(JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).commit ?? "")); } catch {}' "${share}/release.json" 2>/dev/null || true)"
 fi
+printf 'Installing Genesis\n'
 chmod 0644 "${scratch}/genesis.mjs"
 chmod 0755 "${scratch}/agent-auth-setup.sh"
 printf '{\n  "commit": "%s",\n  "installedAt": "%s",\n  "installUrl": "%s"\n}\n' \
@@ -87,7 +117,7 @@ esac
 # curl | bash leaves stdin on the pipe; the dashboard runs only when a terminal
 # is attached and the caller (genesis update) has not asked it to stay quiet.
 # exec replaces this shell without running the EXIT trap, so cleanup goes first.
-if [[ -z "${GENESIS_NO_LAUNCH:-}" && -t 1 ]] && { exec 9<>/dev/tty; } 2>/dev/null; then
+if hold_result 'Press Enter to open Genesis, or Ctrl-C to exit'; then
   exec 9>&-
   rm -rf "${scratch}" "${staged_wrapper}"
   trap - EXIT
