@@ -7,12 +7,12 @@
 set +x
 set -euo pipefail
 
-RELEASE_COMMIT='afd32b45147dafcc2b43e2c6e36e11b95e7bd6f5'
-GENESIS_SHA256='75285b15db96a9ab181eb7d7f08c600d3145b99f0927e1ee5aee2cfa586a125b'
+RELEASE_COMMIT='25a7cc80ea20d56756cfc8a0fd3ce1701124dc5f'
+GENESIS_SHA256='7a9d58af2200bb07ee6e1f269acffbf4146bd98d10192bac47ac26a3328ebd21'
 SETUP_SHA256='d764ae1f997956252d07ee0431a967e3b2025eee8785a1eef9b6bd8501e10798'
 # GENESIS_SOURCE overrides the download base for mirrors and local checks;
 # GENESIS_INSTALL_URL is the publisher `genesis update` re-fetches this script from.
-source_base="${GENESIS_SOURCE:-https://raw.githubusercontent.com/99point/omp-gateway-setup/afd32b45147dafcc2b43e2c6e36e11b95e7bd6f5}"
+source_base="${GENESIS_SOURCE:-https://raw.githubusercontent.com/99point/omp-gateway-setup/25a7cc80ea20d56756cfc8a0fd3ce1701124dc5f}"
 install_url="${GENESIS_INSTALL_URL:-https://raw.githubusercontent.com/99point/omp-gateway-setup/main/install.sh}"
 share="${HOME}/.local/share/genesis"
 bin_dir="${HOME}/.local/bin"
@@ -114,12 +114,13 @@ case ":${PATH}:" in
   *) printf 'Add it to PATH: export PATH="%s:$PATH"\n' "${bin_dir/#${HOME}/\$HOME}" ;;
 esac
 
-# curl | bash leaves stdin on the pipe; the dashboard runs only when a terminal
-# is attached and the caller (genesis update) has not asked it to stay quiet.
+# curl | bash leaves stdin on the pipe; the setup walkthrough (prod gateway
+# URL and key, then the installed clients) runs only when a terminal is
+# attached and the caller (genesis update) has not asked it to stay quiet.
 # exec replaces this shell without running the EXIT trap, so cleanup goes first.
-if hold_result 'Press Enter to open Genesis, or Ctrl-C to exit'; then
+if hold_result 'Press Enter to set up Genesis, or Ctrl-C to exit'; then
   exec 9>&-
   rm -rf "${scratch}" "${staged_wrapper}"
   trap - EXIT
-  exec node "${share}/genesis.mjs" </dev/tty
+  exec node "${share}/genesis.mjs" setup </dev/tty
 fi
