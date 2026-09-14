@@ -5,7 +5,8 @@
 // change, and talks to the gateway's bearer-authenticated CLI door
 // (/admin/api/cli/*). Nothing privileged lives here: the server decides what a
 // key may do from its role.
-import { spawn, spawnSync } from 'node:child_process';
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { execFile, spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import { once } from 'node:events';
 import fs from 'node:fs';
@@ -21,6 +22,8 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 const KEY = /^s99dev\.[A-Za-z0-9_-]{20,512}$/;
 const KEY_SHAPE = 'those start with s99dev. followed by 20-512 letters, digits, _ or -';
 const ROLES = new Set(['owner', 'admin', 'viewer', 'client']);
+const IDENTITY_CLASSES = new Set(['internal', 'external']);
+const identityClassOf = value => value === undefined ? 'internal' : IDENTITY_CLASSES.has(value) ? value : null;
 const HTTP_TIMEOUT_MS = 30_000;
 const LINK_POLL_MS = 2_000;
 const LOCAL_BODY_CAP = 16 * 1024;
@@ -32,6 +35,15 @@ const MODEL_ID = /^[\x21-\x7e]{1,256}$/;
 const PROVIDER_LABELS = { anthropic: 'Anthropic', 'openai-codex': 'OpenAI' };
 const WINDOWS = ['today', '7d', '30d', 'all'];
 
+const ENVIRONMENTS = Object.freeze({
+  main: { label: 'Main', endpoint: 'https://genesis.99point.co', installUrl: 'https://raw.githubusercontent.com/99point/omp-gateway-setup/main/install.sh' },
+  staging: { label: 'Staging', endpoint: 'https://genesis-staging.99point.co', installUrl: 'https://raw.githubusercontent.com/99point/omp-gateway-setup-staging/staging/install.sh' },
+});
+function environmentId(value) {
+  if (typeof value !== 'string' || !Object.hasOwn(ENVIRONMENTS, value)) throw usage('environment must be main or staging');
+  return value;
+}
+const environmentLabel = environment => ENVIRONMENTS[environment].label;
 // One row per supported client. `providers` are the gateway providers whose
 // models the client can use; `binary` is what the installer requires on PATH.
 export const CLIENTS = Object.freeze([
@@ -44,7 +56,7 @@ export const CLIENTS = Object.freeze([
 
 // ── errors ──────────────────────────────────────────────────────────────────
 // Exit codes: 0 ok, 1 failure, 2 usage, 130 interrupted. An empty message
-// means the reason was already printed (the installer reports its own).
+// suppresses a duplicate error after acknowledgement, or marks an interrupt.
 export class CliError extends Error {
   constructor(message, exitCode = 1) { super(message); this.exitCode = exitCode; }
 }
@@ -61,7 +73,7 @@ const hostOf = endpoint => endpoint.replace(/^[a-z]+:\/\//, '');
 // ── key hygiene ─────────────────────────────────────────────────────────────
 // Every key this process has held is registered here; everything the CLI
 // prints passes through redact(), which replaces those bytes with <key>.
-const secrets = new Set();
+const secrets = [];
 function redact(text) {
   let value = String(text);
   for (const secret of secrets) value = value.split(secret).join('<key>');
@@ -71,11 +83,14 @@ function redact(text) {
 // redaction. A malformed one is never registered, sent, or echoed.
 function acceptKey(token) {
   if (typeof token !== 'string' || !KEY.test(token)) return false;
-  secrets.add(token);
+  if (!secrets.includes(token)) {
+    const before = secrets.findIndex(secret => secret.length < token.length);
+    secrets.splice(before === -1 ? secrets.length : before, 0, token);
+  }
   return true;
 }
 // Before anything is printed, the exported AGENT_AUTH_TOKEN and the stored
-// session key are registered, so a key pasted into the wrong prompt, typed
+// session keys are registered, so a key pasted into the wrong prompt, typed
 // into a URL or quoted by a child is rendered as <key>. Nothing is reported
 // here; the command that needs the session explains what is wrong with it.
 function primeSecrets() {
@@ -83,7 +98,11 @@ function primeSecrets() {
   let text = null;
   try { text = readSessionText(); } catch { return; }
   if (text === null) return;
-  try { acceptKey(JSON.parse(text)?.token); } catch { /* loadSession reports */ }
+  try {
+    const value = JSON.parse(text);
+    acceptKey(value?.token);
+    if (record(value?.sessions)) for (const session of Object.values(value.sessions)) acceptKey(session?.token);
+  } catch { /* loadStore reports */ }
 }
 
 // ── install layout ──────────────────────────────────────────────────────────
@@ -128,7 +147,7 @@ function setupScript() {
 
 // ── session store ───────────────────────────────────────────────────────────
 // ${XDG_CONFIG_HOME:-~/.config}/genesis/session.json (0600, dir 0700) holds
-// {version, endpoint, name, role, email, token, updatedAt}, replaced by rename.
+// {version: 2, environment, sessions: {main?, staging?}}, replaced by rename.
 export function configDir() {
   const xdg = process.env.XDG_CONFIG_HOME;
   return path.join(xdg && path.isAbsolute(xdg) ? xdg : path.join(os.homedir(), '.config'), 'genesis');
@@ -184,36 +203,81 @@ function writeSessionText(text) {
   try { fs.writeFileSync(fd, text); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
   fs.renameSync(temporary, file);
 }
-export function loadSession() {
-  const text = readSessionText();
-  if (text === null) return null;
+function storedSession(value, environment) {
   const file = sessionFile();
-  let value;
-  try { value = JSON.parse(text); } catch { throw new CliError(`${file} is not valid JSON; run genesis login`); }
-  if (!record(value) || value.version !== 1 || typeof value.endpoint !== 'string' || typeof value.name !== 'string'
-    || !ROLES.has(value.role) || (value.email !== null && typeof value.email !== 'string') || typeof value.token !== 'string') {
-    throw new CliError(`${file} is not a genesis session; run genesis login`);
+  if (!record(value) || typeof value.endpoint !== 'string' || typeof value.name !== 'string'
+    || !ROLES.has(value.role)
+    || (value.email !== null && typeof value.email !== 'string') || typeof value.updatedAt !== 'string') {
+    throw new CliError(`${file} is not a genesis session store; remove it and run genesis login`);
   }
   if (!acceptKey(value.token)) throw new CliError(`${file} does not hold a personal gateway key; run genesis login`);
-  return { endpoint: value.endpoint, name: value.name, role: value.role, email: value.email, token: value.token };
+  return {
+    endpoint: environmentEndpoint(value.endpoint, environment), name: value.name, role: value.role,
+    email: value.email, token: value.token, updatedAt: value.updatedAt, identityClass: identityClassOf(value.identityClass),
+  };
+}
+function checkSessionIsolation(store, environment, endpoint, token) {
+  for (const [other, session] of Object.entries(store.sessions)) {
+    if (other === environment) continue;
+    if (session.endpoint === endpoint) throw new CliError(`${environmentLabel(environment)} needs its own gateway; ${endpoint} belongs to ${environmentLabel(other)}`);
+    if (session.token === token) throw new CliError(`${environmentLabel(environment)} needs its own key; the supplied key belongs to ${environmentLabel(other)}`);
+  }
+}
+function loadStore() {
+  const text = readSessionText();
+  if (text === null) return { version: 2, environment: 'main', sessions: {} };
+  const file = sessionFile();
+  let value;
+  try { value = JSON.parse(text); } catch { throw new CliError(`${file} is not valid JSON; remove it and run genesis login`); }
+  if (record(value) && value.version === 1) {
+    const environment = canonicalEnvironment(value.endpoint) ?? 'main';
+    const session = storedSession(value, environment);
+    const store = { version: 2, environment, sessions: { [environment]: session } };
+    writeSessionText(JSON.stringify(store, null, 2) + '\n');
+    return store;
+  }
+  if (!record(value) || value.version !== 2 || typeof value.environment !== 'string' || !Object.hasOwn(ENVIRONMENTS, value.environment) || !record(value.sessions)
+    || Object.keys(value.sessions).some(environment => !Object.hasOwn(ENVIRONMENTS, environment))) {
+    throw new CliError(`${file} is not a genesis session store; remove it and run genesis login`);
+  }
+  for (const [environment, session] of Object.entries(value.sessions)) value.sessions[environment] = storedSession(session, environment);
+  for (const [environment, session] of Object.entries(value.sessions)) checkSessionIsolation(value, environment, session.endpoint, session.token);
+  return value;
+}
+export function loadSession(environment) {
+  const store = loadStore();
+  const selected = environmentId(environment ?? store.environment);
+  const session = store.sessions[selected];
+  return session === undefined ? null : { environment: selected, ...session };
 }
 function saveSession(session) {
-  writeSessionText(JSON.stringify({
-    version: 1, endpoint: session.endpoint, name: session.name, role: session.role, email: session.email,
-    token: session.token, updatedAt: new Date().toISOString(),
-  }, null, 2) + '\n');
+  const store = loadStore();
+  checkSessionIsolation(store, session.environment, session.endpoint, session.token);
+  store.sessions[session.environment] = storedSession({ ...session, updatedAt: new Date().toISOString() }, session.environment);
+  writeSessionText(JSON.stringify(store, null, 2) + '\n');
 }
-// logout removes the session file and nothing else; a link in its place is refused.
-function clearSession() {
-  const file = sessionFile();
-  if (checkSessionDir(path.dirname(file)) === null) return;
-  refuseSymlink(file);
-  fs.rmSync(file, { force: true });
+function selectEnvironment(environment) {
+  environmentId(environment);
+  const store = loadStore();
+  store.environment = environment;
+  writeSessionText(JSON.stringify(store, null, 2) + '\n');
 }
-function requireSession() {
-  const session = loadSession();
-  if (session === null) throw new CliError('not logged in; run genesis login');
-  return session;
+// Logout keeps the selected environment and the other login, never client files.
+function clearSession(environment) {
+  const store = loadStore();
+  const selected = environmentId(environment ?? store.environment);
+  if (Object.hasOwn(store.sessions, selected)) {
+    delete store.sessions[selected];
+    writeSessionText(JSON.stringify(store, null, 2) + '\n');
+  }
+  return selected;
+}
+function requireSession(flags) {
+  const store = loadStore();
+  const environment = environmentId(flags.environment ?? store.environment);
+  const session = store.sessions[environment];
+  if (session === undefined) throw new CliError(`${environmentLabel(environment)} is not logged in; run genesis login --environment ${environment}`);
+  return { environment, ...session };
 }
 
 // ── endpoint ────────────────────────────────────────────────────────────────
@@ -234,6 +298,21 @@ export function normalizeEndpoint(input) {
   if (value.startsWith('http://')) return { error: 'cleartext http:// is accepted only for localhost; use https://' };
   return { error: 'use https://HOST (or a bare host); other schemes are not gateways' };
 }
+function canonicalEnvironment(endpoint) {
+  let url;
+  try { url = new URL(endpoint); } catch { return null; }
+  const hostname = url.hostname.toLowerCase().replace(/\.$/, '');
+  return Object.keys(ENVIRONMENTS).find(environment => hostname === new URL(ENVIRONMENTS[environment].endpoint).hostname) ?? null;
+}
+function environmentEndpoint(input, environment) {
+  const result = normalizeEndpoint(input);
+  if (result.error !== undefined) throw usage(result.error);
+  let endpoint;
+  try { endpoint = new URL(result.value).href.replace(/\/+$/, ''); } catch { throw usage('the gateway URL is invalid'); }
+  const canonical = canonicalEnvironment(endpoint);
+  if (canonical !== null && canonical !== environment) throw usage(`${endpoint} is ${environmentLabel(canonical)}, not ${environmentLabel(environment)}`);
+  return endpoint;
+}
 
 // ── HTTP ────────────────────────────────────────────────────────────────────
 function reasonOf(error) {
@@ -242,36 +321,54 @@ function reasonOf(error) {
   if (typeof cause?.code === 'string') return cause.code;
   return String(cause?.message ?? error?.message ?? error);
 }
+function requestDeadline(timeoutMs, interruptible = true) {
+  const controller = new AbortController();
+  const operation = interruptible ? workContext.getStore()?.signal : null;
+  const abort = () => controller.abort();
+  const timer = setTimeout(() => controller.abort(new DOMException('Request timed out', 'TimeoutError')), timeoutMs);
+  if (operation?.aborted) abort();
+  else operation?.addEventListener('abort', abort, { once: true });
+  return {
+    signal: controller.signal,
+    close() { clearTimeout(timer); operation?.removeEventListener('abort', abort); },
+  };
+}
 // JSON in, JSON out. Failures become one line naming the host and the server's
 // `error`; a bearer is sent only when it is a personal key, and its bytes are
 // redacted from every rendered line.
 async function request(endpoint, token, method, pathname, body, timeoutMs = HTTP_TIMEOUT_MS) {
+  if (workContext.getStore()?.signal.aborted) throw new Interrupt();
   const headers = { Accept: 'application/json' };
   if (token !== null) {
     if (!acceptKey(token)) throw new CliError(`the stored key is not a personal gateway key (${KEY_SHAPE}); run genesis login`);
     headers.Authorization = `Bearer ${token}`;
   }
   if (body !== undefined) headers['Content-Type'] = 'application/json';
-  let response;
+  // A dispatched mutation must settle (notably key rotation) so its committed
+  // result can be saved. Read requests can stop immediately.
+  const deadline = requestDeadline(timeoutMs, method === 'GET');
   try {
-    response = await fetch(`${endpoint}${pathname}`, {
-      method, headers, body: body === undefined ? undefined : JSON.stringify(body),
-      redirect: 'manual', signal: AbortSignal.timeout(timeoutMs),
-    });
-  } catch (error) {
-    throw new CliError(`could not reach ${hostOf(endpoint)}: ${reasonOf(error)}`);
-  }
-  if (Number(response.headers.get('content-length') ?? 0) > 4 * 1024 * 1024) {
-    throw new CliError(`${hostOf(endpoint)}: response too large for ${pathname}`);
-  }
-  const text = await response.text();
-  let value = null;
-  try { value = text === '' ? null : JSON.parse(text); } catch { value = null; }
-  if (!response.ok) {
-    const detail = typeof value?.error === 'string' ? value.error : `unexpected ${response.status} response`;
-    throw new HttpError(response.status, `${hostOf(endpoint)}: ${detail} (HTTP ${response.status})`);
-  }
-  return value;
+    let response;
+    try {
+      response = await fetch(`${endpoint}${pathname}`, {
+        method, headers, body: body === undefined ? undefined : JSON.stringify(body),
+        redirect: 'manual', signal: deadline.signal,
+      });
+    } catch (error) {
+      throw new CliError(`could not reach ${hostOf(endpoint)}: ${reasonOf(error)}`);
+    }
+    if (Number(response.headers.get('content-length') ?? 0) > 4 * 1024 * 1024) {
+      throw new CliError(`${hostOf(endpoint)}: response too large for ${pathname}`);
+    }
+    const text = await response.text();
+    let value = null;
+    try { value = text === '' ? null : JSON.parse(text); } catch { value = null; }
+    if (!response.ok) {
+      const detail = typeof value?.error === 'string' ? value.error : `unexpected ${response.status} response`;
+      throw new HttpError(response.status, `${hostOf(endpoint)}: ${detail} (HTTP ${response.status})`);
+    }
+    return value;
+  } finally { deadline.close(); }
 }
 const api = (session, method, pathname, body, timeoutMs) => request(session.endpoint, session.token, method, pathname, body, timeoutMs);
 
@@ -280,11 +377,14 @@ const utf8 = /utf-?8/i.test(process.env.LC_ALL || process.env.LC_CTYPE || proces
 const glyph = utf8 ? { ok: '✓', pick: '❯', step: '›', dot: '·' } : { ok: '+', pick: '>', step: '>', dot: '.' };
 const ansi = () => process.env.TERM !== 'dumb';
 let screenOutput = null;
+let activeWork = null;
+// Earlier connection cleanup must not inherit a later menu's cancellation.
+const workContext = new AsyncLocalStorage();
 const colorOut = () => screenOutput === null && process.stdout.isTTY === true && ansi() && !process.env.NO_COLOR;
 const paint = (code, text, enabled = colorOut()) => (enabled ? `\x1b[${code}m${text}\x1b[0m` : text);
 const writeOutput = (target, text, encoding = 'utf8') => {
   const safe = redact(text);
-  if (screenOutput !== null) screenOutput.push(encoding === 'latin1' ? Buffer.from(safe, 'latin1').toString('utf8') : safe);
+  if (screenOutput !== null) screenOutput(encoding === 'latin1' ? Buffer.from(safe, 'latin1').toString('utf8') : safe);
   else target.write(safe, encoding);
 };
 const out = text => writeOutput(process.stdout, `${text}\n`);
@@ -417,30 +517,30 @@ async function confirm(question, defaultYes = false) {
 }
 const BACK = Symbol('back');
 const backOption = { value: BACK, label: 'Back' };
-const clearScreen = () => term(ansi() ? '\x1b[H\x1b[2J' : '\f');
 function renderScreen(view) {
   const width = Math.max(20, columns() - 1);
   const height = Math.max(8, tty().output.rows || 24);
   const options = view.options;
   view.selected = Math.max(0, Math.min(view.selected ?? 0, options.length - 1));
-  const body = [view.body, view.notice].filter(Boolean).join('\n\n');
+  const body = [view.identity, view.body, view.notice].filter(Boolean).join('\n\n');
   const lines = redact(body).split('\n').flatMap(line => {
     const wrapped = [];
     for (let offset = 0; offset < line.length; offset += width) wrapped.push(line.slice(offset, offset + width));
     return wrapped.length === 0 ? [''] : wrapped;
   });
   const menuRows = Math.min(options.length, Math.max(1, height - 5));
-  const bodyRows = Math.max(0, height - menuRows - 5);
+  const bodyRows = Math.max(0, height - menuRows - 5 - (view.status ? 2 : 0));
   view.offset = Math.max(0, Math.min(view.offset ?? 0, Math.max(0, lines.length - bodyRows)));
   const firstOption = Math.max(0, Math.min(view.selected - menuRows + 1, options.length - menuRows));
-  clearScreen();
+  const frame = [ansi() ? '\x1b[H\x1b[2J' : '\f'];
   const title = redact(view.title);
-  term(`${tint('1', title.length > width ? `…${title.slice(1 - width)}` : title)}\n\n`);
+  frame.push(`${tint('1', title.length > width ? `…${title.slice(1 - width)}` : title)}\n\n`);
+  if (view.status) frame.push(`${tint(view.failed ? '31' : '36', redact(view.status).slice(0, width))}\n\n`);
   if (bodyRows > 0 && body) {
-    term(`${lines.slice(view.offset, view.offset + bodyRows).join('\n')}\n`);
-    if (lines.length > bodyRows) term(`${tint('2', `${view.offset + 1}–${Math.min(lines.length, view.offset + bodyRows)}/${lines.length}`)}\n`);
+    frame.push(`${lines.slice(view.offset, view.offset + bodyRows).join('\n')}\n`);
+    if (lines.length > bodyRows) frame.push(`${tint('2', `${view.offset + 1}–${Math.min(lines.length, view.offset + bodyRows)}/${lines.length}`)}\n`);
   }
-  term('\n');
+  frame.push('\n');
   options.slice(firstOption, firstOption + menuRows).forEach((option, offset) => {
     const index = firstOption + offset;
     const prefix = `${index === view.selected ? glyph.pick : ' '} ${index + 1}  `;
@@ -448,19 +548,25 @@ function renderScreen(view) {
     const hint = option.hint ? `  ${option.hint}` : '';
     const line = `${label}${hint}`;
     const clipped = line.length >= width ? `${line.slice(0, width - 2)}…` : line;
-    term(`${index === view.selected ? tint('36', clipped) : clipped}\n`);
+    frame.push(`${index === view.selected ? tint('36', clipped) : clipped}\n`);
   });
+  term(frame.join(''));
 }
 // One screen owns terminal input until it is left. The route keeps its cursor
 // and scroll position; Escape never confirms a highlighted action.
-async function selectScreen(view, signal) {
+async function selectScreen(view, signal, renderInitial = true) {
   const { input, output } = tty();
   if (signal?.aborted) return BACK;
   let keypress, resize, abort, ended;
   try {
     return await new Promise((resolve, reject) => {
       keypress = (text, key) => {
-        if (key?.ctrl && key.name === 'c') { reject(new Interrupt()); return; }
+        if (key?.ctrl && key.name === 'c') {
+          if (view.interrupt) view.interrupt();
+          else reject(new Interrupt());
+          return;
+        }
+        if (view.options.length === 0) return;
         if (key?.name === 'escape' || key?.name === 'left' || (key?.ctrl && key.name === 'd')) { resolve(BACK); return; }
         if (key?.name === 'return' || key?.name === 'enter') { resolve(view.options[view.selected ?? 0].value); return; }
         const count = view.options.length;
@@ -485,7 +591,7 @@ async function selectScreen(view, signal) {
       terminal.raw = true;
       input.resume();
       if (ansi()) { term('\x1b[?25l'); terminal.cursorHidden = true; }
-      renderScreen(view);
+      if (renderInitial) renderScreen(view);
     });
   } finally {
     input.off('keypress', keypress);
@@ -494,6 +600,109 @@ async function selectScreen(view, signal) {
     signal?.removeEventListener('abort', abort);
     restoreTerminal();
   }
+}
+
+// Keep reading while work runs: keys pressed during a slow step must not
+// become an acknowledgement of its result. Prompts run outside this boundary.
+async function runProgress(view, label, work) {
+  const running = {
+    title: view.title, identity: view.identity, status: `Running ${glyph.dot} ${label}`, body: '', options: [],
+    interrupt: () => process.emit('SIGINT'),
+  };
+  const finished = new AbortController();
+  const operation = new AbortController();
+  activeWork = operation;
+  let visible = false, redraw = null, inputError = null, interrupts = 0;
+  const draw = () => {
+    if (!visible || redraw !== null) return;
+    redraw = setImmediate(() => { redraw = null; renderScreen(running); });
+  };
+  // Input belongs to this operation immediately; quick loads need no extra frame.
+  const reveal = setTimeout(() => { visible = true; draw(); }, 150);
+  const interrupt = () => {
+    if (++interrupts > 1) { closeTerminal(); process.exit(130); }
+    operation.abort();
+    running.status = `Stopping ${glyph.dot} ${label}`;
+    visible = true;
+    draw();
+  };
+  for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(signal, interrupt);
+  const input = selectScreen(running, finished.signal, false).catch(error => { inputError = error; operation.abort(); });
+  screenOutput = text => {
+    running.body += text;
+    running.offset = Infinity;
+    draw();
+  };
+  try {
+    const value = await workContext.run(operation, work);
+    if (inputError !== null) throw inputError;
+    if (operation.signal.aborted) throw new Interrupt();
+    return value;
+  } catch (error) {
+    if (operation.signal.aborted) throw new Interrupt();
+    throw error;
+  } finally {
+    clearTimeout(reveal);
+    clearImmediate(redraw);
+    screenOutput = null;
+    if (running.body !== '') { view.body = running.body.trim(); view.offset = Infinity; }
+    finished.abort();
+    await input;
+    activeWork = null;
+    for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.off(signal, interrupt);
+  }
+}
+function showResult(view, status, body = view.body, failed = false) {
+  Object.assign(view, { route: 'result', status, body, failed, options: [backOption], selected: 0, offset: Infinity, ready: true });
+}
+async function runAction(label, work, prompts = false) {
+  if (!interactive() || screenOutput !== null) return work(null);
+  const view = { title: `genesis ${glyph.step} ${label}` };
+  const alternate = ansi() && !terminal.alternateScreen;
+  if (alternate) { terminal.alternateScreen = true; term('\x1b[?1049h'); }
+  const interrupt = () => { if (activeWork === null) { closeTerminal(); process.exit(130); } };
+  for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(signal, interrupt);
+  let result, failure;
+  try {
+    try {
+      result = await (prompts ? work(view) : runProgress(view, label, () => work(view)));
+      if (result === false) return false;
+      showResult(view, `Complete ${glyph.dot} ${label}`);
+    } catch (error) {
+      if (error instanceof Interrupt) {
+        if (view.body) showResult(view, `Interrupted ${glyph.dot} ${label}`);
+        throw error;
+      }
+      failure = error;
+      showResult(view, `Failed ${glyph.dot} ${label}`, [view.body, error.message || String(error)].filter(Boolean).join('\n\n'), true);
+    }
+    await selectScreen(view);
+  } finally {
+    for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.off(signal, interrupt);
+    if (alternate && terminal !== null) { term('\x1b[?1049l'); terminal.alternateScreen = false; }
+    if (view.route === 'result') {
+      out(view.status);
+      if (view.body) out(view.body);
+    }
+  }
+  if (failure) throw new CliError('', failure instanceof CliError ? failure.exitCode : 1);
+  return result;
+}
+// Unattended children get their own group so Ctrl-C also reaches subprocesses
+// (curl, sleep, client probes), not only the shell waiting for them.
+function spawnWork(command, args, options) {
+  const signal = workContext.getStore()?.signal;
+  if (signal?.aborted) throw new Interrupt();
+  const child = spawn(command, args, { ...options, detached: signal !== undefined });
+  if (signal) {
+    const cancel = () => {
+      if (!child.pid) return;
+      try { process.kill(-child.pid, 'SIGINT'); } catch (error) { if (error.code !== 'ESRCH') throw error; }
+    };
+    signal.addEventListener('abort', cancel, { once: true });
+    child.once('close', () => signal.removeEventListener('abort', cancel));
+  }
+  return child;
 }
 // Aligned columns, two spaces apart; `right` marks right-aligned columns.
 export function table(header, rows, right = new Set()) {
@@ -571,12 +780,16 @@ function resolveConfigTarget(file) {
 // The same path rules as the installer: each client's own environment picks
 // the scope; OMP answers through its own CLI. `targets` are the files whose
 // presence means consent is needed before a configure replaces them.
-function resolveScope(client, profile) {
+async function resolveScope(client, profile) {
   if (client.id === 'omp') {
-    const result = spawnSync('omp', [...(profile ? ['--profile', profile] : []), 'config', 'path'],
-      { encoding: 'utf8', timeout: 20_000, stdio: ['ignore', 'pipe', 'pipe'] });
-    const agentDir = (result.stdout ?? '').trim();
-    if (result.status !== 0 || !path.isAbsolute(agentDir) || agentDir.includes('\n')) throw new CliError('omp config path did not return one absolute path');
+    const agentDir = await new Promise((resolve, reject) => {
+      execFile('omp', [...(profile ? ['--profile', profile] : []), 'config', 'path'],
+        { encoding: 'utf8', timeout: 20_000, signal: workContext.getStore()?.signal }, (error, stdout) => {
+          const directory = stdout.trim();
+          if (error || !path.isAbsolute(directory) || directory.includes('\n')) reject(new CliError('omp config path did not return one absolute path'));
+          else resolve(directory);
+        });
+    });
     const tokenDir = path.join(agentDir, 'agent-auth');
     return { stateFile: path.join(tokenDir, 'switch.json'), targets: [path.join(agentDir, 'models.yml'), path.join(agentDir, 'config.yml'), path.join(tokenDir, 'token')] };
   }
@@ -648,7 +861,7 @@ export function scopeStatus(state, isInstalled, endpoint) {
 // One row per scope. `problem` is set when the scope could not be discovered
 // (for example `omp config path` failed); such a scope is reported, never
 // treated as absent.
-function statusRows(session, profile) {
+async function statusRows(session, profile) {
   const rows = [];
   for (const client of CLIENTS) {
     const profiles = client.id === 'codex' ? [profile ?? '', ...codexProfiles().filter(name => name !== profile)] : [client.id === 'omp' ? profile ?? '' : ''];
@@ -656,7 +869,7 @@ function statusRows(session, profile) {
       const isInstalled = installed(client.binary);
       let state = null, problem = null;
       try {
-        if (client.id !== 'omp' || isInstalled) state = readState(resolveScope(client, scopeProfile || undefined).stateFile, client.id);
+        if (client.id !== 'omp' || isInstalled) state = readState((await resolveScope(client, scopeProfile || undefined)).stateFile, client.id);
       } catch (error) { problem = error.message; }
       rows.push({
         client, profile: scopeProfile, state, installed: isInstalled, problem,
@@ -672,7 +885,8 @@ export function renderStatus(rows) {
     row.label, row.installed ? 'yes' : 'no', row.status, row.state?.model ?? '—', row.state?.gateway ? hostOf(row.state.gateway) : '—',
   ]));
 }
-const header = session => out(paint('1', `${session.endpoint} ${glyph.dot} ${session.name} ${glyph.dot} ${session.role}`));
+const sessionIdentity = session => `${environmentLabel(session.environment)} ${glyph.dot} ${session.endpoint} ${glyph.dot} ${session.name} ${glyph.dot} ${session.role}${session.identityClass === 'external' ? ` ${glyph.dot} external` : session.identityClass === null ? ` ${glyph.dot} unclassified` : ''}`;
+const header = session => out(paint('1', sessionIdentity(session)));
 
 // ── installer ───────────────────────────────────────────────────────────────
 // AGENT_AUTH_URL/AGENT_AUTH_TOKEN carry the session into the installer; the key
@@ -684,13 +898,14 @@ async function runSetup(session, client, action, args, withToken) {
   delete env.AGENT_AUTH_KEY_CHOICE;
   delete env.AGENT_AUTH_TOKEN;
   if (withToken) env.AGENT_AUTH_TOKEN = session.token;
-  const child = spawn('bash', [setupScript(), '--harness', client.id, '--action', action, '--unattended', ...args], { env, stdio: ['ignore', 'pipe', 'pipe'] });
+  note(`running ${client.label} ${action} setup`);
+  const child = spawnWork('bash', [setupScript(), '--harness', client.id, '--action', action, '--unattended', ...args], { env, stdio: ['ignore', 'pipe', 'pipe'] });
   relay(child.stdout, process.stdout);
   relay(child.stderr, process.stderr);
   const [code, signal] = await once(child, 'close');
   if (code === 0) return;
   if (signal === 'SIGINT' || code === 130) throw new Interrupt();
-  throw new CliError(code === 1 ? '' : `setup exited ${code ?? signal}`);
+  throw new CliError(`${client.label} ${action} failed (setup exited ${code ?? signal})`);
 }
 const profileArgs = profile => (profile ? ['--profile', profile] : []);
 function checkProfile(client, profile) {
@@ -704,7 +919,7 @@ async function consentToOverwrite(client, profile, flags) {
   if (flags.overwrite) return true;
   let occupied = client.id === 'omp';
   if (!occupied) {
-    try { const scope = resolveScope(client, profile); occupied = [scope.stateFile, ...scope.targets].some(exists); } catch { occupied = true; }
+    try { const scope = await resolveScope(client, profile); occupied = [scope.stateFile, ...scope.targets].some(exists); } catch { occupied = true; }
   }
   if (!occupied) return false;
   if (!interactive()) {
@@ -718,19 +933,37 @@ async function consentToOverwrite(client, profile, flags) {
   out(`Left ${client.label} alone; no user files changed.`);
   return null;
 }
-async function configure(session, client, flags) {
+async function configure(session, client, flags, view = null) {
   checkProfile(client, flags.profile);
   if (flags.model !== undefined && !MODEL_ID.test(flags.model)) throw usage('model ids are 1-256 printable ASCII characters without spaces');
+  if (view === null && screenOutput === null) header(session);
   const overwrite = await consentToOverwrite(client, flags.profile, flags);
   if (overwrite === null) return false;
-  await runSetup(session, client, 'configure', [
-    '--new-key', ...(overwrite ? ['--overwrite'] : []), ...(flags.model !== undefined ? ['--model', flags.model] : []), ...profileArgs(flags.profile),
-  ], true);
-  return true;
+  const apply = async () => {
+    await runSetup(session, client, 'configure', [
+      '--new-key', ...(overwrite ? ['--overwrite'] : []), ...(flags.model !== undefined ? ['--model', flags.model] : []), ...profileArgs(flags.profile),
+    ], true);
+    done('Configured', flags.profile ? `${client.label} (${flags.profile})` : client.label);
+    done('Gateway', session.endpoint);
+    try {
+      const state = readState((await resolveScope(client, flags.profile)).stateFile, client.id);
+      if (state?.model ?? flags.model) done('Model', state?.model ?? flags.model);
+    } catch (error) {
+      if (workContext.getStore()?.signal.aborted) throw new Interrupt();
+      warn(`Client configured; could not read its saved model: ${error.message}`);
+    }
+    done('Key', 'staged');
+    return true;
+  };
+  const label = `Configure ${client.label}`;
+  return view === null ? runAction(label, apply) : runProgress(view, label, apply);
 }
 async function switchScope(session, client, action, flags) {
   checkProfile(client, flags.profile);
-  await runSetup(session, client, action, profileArgs(flags.profile), false);
+  return runAction(`${action} ${client.label}`, async () => {
+    await runSetup(session, client, action, profileArgs(flags.profile), false);
+    done({ enable: 'Enabled', disable: 'Disabled', unset: 'Unset' }[action], flags.profile ? `${client.label} (${flags.profile})` : client.label);
+  });
 }
 
 // ── served models ───────────────────────────────────────────────────────────
@@ -765,32 +998,37 @@ const currentModelId = state => (state?.model ? rawModelId(state.model) : null);
 
 // ── renderers ───────────────────────────────────────────────────────────────
 const number = value => (typeof value === 'number' && Number.isFinite(value) ? value : null);
-const bars = value => (number(value) === null ? '—' : value.toFixed(2));
+const USAGE_CATEGORIES = [
+  ['input', 'input'], ['cache_write', 'cache write'], ['cache_read', 'cache read'],
+  ['output_completion', 'completion'], ['thinking', 'thinking'], ['total', 'total'],
+  ['cache_write_5m', 'cache write 5m'], ['cache_write_1h', 'cache write 1h'],
+  ['orchestration_input', 'orchestration input'], ['orchestration_cache_read', 'orchestration read'], ['orchestration_output', 'orchestration out'],
+];
 export function renderUsage(payload) {
-  if (!record(payload) || !Array.isArray(payload.barTypes) || !record(payload.windows)
-    || WINDOWS.some(key => !record(payload.windows[key]) || !record(payload.windows[key].tokens) || !record(payload.windows[key].bars))) {
+  const bucket = value => record(value) && record(value.tokens) && record(value.ratesPerDay);
+  if (!record(payload) || !record(payload.windows)
+    || WINDOWS.some(key => !bucket(payload.windows[key]) || !record(payload.windows[key].providers)
+      || Object.values(payload.windows[key].providers).some(value => !bucket(value)))) {
     throw new CliError('the usage payload is not in the expected shape');
   }
-  const types = payload.barTypes.filter(type => record(type) && typeof type.id === 'string' && typeof type.label === 'string');
-  const rows = WINDOWS.map(key => {
+  const count = value => number(value) === null ? '—' : integer(value);
+  const rate = value => number(value) === null ? '—' : amount(value);
+  const renderBucket = (name, value) => {
+    const cost = number(value.cost) === null ? '—' : `$${value.cost.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+    return `${name} ${glyph.dot} ${count(value.calls)} calls ${glyph.dot} ${count(value.errors)} errors ${glyph.dot} ${cost}\n`
+      + table(['category', 'tokens', 'tokens/day'], USAGE_CATEGORIES
+        .filter(([key]) => Object.hasOwn(value.tokens, key))
+        .map(([key, label]) => [label, count(value.tokens[key]), rate(value.ratesPerDay[key])]), new Set([1, 2]));
+  };
+  return WINDOWS.map(key => {
     const window = payload.windows[key];
-    const { tokens } = window;
-    // null counters mean the gateway's recorder checkpoint is unreadable, not
-    // an idle account; null detail means no folded call measured it (write
-    // TTLs are Anthropic-only, reasoning counts Codex-only).
-    const count = value => (number(value) === null ? '—' : integer(value));
-    const prompt = [tokens.input, tokens.cacheRead, tokens.cacheWrite].some(value => number(value) === null)
-      ? null : tokens.input + tokens.cacheRead + tokens.cacheWrite;
-    const ttl = record(tokens.cacheWriteTtl) ? tokens.cacheWriteTtl : null;
-    return [key, ...types.map(type => bars(window.bars[type.id])), count(window.calls),
-      count(prompt), count(tokens.input), count(tokens.cacheRead), count(tokens.cacheWrite),
-      ttl === null ? '—' : `${count(ttl.ephemeral5m)}/${count(ttl.ephemeral1h)}`,
-      count(tokens.output), count(tokens.reasoningTokens),
-      number(window.cost) === null ? '—' : `$${window.cost.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`];
-  });
-  const head = ['window', ...types.map(type => `${type.label} bars`), 'calls',
-    'prompt', 'uncached', 'cache read', 'cache write', '5m/1h', 'output', 'reasoning', 'cost'];
-  return table(head, rows, new Set(head.map((_, index) => index).slice(1)));
+    const coverage = payload.coverage?.windows?.[key];
+    const status = coverage?.status === 'unavailable' ? 'unavailable'
+      : coverage?.status === 'partial' ? 'partial history' : '';
+    return [key + (status ? ` ${glyph.dot} ${status}` : ''), renderBucket('all providers', window),
+      ...Object.entries(window.providers).sort(([left], [right]) => left.localeCompare(right))
+        .map(([provider, value]) => renderBucket(provider, value))].join('\n\n');
+  }).join('\n\n');
 }
 export function renderCapacity(payload, nowMs = Date.now()) {
   if (!record(payload) || !Array.isArray(payload.providers)) throw new CliError('the capacity payload is not in the expected shape');
@@ -846,10 +1084,11 @@ function keyRefusal(endpoint, source, status) {
   return lines.join('\n');
 }
 function validateMe(value) {
-  if (!record(value) || typeof value.name !== 'string' || value.name === '' || !ROLES.has(value.role) || (value.email !== null && typeof value.email !== 'string')) {
+  if (!record(value) || typeof value.name !== 'string' || value.name === '' || !ROLES.has(value.role)
+    || (value.email !== null && typeof value.email !== 'string')) {
     throw new CliError('the gateway answered /admin/api/cli/me with an unexpected shape');
   }
-  return { name: value.name, role: value.role, email: value.email };
+  return { name: value.name, role: value.role, email: value.email, identityClass: identityClassOf(value.identityClass) };
 }
 async function reachable(endpoint) {
   try {
@@ -860,82 +1099,86 @@ async function reachable(endpoint) {
     return error.message;
   }
 }
-export async function login(flags) {
-  let endpoint;
-  if (flags.url !== undefined) {
-    const result = normalizeEndpoint(flags.url);
-    if (result.error !== undefined) throw usage(result.error);
-    endpoint = result.value;
-    const problem = await reachable(endpoint);
-    if (problem !== null) throw new CliError(problem);
-    done('Gateway', endpoint);
-  } else {
-    if (!interactive()) throw usage('pass --url when no terminal is available');
-    for (;;) {
-      endpoint = await ask('Gateway host or URL', normalizeEndpoint, 'Gateway');
-      const problem = await reachable(endpoint);
-      if (problem === null) break;
-      term(`${tint('33', '!')} ${problem}\n`);
-    }
-  }
+export async function login(flags, view = null) {
+  const store = loadStore();
+  const environment = environmentId(flags.environment ?? store.environment);
+  const endpoint = environmentEndpoint(flags.url ?? store.sessions[environment]?.endpoint ?? ENVIRONMENTS[environment].endpoint, environment);
   let token = process.env.AGENT_AUTH_TOKEN ?? '';
-  let source = token === '' ? 'entered' : 'env';
+  if (token !== '' && interactive() && Object.entries(store.sessions).some(([other, session]) => other !== environment && session.token === token)) token = '';
+  const source = token === '' ? 'entered' : 'env';
   if (token === '') {
-    if (!interactive()) throw usage('set AGENT_AUTH_TOKEN or run from a terminal to enter the key');
-    token = await secret('Gateway key', 'Key');
+    if (!interactive()) throw usage(`${environmentLabel(environment)} login needs AGENT_AUTH_TOKEN or a terminal to enter its key`);
+    done('Environment', environmentLabel(environment));
+    done('Gateway', endpoint);
+    token = await secret(`${environmentLabel(environment)} key`, 'Key');
   }
   let identity;
   for (let attempts = 0; ; attempts++) {
     let refusal = null;
     if (!acceptKey(token)) refusal = keyRefusal(endpoint, source, null);
     else {
-      try { identity = validateMe(await request(endpoint, token, 'GET', '/admin/api/cli/me')); break; } catch (error) {
+      checkSessionIsolation(store, environment, endpoint, token);
+      const check = async () => {
+        const problem = await reachable(endpoint);
+        if (problem !== null) throw new CliError(problem);
+        done('Gateway', endpoint);
+        return validateMe(await request(endpoint, token, 'GET', '/admin/api/cli/me'));
+      };
+      try { identity = await (view === null ? check() : runProgress(view, 'Checking gateway and key', check)); break; } catch (error) {
         if (!(error instanceof HttpError) || ![401, 403].includes(error.status)) throw error;
         refusal = keyRefusal(endpoint, source, error.status);
       }
     }
     if (!interactive() || source === 'env' || attempts >= 2) throw new CliError(refusal);
-    term(`${tint('33', '!')} ${refusal}\n`);
-    if (await selectScreen({ title: 'Key refused', options: [{ value: 'retry', label: 'Paste a different key' }, backOption] }) !== 'retry') {
+    if (await selectScreen({ title: 'Key refused', body: refusal, options: [{ value: 'retry', label: 'Paste a different key' }, backOption] }) !== 'retry') {
       throw new CliError('Left the login alone; nothing was stored.');
     }
-    token = await secret('Gateway key', 'Key');
+    token = await secret(`${environmentLabel(environment)} key`, 'Key');
   }
-  const session = { endpoint, token, ...identity };
+  const session = { environment, endpoint, token, ...identity };
   saveSession(session);
-  done('Logged in', `${session.name} ${glyph.dot} ${session.role} ${glyph.dot} ${endpoint}`);
+  if (view === null) done('Logged in', sessionIdentity(session));
+  else view.body = `Logged in ${glyph.dot} ${sessionIdentity(session)}\nKey stored`;
   return session;
 }
-function logout() {
-  clearSession();
-  done('Logged out', sessionFile());
+function logout(flags) {
+  const environment = clearSession(flags.environment);
+  done('Logged out', environmentLabel(environment));
 }
-function status(session, flags) {
+async function status(session, flags) {
   header(session);
   out('');
-  out(renderStatus(statusRows(session, flags.profile)));
+  out(renderStatus(await statusRows(session, flags.profile)));
 }
 async function model(session, client, requested, flags) {
   checkProfile(client, flags.profile);
-  const models = servedModels(await api(session, 'GET', '/v1/models'), client);
-  let current = null;
-  try { current = currentModelId(readState(resolveScope(client, flags.profile).stateFile, client.id)); } catch { current = null; }
-  if (requested !== undefined) {
-    if (!models.some(entry => entry.id === requested)) throw new CliError(`model ${requested} is not served for ${client.label}; served models: ${models.map(entry => entry.id).join(', ')}`);
-    return configure(session, client, { ...flags, model: requested });
-  }
-  if (!interactive()) { out(renderModels(models, current)); return true; }
-  const choice = await selectScreen({
-    title: `${client.label} ${glyph.step} Model`,
-    selected: Math.max(0, models.findIndex(entry => entry.id === current)),
-    options: [...modelOptions(models, current), backOption],
-  });
-  if (choice === BACK) return false;
-  return configure(session, client, { ...flags, model: choice });
+  return runAction(`${client.label} Model`, async view => {
+    if (view !== null) view.identity = sessionIdentity(session);
+    const load = async () => {
+      const models = servedModels(await api(session, 'GET', '/v1/models'), client);
+      let current = null;
+      try { current = currentModelId(readState((await resolveScope(client, flags.profile)).stateFile, client.id)); } catch { current = null; }
+      return { models, current };
+    };
+    const { models, current } = await (view === null ? load() : runProgress(view, 'Loading models', load));
+    if (requested !== undefined) {
+      if (!models.some(entry => entry.id === requested)) throw new CliError(`model ${requested} is not served for ${client.label}; served models: ${models.map(entry => entry.id).join(', ')}`);
+      return configure(session, client, { ...flags, model: requested }, view);
+    }
+    if (view === null) { out(renderModels(models, current)); return true; }
+    const choice = await selectScreen({
+      ...view,
+      selected: Math.max(0, models.findIndex(entry => entry.id === current)),
+      options: [...modelOptions(models, current), backOption],
+    });
+    if (choice === BACK) return false;
+    return configure(session, client, { ...flags, model: choice }, view);
+  }, true);
 }
-async function showUsage(session) {
+async function showUsage(session, flags) {
   const payload = await api(session, 'GET', '/admin/api/cli/usage');
-  out(paint('1', `usage ${glyph.dot} ${session.name}`));
+  if (flags.json) { out(JSON.stringify(payload, null, 2)); return; }
+  out(paint('1', `usage ${glyph.dot} ${environmentLabel(session.environment)} ${glyph.dot} ${session.name}`));
   out('');
   out(renderUsage(payload));
 }
@@ -1044,7 +1287,7 @@ async function anthropicCallback(session, link, onLink, onError) {
 // (copied with one click), and the state poll every LINK_POLL_MS. Every
 // /api/* request carries the per-process nonce in X-S99-Local.
 function launcherPage(session, nonce, preset) {
-  return `<!doctype html>
+  return redact(`<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>genesis</title>
@@ -1074,8 +1317,8 @@ function launcherPage(session, nonce, preset) {
 const localNonce = ${inline(nonce)};
 const labels = ${inline(PROVIDER_LABELS)};
 let preset = ${inline(preset)};
-document.title = 'genesis · ' + ${inline(hostOf(session.endpoint))};
-document.querySelector('#session').textContent = ${inline(`${session.endpoint} · ${session.name} · ${session.role}`)};
+document.title = ${inline(`genesis · ${environmentLabel(session.environment)} · ${hostOf(session.endpoint)}`)};
+document.querySelector('#session').textContent = ${inline(sessionIdentity(session))};
 const $ = selector => document.querySelector(selector);
 const esc = value => String(value ?? '').replace(/[&<>"]/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[char]));
 async function api(path, body) {
@@ -1186,7 +1429,7 @@ $('#cancel').onclick = () => {
   api('/api/link/cancel', {}).then(result => { link = result.link; paintDestination(); }).catch(paintError);
 };
 refresh();
-</script>`;
+</script>`);
 }
 async function addConnection(session, flags, view = null) {
   let port = 0;
@@ -1194,7 +1437,9 @@ async function addConnection(session, flags, view = null) {
     port = /^[0-9]{1,5}$/.test(flags.port) ? Number(flags.port) : 0;
     if (port < 1 || port > 65_535) throw usage('--port takes a number from 1 to 65535; the page is only ever served on 127.0.0.1');
   }
-  const topology = await api(session, 'GET', '/admin/api/cli/workers');
+  if (view === null && interactive()) note('Loading connection workers');
+  const workersRequest = () => api(session, 'GET', '/admin/api/cli/workers');
+  const topology = await (view === null ? workersRequest() : runProgress(view, 'Loading connection workers', workersRequest));
   const placement = record(topology) && Array.isArray(topology.placement) ? topology.placement.filter(record) : [];
   if (placement.length === 0) throw new CliError('worker topology is unavailable; try again shortly');
   // --provider and --worker only preselect on the page; each must name what the topology offers.
@@ -1247,6 +1492,7 @@ async function addConnection(session, flags, view = null) {
   const cancel = async () => {
     if (!busy()) return link;
     cancelling ??= (async () => {
+      report(`Cancelling ${glyph.dot} ${PROVIDER_LABELS[link.provider] ?? link.provider}`);
       try { settle(validateLink(await api(session, 'POST', '/admin/api/cli/link/cancel', linkBody(link)))); }
       catch (error) { cancellationError = error.message; report(error.message, true); settle({ ...link, status: 'cancelled', error: error.message }); }
       finally { cancelling = null; }
@@ -1275,6 +1521,7 @@ async function addConnection(session, flags, view = null) {
     if (starting !== null || busy()) throw new CliError('a connection is already being added');
     cancellationError = null;
     starting = (async () => {
+      report(`Starting ${glyph.dot} ${PROVIDER_LABELS[provider] ?? provider}${workerId ? ` on ${workerId}` : ''}`);
       const started = await api(session, 'POST', '/admin/api/cli/link/start', { provider, workerId }, 60_000);
       if (record(started) && record(started.provisioning) && started.workerId === null) {
         report(`${started.provisioning.state} ${glyph.dot} ${started.provisioning.workerId ?? 'worker'}`);
@@ -1284,7 +1531,9 @@ async function addConnection(session, flags, view = null) {
       await bindCallback();
       return { link };
     })();
-    try { return await starting; } finally { starting = null; }
+    try { return await starting; }
+    catch (error) { report(`Connection failed: ${error.message}`, true); throw error; }
+    finally { starting = null; }
   };
   const server = http.createServer();
   try { await listen(server, '127.0.0.1', port); } catch (error) {
@@ -1358,7 +1607,7 @@ async function addConnection(session, flags, view = null) {
   process.on('SIGINT', interrupt);
   process.on('SIGTERM', interrupt);
   try {
-    if (view === null) { out(localUrl); await finished; }
+    if (view === null) { header(session); out(localUrl); await finished; }
     else {
       view.body = localUrl;
       view.options = [backOption];
@@ -1388,95 +1637,120 @@ async function addConnection(session, flags, view = null) {
 async function rotateToken(session, flags, commit = () => {}) {
   if (!flags.yes) {
     if (!interactive()) throw usage('token rotate needs --yes without a terminal');
-    if (!(await confirm(`Rotate the key for ${session.name}? The current key stops working everywhere`))) { out('Left the key alone.'); return; }
+    if (!(await confirm(`Rotate the ${environmentLabel(session.environment)} key for ${session.name}? The current key stops working everywhere`))) { out('Left the key alone.'); return; }
   }
-  const rows = statusRows(session);
-  const scopes = rows.filter(row => row.state !== null && row.state.gateway === session.endpoint);
-  const minted = await api(session, 'POST', '/admin/api/cli/token/rotate', {});
-  if (!record(minted) || !acceptKey(minted.token) || typeof minted.name !== 'string') {
-    throw new CliError('the gateway answered token/rotate with an unexpected shape');
-  }
-  const next = { ...session, token: minted.token, name: minted.name };
-  saveSession(next);
-  commit(next);
-  done('Rotated', `${next.name}; the previous key is revoked`);
-  const stage = async (row, action, args, withToken) => {
-    try { await runSetup(next, row.client, action, args, withToken); return true; } catch (error) {
-      if (error instanceof Interrupt) throw error;
-      if (error.message) warn(error.message);
-      return false;
+  return runAction('Rotate key', async () => {
+    const rows = await statusRows(session);
+    const scopes = rows.filter(row => row.state !== null && row.state.gateway === session.endpoint);
+    const minted = await api(session, 'POST', '/admin/api/cli/token/rotate', {});
+    if (!record(minted) || !acceptKey(minted.token) || typeof minted.name !== 'string') {
+      throw new CliError('the gateway answered token/rotate with an unexpected shape');
     }
-  };
-  const restaged = [];
-  const stale = [];
-  const enabled = [];
-  for (const row of scopes) {
-    note(`re-staging ${row.label}`);
-    const profile = profileArgs(row.profile || undefined);
-    const model = row.state.model ? ['--model', rawModelId(row.state.model)] : [];
-    if (!(await stage(row, 'configure', ['--new-key', '--overwrite', ...model, ...profile], true))) { stale.push(row); continue; }
-    if (row.state.mode === 'disabled' && !(await stage(row, 'disable', profile, false))) { enabled.push(row); continue; }
-    restaged.push(row.state.mode === 'disabled' ? `${row.label} ${glyph.dot} disabled` : row.label);
-  }
-  done('Restaged', restaged.join(', ') || 'none');
-  const command = (row, action) => `genesis ${action} ${row.client.id}${row.profile ? ` --profile ${row.profile}` : ''}`;
-  for (const row of stale) warn(`${row.label} still holds the old key — run ${command(row, 'configure')}`);
-  for (const row of enabled) warn(`${row.label} holds the new key but is enabled — run ${command(row, 'disable')}`);
-  const unchecked = rows.filter(row => row.problem !== null);
-  for (const row of unchecked) warn(`${row.label} was not checked: ${row.problem}`);
-  note('OMP profiles other than default are not enumerated; run genesis configure omp --profile <name> for each');
-  const problems = stale.length + enabled.length + unchecked.length;
-  if (problems > 0) throw new CliError(`the new key is stored; ${problems} scope${problems === 1 ? '' : 's'} above need${problems === 1 ? 's' : ''} attention`);
+    const next = { ...session, token: minted.token, name: minted.name };
+    saveSession(next);
+    commit(next);
+    done('Rotated', `${environmentLabel(next.environment)} ${glyph.dot} ${next.name}; the previous key is revoked`);
+    const stage = async (row, action, args, withToken) => {
+      try { await runSetup(next, row.client, action, args, withToken); return true; } catch (error) {
+        if (error instanceof Interrupt) throw error;
+        if (error.message) warn(error.message);
+        return false;
+      }
+    };
+    const restaged = [];
+    const stale = [];
+    const enabled = [];
+    let interrupted = false;
+    for (let index = 0; index < scopes.length; index++) {
+      const row = scopes[index];
+      let configured = false;
+      try {
+        note(`re-staging ${row.label}`);
+        const profile = profileArgs(row.profile || undefined);
+        const model = row.state.model ? ['--model', rawModelId(row.state.model)] : [];
+        if (!(await stage(row, 'configure', ['--new-key', '--overwrite', ...model, ...profile], true))) { stale.push(row); continue; }
+        configured = true;
+        if (row.state.mode === 'disabled' && !(await stage(row, 'disable', profile, false))) { enabled.push(row); continue; }
+        restaged.push(row.state.mode === 'disabled' ? `${row.label} ${glyph.dot} disabled` : row.label);
+      } catch (error) {
+        if (!(error instanceof Interrupt)) throw error;
+        (configured ? enabled : stale).push(row);
+        for (let remaining = index + 1; remaining < scopes.length; remaining++) stale.push(scopes[remaining]);
+        interrupted = true;
+        break;
+      }
+    }
+    done('Restaged', restaged.join(', ') || 'none');
+    const command = (row, action) => `genesis ${action} ${row.client.id}${row.profile ? ` --profile ${row.profile}` : ''} --environment ${session.environment}`;
+    for (const row of stale) warn(`${row.label} still holds the old key — run ${command(row, 'configure')}`);
+    for (const row of enabled) warn(`${row.label} holds the new key but is enabled — run ${command(row, 'disable')}`);
+    const unchecked = rows.filter(row => row.problem !== null);
+    for (const row of unchecked) warn(`${row.label} was not checked: ${row.problem}`);
+    note(`OMP profiles other than default are not enumerated; run genesis configure omp --profile <name> --environment ${session.environment} for each`);
+    if (interrupted) throw new Interrupt();
+    const problems = stale.length + enabled.length + unchecked.length;
+    if (problems > 0) throw new CliError(`the new key is stored; ${problems} scope${problems === 1 ? '' : 's'} above need${problems === 1 ? 's' : ''} attention`);
+  });
 }
 
 // ── update ──────────────────────────────────────────────────────────────────
-// The only code source is the publisher URL the install recorded in
-// release.json; a gateway endpoint never supplies code. Redirects are followed
-// by hand, at most five, and every hop must be a trusted location before it
-// is requested. The script runs with the same stdin it would get from
-// curl | bash, its output relayed through the redactor, and does not relaunch
-// the dashboard.
+// Official publications follow the selected environment; explicit mirrors and
+// local fixtures keep their recorded publisher. Gateway endpoints never supply
+// code. Every redirect hop is validated before it is requested, at most five.
+// The script runs with curl | bash's stdin, its output relayed through the
+// redactor, and does not relaunch the dashboard.
 const trustedUrl = url => typeof url === 'string' && (url.startsWith('https://') || /^http:\/\/(localhost|127\.0\.0\.1|\[::1\])(:[0-9]+)?(\/|$)/.test(url));
+const publishedInstallUrl = /^https:\/\/raw\.githubusercontent\.com\/99point\/omp-gateway-setup(?:-staging)?\/[^/]+\/install\.sh$/;
 const REDIRECTS = new Set([301, 302, 303, 307, 308]);
 async function fetchScript(url) {
   let current = url;
   for (let hops = 0; ; hops++) {
-    let response;
-    try { response = await fetch(current, { redirect: 'manual', signal: AbortSignal.timeout(HTTP_TIMEOUT_MS) }); } catch (error) { throw new CliError(`could not download ${current}: ${reasonOf(error)}`); }
-    if (!REDIRECTS.has(response.status)) {
-      if (!response.ok) throw new CliError(`could not download ${current}: HTTP ${response.status}`);
-      const text = await response.text();
-      if (!text.startsWith('#!')) throw new CliError(`${current} did not return an installer script`);
-      return text;
-    }
-    await response.body?.cancel();
-    const location = response.headers.get('location');
-    let next = null;
-    if (location !== null) { try { next = new URL(location, current).href; } catch { /* refused below */ } }
-    if (next === null || !trustedUrl(next)) throw new CliError(`${current} redirected to ${location ?? 'nowhere'}, which is not an https location`);
-    if (hops === 5) throw new CliError(`${url} redirected more than 5 times`);
-    current = next;
+    const deadline = requestDeadline(HTTP_TIMEOUT_MS);
+    try {
+      let response;
+      try { response = await fetch(current, { redirect: 'manual', signal: deadline.signal }); } catch (error) { throw new CliError(`could not download ${current}: ${reasonOf(error)}`); }
+      if (!REDIRECTS.has(response.status)) {
+        if (!response.ok) throw new CliError(`could not download ${current}: HTTP ${response.status}`);
+        const text = await response.text();
+        if (!text.startsWith('#!')) throw new CliError(`${current} did not return an installer script`);
+        return text;
+      }
+      await response.body?.cancel();
+      const location = response.headers.get('location');
+      let next = null;
+      if (location !== null) { try { next = new URL(location, current).href; } catch { /* refused below */ } }
+      if (next === null || !trustedUrl(next)) throw new CliError(`${current} redirected to ${location ?? 'nowhere'}, which is not an https location`);
+      if (hops === 5) throw new CliError(`${url} redirected more than 5 times`);
+      current = next;
+    } finally { deadline.close(); }
   }
 }
-async function update() {
-  const release = releaseInfo();
-  if (release === null) throw new CliError(`no release.json beside ${path.join(here, 'genesis.mjs')} (a source checkout is not updated in place); rerun the published install line`);
-  if (!trustedUrl(release.installUrl)) throw new CliError(`${path.join(here, 'release.json')} records no https install URL; rerun the published install line`);
-  const script = await fetchScript(release.installUrl);
-  note(`installing from ${release.installUrl}`);
-  const child = spawn('bash', ['-s'], { env: { ...process.env, GENESIS_NO_LAUNCH: '1' }, stdio: ['pipe', 'pipe', 'pipe'] });
-  relay(child.stdout, process.stdout);
-  relay(child.stderr, process.stderr);
-  child.stdin.end(script);
-  const [code] = await once(child, 'close');
-  if (code !== 0) throw new CliError(`update exited ${code}`);
+async function update(flags) {
+  return runAction('Update', async () => {
+    const release = releaseInfo();
+    if (release === null) throw new CliError(`no release.json beside ${path.join(here, 'genesis.mjs')} (a source checkout is not updated in place); rerun the published install line`);
+    if (!trustedUrl(release.installUrl)) throw new CliError(`${path.join(here, 'release.json')} records no https install URL; rerun the published install line`);
+    const installUrl = publishedInstallUrl.test(release.installUrl)
+      ? ENVIRONMENTS[flags.environment ?? loadStore().environment].installUrl
+      : release.installUrl;
+    note(`downloading ${installUrl}`);
+    const script = await fetchScript(installUrl);
+    note(`installing from ${installUrl}`);
+    const child = spawnWork('bash', ['-s'], { env: { ...process.env, GENESIS_NO_LAUNCH: '1' }, stdio: ['pipe', 'pipe', 'pipe'] });
+    relay(child.stdout, process.stdout);
+    relay(child.stderr, process.stderr);
+    child.stdin.end(script);
+    const [code] = await once(child, 'close');
+    if (code !== 0) throw new CliError(`update exited ${code}`);
+    done('Updated', 'Genesis; the next launch uses the installed release');
+  });
 }
 
 // ── dashboard ───────────────────────────────────────────────────────────────
-async function refreshIdentity(session) {
+async function refreshIdentity(session, view) {
   try {
-    const identity = validateMe(await api(session, 'GET', '/admin/api/cli/me'));
-    if (identity.name !== session.name || identity.role !== session.role || identity.email !== session.email) {
+    const identity = validateMe(await runProgress(view, 'Checking saved login', () => api(session, 'GET', '/admin/api/cli/me')));
+    if (identity.name !== session.name || identity.role !== session.role || identity.email !== session.email || identity.identityClass !== session.identityClass) {
       const next = { ...session, ...identity };
       saveSession(next);
       return next;
@@ -1484,24 +1758,26 @@ async function refreshIdentity(session) {
     return session;
   } catch (error) {
     if (error instanceof HttpError && error.status === 401) {
-      warn(`${hostOf(session.endpoint)} no longer accepts the stored key; log in again`);
-      return login({ url: session.endpoint });
+      return null;
     }
-    warn(error.message);
+    if (error instanceof Interrupt) throw error;
+    view.notice = error.message;
     return session;
   }
 }
-async function dashboard() {
+async function dashboard(flags) {
   if (!interactive()) throw usage('no terminal; run a command instead (genesis --help)');
-  let session = loadSession();
-  session = session === null ? await login({}) : await refreshIdentity(session);
+  let environment = environmentId(flags.environment ?? loadStore().environment);
+  let session = loadSession(environment);
   const stack = [{ route: 'dashboard', title: 'genesis', selected: 0 }];
   const pendingClosures = new Set();
   const navigation = new AbortController();
   let activeView = null;
+  let interruptedView = null;
   const interrupt = () => {
     if (navigation.signal.aborted) { closeTerminal(); process.exit(130); }
     navigation.abort();
+    activeWork?.abort();
   };
   process.on('SIGINT', interrupt);
   process.on('SIGTERM', interrupt);
@@ -1519,10 +1795,34 @@ async function dashboard() {
   ];
   if (ansi()) { terminal.alternateScreen = true; term('\x1b[?1049h'); }
   try {
+    if (session !== null) {
+      const initial = stack[0];
+      const endpoint = session.endpoint;
+      session = await refreshIdentity(session, initial);
+      if (session === null) push('login', 'Log in', {
+        endpoint, status: `Failed ${glyph.dot} Check saved login`, failed: true,
+        notice: `${hostOf(endpoint)} no longer accepts the stored key; log in again`,
+      });
+      else if (initial.notice) {
+        push('result', 'Connection error');
+        showResult(stack.at(-1), `Failed ${glyph.dot} Check saved login`, initial.notice, true);
+        delete initial.notice;
+      }
+    }
     while (stack.length > 0) {
       const view = stack.at(-1);
+      view.identity = session === null
+        ? `${environmentLabel(environment)} ${glyph.dot} ${view.endpoint ?? ENVIRONMENTS[environment].endpoint} ${glyph.dot} not logged in`
+        : sessionIdentity(session);
       if (navigation.signal.aborted) throw new Interrupt();
       try {
+        if (view.route === 'login') {
+          renderScreen({ ...view, body: '', options: [] });
+          session = await login({ environment }, view);
+          delete view.notice;
+          showResult(view, `Complete ${glyph.dot} Log in`);
+          continue;
+        }
         if (view.route === 'add') {
           const { cleanup } = await addConnection(session, {}, view);
           const parent = stack.at(-2);
@@ -1537,41 +1837,54 @@ async function dashboard() {
           continue;
         }
         if (!view.ready) {
-          if (view.route === 'dashboard') {
-            view.body = `${session.endpoint} ${glyph.dot} ${session.name} ${glyph.dot} ${session.role}\n\n${renderStatus(statusRows(session))}`;
-            view.options = [
-              { value: 'clients', label: 'Clients' }, { value: 'usage', label: 'Usage' },
-              ...(['owner', 'admin'].includes(session.role) ? [{ value: 'capacity', label: 'Capacity' }, { value: 'connections', label: 'Connections' }] : []),
-              ...(session.role === 'owner' ? [{ value: 'rotate', label: 'Rotate my key' }] : []),
-              { value: 'update', label: 'Update' }, { value: BACK, label: 'Quit' },
-            ];
-          } else if (view.route === 'clients') {
-            view.options = [...statusRows(session).map(row => ({
-              value: row, label: row.label,
-              hint: `${row.status}${row.state?.model ? ` ${glyph.dot} ${row.state.model}` : ''}`,
-            })), backOption];
-          } else if (view.route === 'actions') {
-            view.options = [...actions, backOption];
-            const row = statusRows(session, view.row.profile || undefined).find(entry => entry.client.id === view.row.client.id && entry.profile === view.row.profile);
-            if (row !== undefined) view.row = row;
-            view.body = renderStatus([view.row]);
-          } else if (view.route === 'model') {
-            const models = servedModels(await api(session, 'GET', '/v1/models'), view.row.client);
-            const current = currentModelId(readState(resolveScope(view.row.client, view.row.profile || undefined).stateFile, view.row.client.id));
-            if (view.options === undefined) view.selected = Math.max(0, models.findIndex(entry => entry.id === current));
-            view.options = [...modelOptions(models, current), backOption];
-          } else if (view.route === 'usage') {
-            view.body = renderUsage(await api(session, 'GET', '/admin/api/cli/usage'));
-            view.options = [backOption];
-          } else if (view.route === 'capacity') {
-            view.body = renderCapacity(await api(session, 'GET', '/admin/api/cli/capacity'));
-            view.options = [backOption];
-          } else if (view.route === 'connections') {
-            view.body = renderConnections(await api(session, 'GET', '/admin/api/cli/connections'));
-            view.options = [...(session.role === 'owner' ? [{ value: 'add', label: 'Add connection' }] : []), backOption];
-          } else if (view.route === 'confirm') {
-            view.options = [{ value: 'apply', label: view.actionLabel }, backOption];
-          }
+          const prepare = async () => {
+            if (view.route === 'dashboard') {
+              view.body = session === null ? '' : renderStatus(await statusRows(session));
+              view.options = [
+                { value: 'environment', label: 'Environment', hint: environmentLabel(environment) },
+                ...(session === null ? [{ value: 'login', label: 'Log in' }] : [
+                  { value: 'clients', label: 'Clients' }, { value: 'usage', label: 'Usage' },
+                  ...(['owner', 'admin'].includes(session.role) ? [{ value: 'capacity', label: 'Capacity' }, { value: 'connections', label: 'Connections' }] : []),
+                  ...(session.role === 'owner' ? [{ value: 'rotate', label: 'Rotate my key' }] : []),
+                ]),
+                { value: 'update', label: 'Update' }, { value: BACK, label: 'Quit' },
+              ];
+            } else if (view.route === 'environment') {
+              if (view.options === undefined) view.selected = Object.keys(ENVIRONMENTS).indexOf(environment);
+              view.options = [...Object.entries(ENVIRONMENTS).map(([value, entry]) => ({
+                value, label: entry.label, hint: value === environment ? 'current' : undefined,
+              })), backOption];
+            } else if (view.route === 'clients') {
+              view.options = [...(await statusRows(session)).map(row => ({
+                value: row, label: row.label,
+                hint: `${row.status}${row.state?.model ? ` ${glyph.dot} ${row.state.model}` : ''}`,
+              })), backOption];
+            } else if (view.route === 'actions') {
+              view.options = [...actions, backOption];
+              const row = (await statusRows(session, view.row.profile || undefined)).find(entry => entry.client.id === view.row.client.id && entry.profile === view.row.profile);
+              if (row !== undefined) view.row = row;
+              view.body = renderStatus([view.row]);
+            } else if (view.route === 'model') {
+              const models = servedModels(await api(session, 'GET', '/v1/models'), view.row.client);
+              const current = currentModelId(readState((await resolveScope(view.row.client, view.row.profile || undefined)).stateFile, view.row.client.id));
+              if (view.options === undefined) view.selected = Math.max(0, models.findIndex(entry => entry.id === current));
+              view.options = [...modelOptions(models, current), backOption];
+            } else if (view.route === 'usage') {
+              view.body = renderUsage(await api(session, 'GET', '/admin/api/cli/usage'));
+              view.options = [backOption];
+            } else if (view.route === 'capacity') {
+              view.body = renderCapacity(await api(session, 'GET', '/admin/api/cli/capacity'));
+              view.options = [backOption];
+            } else if (view.route === 'connections') {
+              view.body = renderConnections(await api(session, 'GET', '/admin/api/cli/connections'));
+              view.options = [...(session.role === 'owner' ? [{ value: 'add', label: 'Add connection' }] : []), backOption];
+            } else if (view.route === 'confirm') {
+              view.options = [{ value: 'apply', label: view.actionLabel }, backOption];
+            }
+          };
+          if (['dashboard', 'clients', 'actions', 'model', 'usage', 'capacity', 'connections'].includes(view.route)) {
+            await runProgress(view, `Loading ${view.title.split(` ${glyph.step} `).at(-1)}`, prepare);
+          } else await prepare();
           view.ready = true;
         }
         activeView = view;
@@ -1583,6 +1896,14 @@ async function dashboard() {
           const label = view.options.find(option => option.value === choice).label;
           if (choice === 'rotate' || choice === 'update') push('confirm', label, { action: choice, actionLabel: label, selected: 1 });
           else push(choice, label);
+        } else if (view.route === 'environment') {
+          const next = loadSession(choice);
+          selectEnvironment(choice);
+          environment = choice;
+          session = next;
+          view.identity = session === null ? `${environmentLabel(environment)} ${glyph.dot} not logged in` : sessionIdentity(session);
+          showResult(view, `Complete ${glyph.dot} Environment selected`,
+            `${environmentLabel(environment)}\nGateway ${session?.endpoint ?? ENVIRONMENTS[environment].endpoint}\n${session === null ? 'Not logged in' : `Logged in as ${session.name}`}\nClient configurations unchanged`);
         } else if (view.route === 'clients') {
           push('actions', choice.label, { row: choice });
         } else if (view.route === 'actions') {
@@ -1594,34 +1915,27 @@ async function dashboard() {
         } else if (view.route === 'connections') {
           push('add', 'Add connection');
         } else if (view.route === 'confirm') {
-          const output = [];
-          screenOutput = output;
-          renderScreen({ title: view.title, body: '', options: [] });
-          try {
+          view.body = '';
+          await runProgress(view, `${view.actionLabel}${view.row ? ` ${view.row.label}` : ''}`, async () => {
             if (view.action === 'rotate') await Promise.all(pendingClosures);
             const flags = { profile: view.row?.profile || undefined, model: view.model, overwrite: true };
             if (view.action === 'configure') await configure(session, view.row.client, flags);
             else if (['enable', 'disable', 'unset'].includes(view.action)) await switchScope(session, view.row.client, view.action, flags);
             else if (view.action === 'rotate') await rotateToken(session, { yes: true }, next => { session = next; });
-            else if (view.action === 'update') await update();
-          } catch (error) {
-            if (error instanceof Interrupt || !(error instanceof CliError)) throw error;
-            if (error.message !== '') warn(error.message);
-          } finally {
-            screenOutput = null;
-            view.body = output.join('').trim();
-            view.options = [backOption];
-            view.selected = 0;
-            view.route = 'result';
-          }
+            else if (view.action === 'update') await update({ environment });
+          });
+          showResult(view, `Complete ${glyph.dot} ${view.actionLabel}`);
         }
       } catch (error) {
-        if (error instanceof Interrupt || !(error instanceof CliError)) throw error;
-        view.route = 'result';
-        view.body = error.message;
-        view.options = [backOption];
-        view.selected = 0;
-        view.ready = true;
+        if (error instanceof Interrupt) {
+          if (view.body) {
+            showResult(view, `Interrupted ${glyph.dot} ${view.actionLabel ?? view.title.split(` ${glyph.step} `).at(-1)}`);
+            interruptedView = view;
+          }
+          throw error;
+        }
+        showResult(view, `Failed ${glyph.dot} ${view.actionLabel ?? view.title.split(` ${glyph.step} `).at(-1)}`,
+          [view.body, error.message || String(error)].filter(Boolean).join('\n\n'), true);
       }
     }
   } finally {
@@ -1630,6 +1944,7 @@ async function dashboard() {
     process.off('SIGINT', interrupt);
     process.off('SIGTERM', interrupt);
     closeTerminal();
+    if (interruptedView !== null) { out(interruptedView.status); out(interruptedView.body); }
   }
 }
 
@@ -1637,23 +1952,25 @@ async function dashboard() {
 const HELP = `Usage: genesis [command] [options]
 
   genesis                                   dashboard
+  environment [main | staging]
   login [--url URL]                         sign in (AGENT_AUTH_TOKEN or a hidden prompt)
   logout
   status [--profile P]
   configure <client> [--model ID] [--profile P] [--overwrite]
   enable | disable | unset <client> [--profile P]
   model <client> [ID] [--profile P]         list or pick the client's default model
-  usage                                     your recorded usage
+  usage [--json]                            your recorded usage
   capacity                                  owner/admin
   connections [list | add]                  owner/admin; add: owner, serves a local page [--provider P] [--worker ID] [--port N]
   token rotate [--yes]                      owner
   update | --update
   --version | --help
 
+Environment override: --environment main | staging (does not change the saved selection)
 Clients: ${CLIENTS.map(client => client.id).join(', ')}
 Exit codes: 0 ok, 1 failure, 2 usage`;
-const VALUE_FLAGS = new Set(['url', 'model', 'profile', 'provider', 'worker', 'port']);
-const SWITCH_FLAGS = new Set(['overwrite', 'yes', 'version', 'help', 'update']);
+const VALUE_FLAGS = new Set(['environment', 'url', 'model', 'profile', 'provider', 'worker', 'port']);
+const SWITCH_FLAGS = new Set(['overwrite', 'yes', 'version', 'help', 'update', 'json']);
 export function parseArgs(argv) {
   const positionals = [];
   const flags = {};
@@ -1676,31 +1993,49 @@ async function main(argv) {
   primeSecrets();
   const { positionals, flags } = parseArgs(argv);
   const [command, ...rest] = positionals;
+  if (flags.environment !== undefined) environmentId(flags.environment);
   if (flags.help || command === 'help') { out(HELP); return; }
   if (flags.version) { out(`genesis ${releaseInfo()?.commit ?? 'source'}`); return; }
-  if (flags.update || command === 'update') { await update(); return; }
+  if (flags.url !== undefined && command !== 'login') throw usage('--url is only accepted by login; it never retargets a stored key');
+  if (flags.json && command !== 'usage') throw usage('--json is only accepted by usage');
+  if (flags.update || command === 'update') { await update(flags); return; }
   const expect = count => { if (rest.length !== count) throw usage(`${command} takes ${count === 0 ? 'no arguments' : `${count} argument${count === 1 ? '' : 's'}`}; see genesis --help`); };
   switch (command) {
-    case undefined: await dashboard(); return;
-    case 'login': expect(0); await login(flags); return;
-    case 'logout': expect(0); logout(); return;
-    case 'status': expect(0); status(requireSession(), flags); return;
-    case 'configure': expect(1); await configure(requireSession(), clientById(rest[0]), flags); return;
-    case 'enable': case 'disable': case 'unset': expect(1); await switchScope(requireSession(), clientById(rest[0]), command, flags); return;
+    case undefined: await dashboard(flags); return;
+    case 'environment': {
+      const apply = () => {
+        if (rest.length > 1) throw usage('environment takes main or staging');
+        if (rest.length === 1) {
+          if (flags.environment !== undefined) throw usage('use environment main|staging without --environment to save the selection');
+          selectEnvironment(rest[0]);
+        }
+        const store = loadStore();
+        const environment = flags.environment ?? store.environment;
+        out(`${environmentLabel(environment)} ${glyph.dot} ${store.sessions[environment]?.endpoint ?? ENVIRONMENTS[environment].endpoint}`);
+      };
+      if (rest.length === 0) apply();
+      else await runAction('Environment', apply);
+      return;
+    }
+    case 'login': expect(0); await runAction('Log in', view => login(flags, view), true); return;
+    case 'logout': expect(0); await runAction('Log out', () => logout(flags)); return;
+    case 'status': expect(0); await status(requireSession(flags), flags); return;
+    case 'configure': expect(1); await configure(requireSession(flags), clientById(rest[0]), flags); return;
+    case 'enable': case 'disable': case 'unset': expect(1); await switchScope(requireSession(flags), clientById(rest[0]), command, flags); return;
     case 'model':
       if (rest.length < 1 || rest.length > 2) throw usage('model takes a client and an optional model id; see genesis --help');
-      await model(requireSession(), clientById(rest[0]), rest[1], flags);
+      await model(requireSession(flags), clientById(rest[0]), rest[1], flags);
       return;
-    case 'usage': expect(0); await showUsage(requireSession()); return;
-    case 'capacity': expect(0); await showCapacity(requireSession()); return;
+    case 'usage': expect(0); await showUsage(requireSession(flags), flags); return;
+    case 'capacity': expect(0); await showCapacity(requireSession(flags)); return;
     case 'connections':
-      if (rest.length === 0 || rest[0] === 'list') await showConnections(requireSession());
-      else if (rest[0] === 'add' && rest.length === 1) await addConnection(requireSession(), flags);
+      if (rest.length === 0 || (rest.length === 1 && rest[0] === 'list')) await showConnections(requireSession(flags));
+      else if (rest[0] === 'add' && rest.length === 1) await addConnection(requireSession(flags), flags);
       else throw usage('connections takes list or add; see genesis --help');
       return;
     case 'token':
       if (rest.length !== 1 || rest[0] !== 'rotate') throw usage('token takes rotate; see genesis --help');
-      await rotateToken(requireSession(), flags);
+      await rotateToken(requireSession(flags), flags);
       return;
     default: throw usage(`unknown command ${command}; see genesis --help`);
   }

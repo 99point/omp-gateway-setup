@@ -1,0 +1,12 @@
+{
+  "repository": "99point/system-99",
+  "sourceCommit": "c8eeb516c8bd0bf8297b411ef1dff8f49bf96121",
+  "channel": "main",
+  "publicationMethod": "owner-authorized-installer-alignment",
+  "stagingReleaseCommit": "7ba3e86f7f912b1b4662c0bd426e25ca4ba5c01e",
+  "stagingPublicationRunId": "34800333504",
+  "scope": "genesis-cli-and-installer-only",
+  "setupUnchanged": true,
+  "genesisSha256": "e3d1b7d267bd9634b66320ed09af4b1ef4508f69c81c3223a0c395944e25b043",
+  "setupSha256": "d764ae1f997956252d07ee0431a967e3b2025eee8785a1eef9b6bd8501e10798"
+}
