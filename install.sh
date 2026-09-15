@@ -7,12 +7,12 @@
 set +x
 set -euo pipefail
 
-RELEASE_COMMIT='5967b2810931dda96cb8710a1d4035852c7ec9bd'
-GENESIS_SHA256='f4d9d9b1cbc4bfbf34b35620fae8f11c0d8c75f89ccccbd9e7021a3127e8647f'
-SETUP_SHA256='d764ae1f997956252d07ee0431a967e3b2025eee8785a1eef9b6bd8501e10798'
+RELEASE_COMMIT='99f6e1bbabc450878d841cd6ed8175c7708b7d81'
+GENESIS_SHA256='4bbfc498509347413f719e2485e435710d5c18b6931c64e8cb0941cf2e0e3491'
+SETUP_SHA256='bacfe4f6e890d6cf5a5bda80d155ca33f1cfe0f695ae991a3029fe37e109f791'
 # GENESIS_SOURCE overrides the download base for mirrors and local checks;
 # GENESIS_INSTALL_URL is the publisher `genesis update` re-fetches this script from.
-source_base="${GENESIS_SOURCE:-https://raw.githubusercontent.com/99point/omp-gateway-setup/5967b2810931dda96cb8710a1d4035852c7ec9bd}"
+source_base="${GENESIS_SOURCE:-https://raw.githubusercontent.com/99point/omp-gateway-setup/99f6e1bbabc450878d841cd6ed8175c7708b7d81}"
 install_url="${GENESIS_INSTALL_URL:-https://raw.githubusercontent.com/99point/omp-gateway-setup/main/install.sh}"
 share="${HOME}/.local/share/genesis"
 bin_dir="${HOME}/.local/bin"
