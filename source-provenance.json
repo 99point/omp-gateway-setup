@@ -1,12 +1,1 @@
-{
-  "repository": "99point/system-99",
-  "sourceCommit": "43dc063e15bfda2547579d044219fdbc35f525dd",
-  "scope": "client-only",
-  "stagingSourceCommit": "6278b2d7e0cf863a22dc68430da3b203964b7476",
-  "stagingRunId": "36794052480",
-  "stagingRunAttempt": "1",
-  "approvalSha256": "5e6befdea028e860634e5894a6f6ff70f04ec971f6992f4c10c1c0a756ae7dbf",
-  "channel": "main",
-  "publicationRunId": "36807267518",
-  "publicationRunAttempt": "1"
-}
+{"repository":"99point/system-99","sourceCommit":"88064d20894d8df26dc3ff4abbfce88a5b9305b6","channel":"main","publicationRunId":"36819324016","publicationRunAttempt":"1"}
