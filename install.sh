@@ -1,18 +1,22 @@
 #!/usr/bin/env bash
-# Installs or updates the genesis CLI. Rendered from cli/install.sh.in when the
-# installer is published: the release commit and both SHA-256 values are pinned
-# there, so this file only ever installs the exact bytes it was published with.
+# Installs or updates the genesis CLI from its one public publication, the
+# same package for the Prod and Staging gateways. Rendered from
+# cli/install.sh.in when the installer is published: the release commit and
+# both SHA-256 values are pinned there, so this file only ever installs the
+# exact bytes it was published with. Installing keeps the selected
+# environment, saved logins and client configuration; setup runs only when asked.
 # Usage: curl -fsSL https://genesis.99point.co/install | bash
 # Re-running the same line updates in place; genesis --update does the same.
 set +x
 set -euo pipefail
 
-RELEASE_COMMIT='32110760e75772a13679ac323e4dcb722421e677'
-GENESIS_SHA256='0c28c5ebe3060a4dd4ee3f019ae1b34019fb92a18e1a66ee56fce399cf697374'
+RELEASE_COMMIT='b3c98011f41b87884a8c6036b001f28d494b8d35'
+GENESIS_SHA256='e527da1cae61f17aebc4f0b60b6bbb362406d81f70d773a8d2516487e6fb26bf'
 SETUP_SHA256='e06b73d27917c3e4b7782eb23e9cf20434f5c714a4e7beec8a22bd49b659f93f'
-# GENESIS_SOURCE overrides the download base for mirrors and local checks;
-# GENESIS_INSTALL_URL is the publisher `genesis update` re-fetches this script from.
-source_base="${GENESIS_SOURCE:-https://raw.githubusercontent.com/99point/omp-gateway-setup/32110760e75772a13679ac323e4dcb722421e677}"
+# GENESIS_SOURCE and GENESIS_INSTALL_URL point a mirror or local check at other
+# artifact and installer URLs (genesis update honours GENESIS_INSTALL_URL too);
+# release.json records the installer URL used.
+source_base="${GENESIS_SOURCE:-https://raw.githubusercontent.com/99point/omp-gateway-setup/${RELEASE_COMMIT}}"
 install_url="${GENESIS_INSTALL_URL:-https://raw.githubusercontent.com/99point/omp-gateway-setup/main/install.sh}"
 share="${HOME}/.local/share/genesis"
 bin_dir="${HOME}/.local/bin"
@@ -114,9 +118,10 @@ case ":${PATH}:" in
   *) printf 'Add it to PATH: export PATH="%s:$PATH"\n' "${bin_dir/#${HOME}/\$HOME}" ;;
 esac
 
-# curl | bash leaves stdin on the pipe; the setup walkthrough (prod gateway
-# URL and key, then the installed clients) runs only when a terminal is
-# attached and the caller (genesis update) has not asked it to stay quiet.
+# curl | bash leaves stdin on the pipe; the setup walkthrough (the selected
+# environment's gateway URL and key, then the installed clients) runs only
+# when a terminal is attached, the person presses Enter, and the caller
+# (genesis update) has not asked it to stay quiet.
 # exec replaces this shell without running the EXIT trap, so cleanup goes first.
 if hold_result 'Press Enter to set up Genesis, or Ctrl-C to exit'; then
   exec 9>&-
