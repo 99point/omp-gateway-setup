@@ -558,7 +558,7 @@ init_scratch() {
   cache_home="${XDG_CACHE_HOME:-${HOME}/.cache}"
   if [[ "${cache_home}" != /* ]]; then cache_home="${HOME}/.cache"; fi
   cache_dir="${cache_home}/omp-agent-auth"
-  scratch_dir="$(mktemp -d /var/tmp/agent-auth-setup.XXXXXXXX)"
+  scratch_dir="$(mktemp -d "${TMPDIR:-/var/tmp}/agent-auth-setup.XXXXXXXX")"
   init_transaction
   require_switch_tools
 }
@@ -1822,14 +1822,15 @@ codex_stage() {
   "${node_bin}" "${scratch_dir}/native/codex.cjs" "${scratch_dir}/codex-effective.json" "${scratch_dir}/native-catalog.json" \
     "${scratch_dir}/bundled-models.json" "${scratch_dir}/codex-patch.json" "${scratch_dir}/codex-models.json" \
     "${catalog_target}" "${gateway_url}" "${cat_bin}" "${token_file}" "${requested_model}" "${config_target}" "${scratch_dir}/codex-source.json"
+  # This schema pins the fields Genesis writes, not the person's whole config.
+  # The installed Codex validates the merged config below, including newer fields.
+  native_schema "${scratch_dir}/codex-patch.json" strict
   PATCH_JSON="${scratch_dir}/codex-patch.json" "${yq_bin}" -p toml -o toml \
     '(. // {}) * load(strenv(PATCH_JSON)) | .model_providers.agent_auth = load(strenv(PATCH_JSON)).model_providers.agent_auth' \
     "${source_config}" > "${config_candidate}" 2> "${scratch_dir}/toml.stderr" || fail 'could not merge Codex gateway settings'
   "${yq_bin}" -p toml -o json '.' "${config_candidate}" > "${scratch_dir}/codex-candidate.json" 2> "${scratch_dir}/toml.stderr" || fail 'could not decode staged Codex configuration'
-  native_schema "${scratch_dir}/codex-candidate.json" strict
   CANDIDATE_JSON="${scratch_dir}/codex-candidate.json" "${yq_bin}" -p json -o json '. * load(strenv(CANDIDATE_JSON))' \
     "${scratch_dir}/codex-effective.json" > "${scratch_dir}/codex-effective-candidate.json"
-  native_schema "${scratch_dir}/codex-effective-candidate.json" strict
   # features list loads a base ConfigBuilder; it cannot select --profile. Load the
   # merged base/profile as scratch config.toml, preserving normal overlay semantics.
   mkdir -p "${validation_home}/codex"
@@ -2186,6 +2187,14 @@ const { select } = require('./catalog.cjs');
 try {
   const [configFile, catalogFile, bundledFile, patchFile, modelsFile, finalModelsFile, gateway, cat, tokenFile, requested, configTarget, sourceFile] = process.argv.slice(2);
   const current = load(configFile, true);
+  // The isolated native probe turns these off; check the values it would hide.
+  for (const [name, value] of [
+    ['check_for_update_on_startup', current.check_for_update_on_startup],
+    ['analytics.enabled', current.analytics?.enabled],
+    ['feedback.enabled', current.feedback?.enabled],
+  ]) {
+    if (value !== undefined && typeof value !== 'boolean') throw new Error(`Codex ${name} must be a boolean`);
+  }
   const normalized = JSON.parse(fs.readFileSync(catalogFile, 'utf8'));
   const catalog = normalized['openai-codex'];
   const bundled = JSON.parse(fs.readFileSync(bundledFile, 'utf8'));
