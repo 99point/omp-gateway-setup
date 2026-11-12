@@ -1797,7 +1797,7 @@ codex_prepare() {
   if [[ -n "${profile}" ]]; then setup_targets+=("${base_config}"); fi
 }
 codex_stage() {
-  local config_candidate
+  local config_candidate inherited_config=''
   stage_config "${config_target}" toml
   config_candidate="${staged_config}"
   # Confirm yq can roundtrip this TOML before allowing it to modify any fields.
@@ -1814,6 +1814,7 @@ codex_stage() {
     cp -p "${tx_originals[tx_count-1]}" "${scratch_dir}/codex-base.toml"
     "${yq_bin}" -p toml -o json '. // {}' "${scratch_dir}/codex-base.toml" > "${scratch_dir}/codex-base.json" 2> "${scratch_dir}/toml.stderr" || fail 'could not decode base Codex TOML'
     "${node_bin}" "${scratch_dir}/native/check.cjs" codex-profile "${scratch_dir}/codex-base.json"
+    inherited_config="${scratch_dir}/codex-base.json"
     SOURCE_JSON="${scratch_dir}/codex-source.json" "${yq_bin}" -p json -o json '. * load(strenv(SOURCE_JSON))' "${scratch_dir}/codex-base.json" > "${scratch_dir}/codex-effective.json"
   else
     cp "${scratch_dir}/codex-source.json" "${scratch_dir}/codex-effective.json"
@@ -1821,7 +1822,7 @@ codex_stage() {
   native_client "${validation_home}" "${scratch_dir}/bundled-models.json" "${scratch_dir}/bundled.stderr" debug models --bundled
   "${node_bin}" "${scratch_dir}/native/codex.cjs" "${scratch_dir}/codex-effective.json" "${scratch_dir}/native-catalog.json" \
     "${scratch_dir}/bundled-models.json" "${scratch_dir}/codex-patch.json" "${scratch_dir}/codex-models.json" \
-    "${catalog_target}" "${gateway_url}" "${cat_bin}" "${token_file}" "${requested_model}" "${config_target}" "${scratch_dir}/codex-source.json"
+    "${catalog_target}" "${gateway_url}" "${cat_bin}" "${token_file}" "${requested_model}" "${config_target}" "${scratch_dir}/codex-source.json" "${inherited_config}"
   # This schema pins the fields Genesis writes, not the person's whole config.
   # The installed Codex validates the merged config below, including newer fields.
   native_schema "${scratch_dir}/codex-patch.json" strict
@@ -1829,8 +1830,12 @@ codex_stage() {
     '(. // {}) * load(strenv(PATCH_JSON)) | .model_providers.agent_auth = load(strenv(PATCH_JSON)).model_providers.agent_auth' \
     "${source_config}" > "${config_candidate}" 2> "${scratch_dir}/toml.stderr" || fail 'could not merge Codex gateway settings'
   "${yq_bin}" -p toml -o json '.' "${config_candidate}" > "${scratch_dir}/codex-candidate.json" 2> "${scratch_dir}/toml.stderr" || fail 'could not decode staged Codex configuration'
-  CANDIDATE_JSON="${scratch_dir}/codex-candidate.json" "${yq_bin}" -p json -o json '. * load(strenv(CANDIDATE_JSON))' \
-    "${scratch_dir}/codex-effective.json" > "${scratch_dir}/codex-effective-candidate.json"
+  if [[ -n "${inherited_config}" ]]; then
+    CANDIDATE_JSON="${scratch_dir}/codex-candidate.json" "${yq_bin}" -p json -o json '. * load(strenv(CANDIDATE_JSON))' \
+      "${inherited_config}" > "${scratch_dir}/codex-effective-candidate.json"
+  else
+    cp "${scratch_dir}/codex-candidate.json" "${scratch_dir}/codex-effective-candidate.json"
+  fi
   # features list loads a base ConfigBuilder; it cannot select --profile. Load the
   # merged base/profile as scratch config.toml, preserving normal overlay semantics.
   mkdir -p "${validation_home}/codex"
@@ -2185,7 +2190,7 @@ const fs = require('node:fs');
 const { load, save, recordedProvider, checkOwnedProvider } = require('./config-io.cjs');
 const { select } = require('./catalog.cjs');
 try {
-  const [configFile, catalogFile, bundledFile, patchFile, modelsFile, finalModelsFile, gateway, cat, tokenFile, requested, configTarget, sourceFile] = process.argv.slice(2);
+  const [configFile, catalogFile, bundledFile, patchFile, modelsFile, finalModelsFile, gateway, cat, tokenFile, requested, configTarget, sourceFile, inheritedFile] = process.argv.slice(2);
   const current = load(configFile, true);
   // The isolated native probe turns these off; check the values it would hide.
   for (const [name, value] of [
@@ -2206,18 +2211,19 @@ try {
     request_max_retries: 0, stream_max_retries: 0,
     auth: { command: cat, args: [tokenFile], timeout_ms: 5000, refresh_interval_ms: 300000 },
   };
-  const previous = current.model_providers?.agent_auth;
+  const inherited = inheritedFile ? load(inheritedFile, true).model_providers?.agent_auth : undefined;
   checkOwnedProvider(load(sourceFile, true).model_providers?.agent_auth, baseUrl, ['base_url'],
     recordedProvider(tokenFile, 'codex', configTarget, ['model_providers', 'agent_auth']));
-  if (previous?.env_key || previous?.experimental_bearer_token || previous?.http_headers || previous?.env_http_headers) {
-    throw new Error('existing Codex gateway provider has conflicting credential/header settings');
+  // Configure replaces its provider in the selected scope. A profile cannot
+  // remove fields inherited from the base without changing that separate scope.
+  if (inherited?.env_key || inherited?.experimental_bearer_token || inherited?.http_headers || inherited?.env_http_headers) {
+    throw new Error('base Codex gateway provider has conflicting credential/header settings; configure Codex without --profile first');
   }
-  if (previous?.auth && Object.keys(previous.auth).some(key => !['command', 'args', 'timeout_ms', 'refresh_interval_ms'].includes(key))) {
-    throw new Error('existing Codex auth helper has additional settings; resolve these before installing the file-backed helper');
+  if (inherited?.auth && Object.keys(inherited.auth).some(key => !['command', 'args', 'timeout_ms', 'refresh_interval_ms'].includes(key))) {
+    throw new Error('base Codex auth helper has additional settings; configure Codex without --profile first');
   }
-  // Profiles inherit provider fields from the base even after their own entry is replaced.
-  if (previous && Object.keys(previous).some(key => !Object.hasOwn(provider, key))) {
-    throw new Error('existing Codex gateway provider has additional settings; resolve these before setup');
+  if (inherited && Object.keys(inherited).some(key => !Object.hasOwn(provider, key))) {
+    throw new Error('base Codex gateway provider has additional settings; configure Codex without --profile first');
   }
   // Keep the installed client's real instructions/tool defaults. The public
   // gateway card is not a Codex ModelInfo and contains no replacement prompt.
@@ -2272,7 +2278,12 @@ try {
       }
     }
   }
-  if (!requested && current.model && current.model !== selected.slug) console.error(`Codex: replacing unsupported model ${current.model} with ${selected.slug}.`);
+  if (!requested && current.model && current.model !== selected.slug) {
+    const reason = catalog.some(card => card.id === current.model)
+      ? `installed Codex has no native metadata for ${current.model}`
+      : `the gateway does not serve ${current.model}`;
+    console.error(`Codex: ${reason}; using ${selected.slug}.`);
+  }
   if (!gatewayDefault && !requested) {
     const reason = selected.slug === current.model ? 'keeping the existing supported selection' : `using the best installed native priority (${selected.priority})`;
     console.error(`Codex: gateway default ${catalog[0].id} has no installed native metadata; ${reason}: ${selected.slug}. A client release containing that model's native metadata is required to select it.`);
