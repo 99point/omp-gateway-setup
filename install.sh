@@ -10,9 +10,9 @@
 set +x
 set -euo pipefail
 
-RELEASE_COMMIT='b38196d018c65840a182622e2c33dd74667782fc'
-GENESIS_SHA256='e527da1cae61f17aebc4f0b60b6bbb362406d81f70d773a8d2516487e6fb26bf'
-SETUP_SHA256='3ed2eaa43ba2d2a1889387f578ef7e46fd3508584b1e8bcd3c75e902cb4777be'
+RELEASE_COMMIT='859307cf73ba324a4b77ec9b938080f20d696712'
+GENESIS_SHA256='23839b8949638b82ddca936360ecf5363b17e0d9771b3d97897b17c09c8c7ed6'
+SETUP_SHA256='4a49b7ffd5e9719a257f257fe4b44e2f9d688a962a63f38fd885d9783c6ab2af'
 # GENESIS_SOURCE and GENESIS_INSTALL_URL point a mirror or local check at other
 # artifact and installer URLs (genesis update honours GENESIS_INSTALL_URL too);
 # release.json records the installer URL used.
