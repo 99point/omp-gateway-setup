@@ -196,7 +196,8 @@ Usage: agent-auth-setup.sh [--harness NAME] [--unattended] [--url URL]
   --overwrite     Allow replacing existing selected-client config/key files
   --model ID      Make the gateway model with this raw provider id (for example
                   claude-fable-5-1) the client's default; it must be one the
-                  gateway serves for the selected client
+                  gateway serves for the selected client (Google Antigravity
+                  models are OMP-only)
   --transport     OMP protocol: auto (default) picks what the gateway and the
                   installed OMP both support; provider-wire (native-capable OMP),
                   standard (stock OMP codecs on the gateway's provider routes),
@@ -427,7 +428,7 @@ mark_applied() {
   ((tx_order_count += 1))
 }
 commit_transaction() {
-  local pass index target original backup staged
+  local pass index target original backup staged first_config_role=''
   # Precheck every snapshot before any replacement; don't overwrite concurrent edits.
   check_switch_scope
   for ((index=0; index<tx_count; index++)); do
@@ -442,12 +443,20 @@ commit_transaction() {
   # Switch state is written first and deleted last: after an abrupt stop the
   # files that did land are always described by it, so a later switch or
   # configure can finish or undo them. Tokens still precede the configs that
-  # reference them; a client's seeded state file follows the configs.
-  for pass in state token asset config seed cleanup state-delete; do
+  # reference them; a client's seeded state file follows the configs. OMP must
+  # pin its gateway endpoint before installing credentials, and remove those
+  # credentials before restoring a direct endpoint. Rollback reverses that order.
+  if [[ "${harness}" == omp ]]; then
+    if [[ "${action}" == configure || "${action}" == enable ]]; then first_config_role=settings
+    else first_config_role=models; fi
+  fi
+  for pass in state token asset config-first config seed cleanup state-delete; do
     for ((index=0; index<tx_count; index++)); do
       case "${pass}" in
         state) [[ "${tx_kinds[index]}" == state && "${tx_operations[index]}" != delete ]] || continue ;;
         state-delete) [[ "${tx_kinds[index]}" == state && "${tx_operations[index]}" == delete ]] || continue ;;
+        config-first) [[ -n "${first_config_role}" && "${tx_kinds[index]}" == config && "${tx_roles[index]}" == "${first_config_role}" ]] || continue ;;
+        config) [[ "${tx_kinds[index]}" == config && ( -z "${first_config_role}" || "${tx_roles[index]}" != "${first_config_role}" ) ]] || continue ;;
         *) [[ "${tx_kinds[index]}" == "${pass}" ]] || continue ;;
       esac
       [[ "${tx_operations[index]}" != keep ]] || continue
@@ -473,7 +482,7 @@ commit_transaction() {
         chmod 0600 "${target}"
         continue
       fi
-      if [[ -n "${original}" && "${pass}" == config && "${action}" == configure && "${tx_backup_allowed[index]}" == 1 ]]; then
+      if [[ -n "${original}" && "${tx_kinds[index]}" == config && "${action}" == configure && "${tx_backup_allowed[index]}" == 1 ]]; then
         # Create privately before copying: cp -p followed by chmod would expose
         # embedded keys at the original mode until chmod completes.
         backup="$(mktemp "${target}.pre-agent-auth.$(date -u +%Y%m%dT%H%M%SZ).XXXXXXXX")"
@@ -926,6 +935,19 @@ probe_standard_route() {
     *) fail "gateway route ${path} returned HTTP ${probe_status}; expected its 400 body validation" ;;
   esac
 }
+# Google route: an empty body is refused at intake (400, no model named) before
+# any provider is contacted; 404 = the gateway does not serve it.
+probe_google_route() {
+  local path='/google-antigravity/v1internal:streamGenerateContent' probe_status
+  probe_status="$(gateway_request "${gateway_url}${path}?alt=sse" "${scratch_dir}/probe-response" \
+    --request POST --header 'Content-Type: application/json' --data-binary "@${scratch_dir}/probe.json")" || exit 1
+  case "${probe_status}" in
+    400) probe_result=present ;;
+    404) probe_result=absent ;;
+    401|403) catalog_only_bearer "${probe_status}" "${path}" ;;
+    *) fail "gateway route ${path} returned HTTP ${probe_status}; expected its 400 body validation" ;;
+  esac
+}
 probe_pi_native_route() {
   local probe_status
   probe_status="$(gateway_request "${gateway_url}/v1/pi/stream" "${scratch_dir}/probe-response" \
@@ -946,7 +968,8 @@ validate_gateway() {
   if [[ "${harness}" != omp ]]; then
     # Catalog metadata and raw request IDs must agree before any config is staged,
     # and the key must be allowed on the model route (the gateway root is not).
-    "${node_bin}" "${scratch_dir}/native/catalog.cjs" providers "${harness}" "${catalog_file}" > "${scratch_dir}/native-providers"
+    # A Google model asked of a client without a Cloud Code Assist codec is refused here.
+    "${node_bin}" "${scratch_dir}/native/catalog.cjs" providers "${harness}" "${catalog_file}" '' "${requested_model}" > "${scratch_dir}/native-providers"
     while IFS= read -r provider; do
       if ! gateway_catalog "/${provider}/v1/models" "${scratch_dir}/${provider}-catalog.json" 1; then
         fail "${gateway_url} has no ${provider} model catalog (/${provider}/v1/models is HTTP 404); this catalog is required to validate model metadata"
@@ -957,6 +980,7 @@ validate_gateway() {
     "${node_bin}" "${scratch_dir}/native/catalog.cjs" normalize "${harness}" "${catalog_file}" "${scratch_dir}" > "${scratch_dir}/native-catalog.json"
   else
     model_ids_file="${scratch_dir}/model-ids"
+    google_ids_file="${scratch_dir}/google-model-ids"
     catalog_ids_file="${scratch_dir}/catalog-model-ids"
     if ! AGENT_AUTH_YQ_ACTION='catalog-model-ids' "${yq_bin}" eval -r \
       '.data[] | select((.id | type) == "!!str") | .id' "${catalog_file}" > "${catalog_ids_file}"; then
@@ -964,18 +988,23 @@ validate_gateway() {
     fi
     providers=(); seen_providers=' '
     : > "${model_ids_file}"
+    : > "${google_ids_file}"
     while IFS= read -r model_id; do
       [[ -n "${model_id}" && "${model_id}" == */* ]] || continue
       provider="${model_id%%/*}"
-      case "${provider}" in anthropic|openai-codex) ;; *) continue;; esac
+      # Google rides OMP's Cloud Code Assist codec whatever the protocol of the
+      # others; its models join the served list once OMP is shown to route them.
+      case "${provider}" in anthropic|openai-codex) ;; google-antigravity) printf '%s\n' "${model_id}" >> "${google_ids_file}"; continue ;; *) continue;; esac
       printf '%s\n' "${model_id}" >> "${model_ids_file}"
       if [[ "${seen_providers}" != *" ${provider} "* ]]; then providers+=("${provider}"); seen_providers+="${provider} "; fi
     done < "${catalog_ids_file}"
     (( ${#providers[@]} > 0 )) || fail 'gateway advertises no supported providers'
     # A requested default that this gateway does not serve is refused before any
     # protocol probe or client validation runs.
-    if [[ -n "${requested_model}" ]]; then omp_requested_selector >/dev/null; fi
+    if [[ -n "${requested_model}" ]]; then omp_requested_selector "${google_ids_file}" >/dev/null; fi
     omp_select_transport
+    omp_select_google
+    omp_normalize_catalog
     omp_validate_client
   fi
   rm -f "${header_file}"
@@ -1152,6 +1181,7 @@ switch_finish() {
       *) fail 'invalid local switch transaction plan' ;;
     esac
   done < "${scratch_dir}/switch-plan"
+  if [[ "${harness}" == omp ]]; then omp_check_google_project; fi
 }
 
 # --- setup/adapters/omp.sh ---
@@ -1167,23 +1197,30 @@ omp_transport_label() {
     pi-native) printf 'pi-native (legacy /v1/pi/stream)' ;;
   esac
 }
-# Runs `omp models --json` against CONFIG in a throwaway home. Sets
-# omp_models_file/omp_models_stderr; returns the client's exit status.
+# Runs `omp models --json` against CONFIG (and SETTINGS as its config.yml, when
+# given) in a throwaway home. Sets omp_models_file/omp_models_stderr; returns
+# the client's exit status.
 omp_models_json() {
-  local config="$1" validation_home validation_agent_dir
+  local config="$1" settings_file="${2:-}" validation_home validation_agent_dir
   validation_home="$(mktemp -d "${scratch_dir}/validation-home.XXXXXX")"
   validation_agent_dir="${validation_home}/.omp/agent"
   mkdir -p "${validation_agent_dir}"
   cp -p "${config}" "${validation_agent_dir}/models.yml"
   chmod 0600 "${validation_agent_dir}/models.yml"
+  if [[ -n "${settings_file}" ]]; then
+    cp "${settings_file}" "${validation_agent_dir}/config.yml"
+    chmod 0600 "${validation_agent_dir}/config.yml"
+  fi
   omp_models_file="${validation_home}/omp-models.json"
   omp_models_stderr="${validation_home}/omp-models.stderr"
+  # A pinned Antigravity client version keeps OMP's Google model discovery from
+  # fetching Google's updater manifest; it only shapes that discovery's User-Agent.
   (
     cd "${validation_home}"
     env -i \
       HOME="${validation_home}" PATH="${PATH}" TMPDIR="${scratch_dir}" \
       PI_CONFIG_DIR='.omp' PI_CODING_AGENT_DIR="${validation_agent_dir}" \
-      OMP_PROFILE='' PI_PROFILE='' \
+      OMP_PROFILE='' PI_PROFILE='' PI_AI_ANTIGRAVITY_VERSION='2.26.0' \
       XDG_CONFIG_HOME="${validation_home}/.config" XDG_DATA_HOME="${validation_home}/.local/share" \
       XDG_STATE_HOME="${validation_home}/.local/state" XDG_CACHE_HOME="${validation_home}/.cache" \
       "${omp_bin}" models --json --no-extensions \
@@ -1313,18 +1350,80 @@ omp_select_transport() {
     omp_gateway_offers "${omp_transport}" || fail "${gateway_url} does not serve $(omp_transport_label "${omp_transport}"); drop --transport to let setup pick, or choose the protocol this gateway serves"
   fi
   ui_done 'Protocol' "$(omp_transport_label "${omp_transport}")"
-  if [[ "${omp_transport}" == standard ]]; then
-    "${node_bin}" "${scratch_dir}/native/catalog.cjs" normalize omp "${catalog_file}" "${scratch_dir}" > "${scratch_dir}/native-catalog.json"
+}
+# Google Antigravity rides OMP's own Cloud Code Assist codec on the gateway's
+# /google-antigravity route, whatever protocol the other providers use. It is
+# configured only when this OMP lists every gateway Google model as one model
+# whose thinking levels each reach their exact wire model (OMP's reviewed variant
+# families), judged with a loopback route and a placeholder key. OMP 18.20+
+# pauses google-antigravity unless its user opted in themselves; setup never
+# lifts that pause, and a requested Google default it cannot honor is refused.
+omp_select_google() {
+  local verdict model_id summary='' probe_settings=''
+  google_configured=0; google_refusal=''; google_opted_in=0; omp_validation_settings=''
+  [[ -s "${google_ids_file}" ]] || return 0
+  if ! gateway_catalog /google-antigravity/v1/models "${scratch_dir}/google-antigravity-catalog.json" 1; then
+    fail "${gateway_url} lists Google Antigravity models but has no /google-antigravity/v1/models catalog (HTTP 404)"
   fi
+  probe_google_route
+  [[ "${probe_result}" == present ]] || fail "${gateway_url} lists Google Antigravity models but does not serve their /google-antigravity route"
+  "${node_bin}" "${scratch_dir}/native/catalog.cjs" normalize omp "${catalog_file}" "${scratch_dir}" google-antigravity > "${scratch_dir}/google-catalog.json"
+  # The user's own opt-in lives in the scope's config.yml (OMP ignores it in
+  # project settings). Validation homes carry it, and nothing else of it, and
+  # only while they hold the gateway's Google route.
+  if [[ -f "${settings}" ]] && AGENT_AUTH_YQ_ACTION='unpaused-providers' "${yq_bin}" eval -e '
+      (.auth.unpausedProviders // []) | select(type == "!!seq") | .[] | select(. == "google-antigravity")
+    ' "${settings}" >/dev/null 2>&1; then
+    google_opted_in=1
+    probe_settings="${scratch_dir}/omp-validation-config.yml"
+    printf 'auth:\n  unpausedProviders: [google-antigravity]\n' > "${probe_settings}"
+  fi
+  "${node_bin}" "${scratch_dir}/native/omp.cjs" block "${scratch_dir}/google-catalog.json" 'http://127.0.0.1:9' > "${scratch_dir}/google-probe-block.json"
+  OMP_BLOCK="${scratch_dir}/google-probe-block.json" AGENT_AUTH_YQ_ACTION='google-probe-config' "${yq_bin}" eval -n '
+    .providers["google-antigravity"] = load(strenv(OMP_BLOCK))["google-antigravity"] |
+    .providers["google-antigravity"].apiKey = ({"token": "schema-probe-only", "projectId": "genesis"} | to_json(0))
+  ' > "${scratch_dir}/probe-google.yml" 2> "${scratch_dir}/yq.stderr" || fail 'could not build the Google client probe'
+  if ! omp_models_json "${scratch_dir}/probe-google.yml" "${probe_settings}" || omp_schema_rejected; then
+    google_refusal="${omp_version} could not load the gateway's Google models config"
+  else
+    verdict="$("${node_bin}" "${scratch_dir}/native/check.cjs" omp-google "${scratch_dir}/google-catalog.json" "${omp_models_file}")"
+    if [[ -z "${verdict}" ]]; then
+      google_configured=1
+      omp_validation_settings="${probe_settings}"
+      cat "${google_ids_file}" >> "${model_ids_file}"
+      while IFS= read -r model_id; do summary+="${summary:+, }${model_id#*/}"; done < "${google_ids_file}"
+      ui_done 'Google' "${summary} (OMP's Cloud Code Assist codec; each thinking level is its own wire model)"
+      return 0
+    elif [[ "${verdict}" == none && "${google_opted_in}" == 0 ]]; then
+      google_refusal="${omp_version} pauses its google-antigravity provider unless you opt in yourself (upstream policy: Google's terms do not allow third-party sign-in, and Google has suspended accounts that used it). Genesis serves these models from its own Google account, but setup does not lift that pause. To opt in, add google-antigravity to auth.unpausedProviders in ${settings/#${HOME}/\~} (this also re-enables any Antigravity sign-in stored in OMP), then rerun setup"
+    elif [[ "${verdict}" == none ]]; then
+      google_refusal="${omp_version} lists no google-antigravity models for the gateway's Cloud Code Assist route"
+    else
+      google_refusal="${omp_version} cannot send each Gemini thinking level as its exact wire model ($(tr '\n' ';' <<< "${verdict}" | sed 's/;$//; s/;/; /g')); update OMP, then rerun setup"
+    fi
+  fi
+  if [[ -n "${requested_model}" ]] && grep -qxF "google-antigravity/${requested_model}" "${google_ids_file}"; then
+    fail "model ${requested_model} needs Google Antigravity, which this OMP cannot use here: ${google_refusal}"
+  fi
+}
+# Native metadata for what this setup writes as explicit models: every provider
+# on the standard protocol, and Google whenever it is configured.
+omp_normalize_catalog() {
+  local selected=()
+  if [[ "${omp_transport}" == standard ]]; then selected+=("${providers[@]}"); fi
+  if (( google_configured == 1 )); then selected+=(google-antigravity); fi
+  (( ${#selected[@]} > 0 )) || return 0
+  "${node_bin}" "${scratch_dir}/native/catalog.cjs" normalize omp "${catalog_file}" "${scratch_dir}" "${selected[@]}" > "${scratch_dir}/native-catalog.json"
 }
 # validate_omp_config CONFIG MODE PROVIDER...: MODE schema proves the client
 # accepts the selected transport; MODE catalog proves the exact candidate
-# lists every gateway model the way the gateway describes it.
+# lists every gateway model the way the gateway describes it (Google models
+# folded into one model per thinking-level family, as omp_select_google found).
 validate_omp_config() {
   local config="$1" mode="$2"
   shift 2
-  local listed_providers_file provider found listed model_id
-  if ! omp_models_json "${config}"; then
+  local listed_providers_file provider found listed model_id problems extras_filter=''
+  if ! omp_models_json "${config}" "${omp_validation_settings:-}"; then
     if omp_schema_rejected || [[ "${mode}" != schema || "${omp_transport}" != provider-wire ]]; then
       fail "${omp_version} rejected the ${omp_transport} models config:
 $(omp_client_diagnostics)"
@@ -1370,6 +1469,8 @@ $(omp_client_diagnostics)"
       '.models[] | select(.transport == "provider-wire") | .selector' \
       "${omp_models_file}" > "${omp_models_file}.selectors"
     while IFS= read -r model_id; do
+      # Google keeps OMP's Cloud Code Assist codec; it is checked below.
+      [[ "${model_id}" != google-antigravity/* ]] || continue
       found=0
       while IFS= read -r listed; do
         if [[ "${listed}" == "${model_id}" ]]; then found=1; break; fi
@@ -1381,12 +1482,19 @@ $(omp_client_diagnostics)"
       > "${scratch_dir}/omp-list-report" || fail "${omp_version} did not list the gateway models as described:
 $(omp_client_diagnostics)"
   fi
+  if (( ${google_configured:-0} == 1 )); then
+    problems="$("${node_bin}" "${scratch_dir}/native/check.cjs" omp-google "${scratch_dir}/native-catalog.json" "${omp_models_file}")"
+    [[ -z "${problems}" ]] || fail "${omp_version} did not list the gateway's Google models as one model per thinking-level family: ${problems//$'\n'/; }"
+  fi
   # Bundled models the gateway does not serve stay listed on the stock protocols
-  # (only provider-wire discovery replaces the bundled catalog).
+  # (only provider-wire discovery replaces the bundled catalog), and always for
+  # a configured Google, which keeps OMP's own codec and bundled catalog.
   omp_extra_models=''
-  if [[ "${omp_transport}" != provider-wire ]]; then
+  if [[ "${omp_transport}" != provider-wire ]]; then extras_filter='.provider == "anthropic" or .provider == "openai-codex"'; fi
+  if (( ${google_configured:-0} == 1 )); then extras_filter+="${extras_filter:+ or }.provider == \"google-antigravity\""; fi
+  if [[ -n "${extras_filter}" ]]; then
     AGENT_AUTH_YQ_ACTION='omp-selectors' "${yq_bin}" eval -r \
-      '.models[] | select(.provider == "anthropic" or .provider == "openai-codex") | .selector' \
+      ".models[] | select(${extras_filter}) | .selector" \
       "${omp_models_file}" > "${omp_models_file}.selectors"
     omp_extra_models="$(grep -vxFf "${model_ids_file}" "${omp_models_file}.selectors" | tr '\n' ' ' || true)"
     omp_extra_models="${omp_extra_models% }"
@@ -1481,21 +1589,59 @@ omp_recover_embedded_key() {
 omp_owned_reset='del(.transport) | del(.discovery) | del(.authHeader) | del(.api) | del(.models)'
 # Credential headers (any spelling, on the provider or a model override) would
 # conflict with the gateway bearer: lease.mjs refuses a request whose x-api-key
-# and Authorization disagree. They are enumerated from the source config, dropped
-# by the merge, and their presence alone makes a config need updating.
+# and Authorization disagree, and OMP's Cloud Code Assist codec lets them replace
+# its own bearer. They are enumerated from the source config, dropped by the
+# merge, and their presence alone makes a config need updating.
 omp_credential_headers() {
-  local config="$1"
+  local config="$1" header_providers=(anthropic openai-codex)
+  if (( ${google_configured:-0} == 1 )); then header_providers+=(google-antigravity); fi
   "${yq_bin}" -o json '. // {}' "${config}" > "${scratch_dir}/omp-source.json" 2> "${scratch_dir}/yq.stderr" \
     || fail "could not read ${models/#${HOME}/\~}"
-  "${node_bin}" "${scratch_dir}/native/omp.cjs" credentials "${scratch_dir}/omp-source.json"
+  "${node_bin}" "${scratch_dir}/native/omp.cjs" credentials "${scratch_dir}/omp-source.json" "${header_providers[@]}"
+}
+# OMP's Cloud Code Assist codec reads its bearer and a project from a JSON key
+# and sends its own Authorization header (no authHeader). The gateway replaces
+# the placeholder project with its own Google account's.
+omp_google_key='({"token": strenv(GATEWAY_TOKEN), "projectId": "genesis"} | to_json(0))'
+omp_google_route='
+  (.providers["google-antigravity"] | type) == "!!map" and
+  .providers["google-antigravity"].baseUrl == load(strenv(OMP_BLOCK))["google-antigravity"].baseUrl and
+  .providers["google-antigravity"].apiKey == '"${omp_google_key}"' and
+  .providers["google-antigravity"].api == "google-gemini-cli" and
+  .providers["google-antigravity"].authHeader == null and
+  .providers["google-antigravity"].transport == null and
+  .providers["google-antigravity"].discovery == null and
+  (.providers["google-antigravity"].models | @json) == (load(strenv(OMP_BLOCK))["google-antigravity"].models | @json)
+'
+# omp_routes_match FILE: every configured provider route in FILE is the gateway's.
+# Sets route_mismatch to the first provider that differs.
+omp_routes_match() {
+  local file="$1" provider
+  route_mismatch=''
+  for provider in "${providers[@]}"; do
+    if ! PROVIDER="${provider}" GATEWAY_URL="${gateway_url}" GATEWAY_TOKEN="${token}" GATEWAY_TRANSPORT="${omp_transport}" OMP_BLOCK="${block}" \
+      AGENT_AUTH_YQ_ACTION='route-matches' "${yq_bin}" eval -e "${route_expression}" "${file}" >/dev/null 2> "${scratch_dir}/yq.stderr"; then
+      route_mismatch="${provider}"
+      return 1
+    fi
+  done
+  if (( google_configured == 1 )) && ! GATEWAY_TOKEN="${token}" OMP_BLOCK="${block}" \
+    AGENT_AUTH_YQ_ACTION='route-matches' "${yq_bin}" eval -e "${omp_google_route}" "${file}" >/dev/null 2> "${scratch_dir}/yq.stderr"; then
+    route_mismatch=google-antigravity
+    return 1
+  fi
 }
 omp_stage() {
-  local omp_candidate provider block credential
+  local omp_candidate provider credential
   stage_config "${models}" yaml models
   omp_candidate="${staged_config}"
   block="${scratch_dir}/omp-block.json"
-  if [[ "${omp_transport}" == standard ]]; then
+  if [[ "${omp_transport}" == standard ]] || (( google_configured == 1 )); then
     "${node_bin}" "${scratch_dir}/native/omp.cjs" block "${scratch_dir}/native-catalog.json" "${gateway_url}" > "${block}"
+  else
+    printf '{}\n' > "${block}"
+  fi
+  if [[ "${omp_transport}" == standard ]]; then
     route_expression='
       (.providers[strenv(PROVIDER)] | type) == "!!map" and
       .providers[strenv(PROVIDER)].baseUrl == load(strenv(OMP_BLOCK))[strenv(PROVIDER)].baseUrl and
@@ -1507,7 +1653,6 @@ omp_stage() {
       (.providers[strenv(PROVIDER)].models | @json) == (load(strenv(OMP_BLOCK))[strenv(PROVIDER)].models | @json)
     '
   else
-    printf '{}\n' > "${block}"
     route_expression='
       (.providers[strenv(PROVIDER)] | type) == "!!map" and
       .providers[strenv(PROVIDER)].baseUrl == strenv(GATEWAY_URL) and
@@ -1526,14 +1671,7 @@ omp_stage() {
   if (( models_existed == 1 )); then
     config_needs_update=0
     if [[ -n "$(omp_credential_headers "${source_config}")" ]]; then config_needs_update=1; fi
-    for provider in "${providers[@]}"; do
-      if ! PROVIDER="${provider}" GATEWAY_URL="${gateway_url}" GATEWAY_TOKEN="${token}" GATEWAY_TRANSPORT="${omp_transport}" OMP_BLOCK="${block}" \
-        AGENT_AUTH_YQ_ACTION='route-matches' "${yq_bin}" eval -e \
-        "${route_expression}" "${source_config}" >/dev/null 2>&1; then
-        config_needs_update=1
-        break
-      fi
-    done
+    if ! omp_routes_match "${source_config}"; then config_needs_update=1; fi
   fi
 
   config_state='unchanged'
@@ -1603,6 +1741,17 @@ omp_stage() {
         fi
       fi
     done
+    if (( google_configured == 1 )); then
+      merge_expression+=' |
+        (
+          select((.providers["google-antigravity"] | kind) != "alias"),
+          (select((.providers["google-antigravity"] | kind) == "alias") | explode(.providers["google-antigravity"]))
+        ) |
+        select(.providers["google-antigravity"] == null or (.providers["google-antigravity"] | type) == "!!map") |
+        .providers["google-antigravity"] = ((.providers["google-antigravity"] // {}) | '"${omp_owned_reset}"') |
+        .providers["google-antigravity"] = (.providers["google-antigravity"] * (load(strenv(OMP_BLOCK))["google-antigravity"] | ... style="")) |
+        .providers["google-antigravity"].apiKey = '"${omp_google_key}"
+    fi
     candidate="${scratch_dir}/candidate-models.yml"
     if ! GATEWAY_URL="${gateway_url}" GATEWAY_TOKEN="${token}" GATEWAY_TRANSPORT="${omp_transport}" OMP_BLOCK="${block}" AGENT_AUTH_YQ_ACTION='merge-config' \
       "${yq_bin}" eval -e "${merge_expression}" "${source_file}" > "${candidate}" 2> "${scratch_dir}/yq.stderr"; then
@@ -1612,13 +1761,7 @@ omp_stage() {
     config_to_validate="${candidate}"
   fi
 
-  for provider in "${providers[@]}"; do
-    if ! PROVIDER="${provider}" GATEWAY_URL="${gateway_url}" GATEWAY_TOKEN="${token}" GATEWAY_TRANSPORT="${omp_transport}" OMP_BLOCK="${block}" \
-      AGENT_AUTH_YQ_ACTION='verify-config' "${yq_bin}" eval -e \
-      "${route_expression}" "${config_to_validate}" >/dev/null 2> "${scratch_dir}/yq.stderr"; then
-      fail "gateway settings are invalid for ${provider}"
-    fi
-  done
+  omp_routes_match "${config_to_validate}" || fail "gateway settings are invalid for ${route_mismatch}"
   [[ -z "$(omp_credential_headers "${config_to_validate}")" ]] || fail 'a credential header survived the merge; nothing was committed'
 
   # Validate the exact candidate in a fresh isolated registry too. Built-in or
@@ -1627,6 +1770,55 @@ omp_stage() {
   ui_note "Checking the merged models config with ${omp_version}"
   validate_omp_config "${omp_candidate}" catalog "${providers[@]}"
   omp_stage_default_model
+  omp_stage_google_endpoint
+}
+# providers.antigravityEndpoint production/sandbox modes ignore the base URL and
+# would send the gateway key to Google. With Google configured, and only after
+# every check has passed, OMP's own default (auto, which honors the base URL)
+# is pinned while enabled; disable and unset restore the previous value.
+# Project and PI_CONFIG_FILES overrides are checked before commit, not rewritten.
+omp_stage_google_endpoint() {
+  local current
+  omp_replaced_endpoint=''
+  (( google_configured == 1 )) || return 0
+  current="$(AGENT_AUTH_YQ_ACTION='antigravity-endpoint' "${yq_bin}" eval -r '.providers.antigravityEndpoint // ""' "${staged_config}" 2>/dev/null || true)"
+  [[ "${current}" != auto ]] || return 0
+  if ! AGENT_AUTH_YQ_ACTION='antigravity-endpoint' "${yq_bin}" eval -e -i '
+    .providers = (.providers // {}) | select((.providers | type) == "!!map") | .providers.antigravityEndpoint = "auto"
+  ' "${staged_config}" 2> "${scratch_dir}/yq.stderr"; then
+    fail "could not set providers.antigravityEndpoint in ${settings/#${HOME}/\~}"
+  fi
+  omp_replaced_endpoint="${current}"
+}
+omp_check_google_project() {
+  [[ "${action}" == configure || "${action}" == enable ]] || return 0
+  local index state_candidate='' validation_home validation_agent_dir
+  for ((index=0; index<tx_count; index++)); do
+    if [[ "${tx_kinds[index]}" == state ]]; then state_candidate="${tx_candidates[index]}"; break; fi
+  done
+  [[ -n "${state_candidate}" ]] || return 0
+  if ! AGENT_AUTH_YQ_ACTION='google-managed-route' "${yq_bin}" eval -e '
+    .files[] | select(.role == "models") | .fields[] |
+    select(.path[0] == "providers" and .path[1] == "google-antigravity" and .path[2] == "baseUrl" and .gateway.present == true)
+  ' "${state_candidate}" >/dev/null 2>&1; then return 0; fi
+  validation_home="$(mktemp -d "${scratch_dir}/endpoint-home.XXXXXX")"
+  validation_agent_dir="${validation_home}/.omp/agent"
+  mkdir -p "${validation_agent_dir}"
+  printf 'providers:\n  antigravityEndpoint: auto\n' > "${validation_agent_dir}/config.yml"
+  # Read the effective setting from the caller's directory. This home contains
+  # no credential; the project's files and explicit environment overlays stay
+  # in scope, unlike the isolated model-schema check.
+  if ! env -i HOME="${validation_home}" PATH="${PATH}" TMPDIR="${scratch_dir}" \
+    PI_CONFIG_DIR='.omp' PI_CODING_AGENT_DIR="${validation_agent_dir}" OMP_PROFILE='' PI_PROFILE='' \
+    PI_CONFIG_FILES="${PI_CONFIG_FILES:-}" XDG_CONFIG_HOME="${validation_home}/.config" \
+    XDG_DATA_HOME="${validation_home}/.local/share" XDG_STATE_HOME="${validation_home}/.local/state" \
+    XDG_CACHE_HOME="${validation_home}/.cache" \
+    "${omp_bin}" config get providers.antigravityEndpoint --json > "${validation_home}/endpoint.json" 2> "${validation_home}/stderr"; then
+    fail 'could not read OMP providers.antigravityEndpoint in this directory; no gateway credentials were installed'
+  fi
+  if ! AGENT_AUTH_YQ_ACTION='google-effective-endpoint' "${yq_bin}" -p json eval -e '.value == "auto"' "${validation_home}/endpoint.json" >/dev/null 2>&1; then
+    fail 'project settings or PI_CONFIG_FILES override providers.antigravityEndpoint here; set that override to auto or remove it before configuring or enabling Genesis'
+  fi
 }
 # A default the gateway does not serve fails on the first prompt. The default
 # role is written only when it has to be: a model was requested with --model,
@@ -1675,15 +1867,16 @@ omp_write_default_role() {
   omp_stage_allowed_default "${chosen}"
 }
 # --model names a raw provider id; OMP selects models as provider/id, so the one
-# served selector carrying that id becomes the default role.
+# served selector carrying that id becomes the default role. EXTRA lists more
+# served selectors (Google, before its client probe decides).
 omp_requested_selector() {
-  local selector found='' served=''
+  local extra="${1:-/dev/null}" selector found='' served=''
   while IFS= read -r selector; do
     served+="${served:+, }${selector#*/}"
     [[ "${selector#*/}" == "${requested_model}" ]] || continue
     [[ -z "${found}" ]] || fail "model ${requested_model} is served by more than one provider (${found%%/*}, ${selector%%/*}); omp cannot pick one default"
     found="${selector}"
-  done < "${model_ids_file}"
+  done < <(cat "${model_ids_file}" "${extra}")
   [[ -n "${found}" ]] || fail "model ${requested_model} is not served by this gateway for omp; served models: ${served}"
   printf '%s' "${found}"
 }
@@ -1706,21 +1899,35 @@ omp_stage_allowed_default() {
   omp_allowed_default="${selector}"
 }
 omp_report() {
+  local model_id google=''
   ui_title 'OMP gateway ready'
   printf '  gateway  %s\n' "${gateway_url}"
   printf '  protocol %s\n' "$(omp_transport_label "${omp_transport}")"
   printf '  client   %s\n' "${omp_version}"
   if [[ -n "${omp_default_model}" ]]; then printf '  default  %s\n' "${omp_default_model}"; fi
+  if (( google_configured == 1 )); then
+    while IFS= read -r model_id; do google+="${google:+, }${model_id}"; done < "${google_ids_file}"
+    printf '  google   %s (pick a thinking level as model:level)\n' "${google}"
+  fi
   report_transaction
   if [[ -n "${omp_replaced_default:-}" ]]; then
-    printf '\nThe previous default %s is not served by this gateway; %s is the default while enabled.\n' "${omp_replaced_default}" "${omp_default_model}"
+    if [[ "${omp_replaced_default}" == google-antigravity/* && -n "${google_refusal}" ]]; then
+      printf '\nThe previous default %s needs Google Antigravity, which was not configured; %s is the default while enabled.\n' "${omp_replaced_default}" "${omp_default_model}"
+    else
+      printf '\nThe previous default %s is not served by this gateway; %s is the default while enabled.\n' "${omp_replaced_default}" "${omp_default_model}"
+    fi
   fi
   if [[ -n "${omp_allowed_default:-}" ]]; then
     printf 'enabledModels did not allow %s; it is added while enabled.\n' "${omp_allowed_default}"
   fi
+  if [[ -n "${omp_replaced_endpoint:-}" ]]; then
+    printf 'providers.antigravityEndpoint was %s, which bypasses the gateway; it is auto while enabled.\n' "${omp_replaced_endpoint}"
+  fi
   if [[ -n "${omp_extra_models:-}" ]]; then
     printf 'Not served by this gateway (bundled in OMP; still listed): %s\n' "${omp_extra_models}"
   fi
+  # The client's own label leads, so the genesis CLI repeats it in its summary.
+  if [[ -n "${google_refusal}" ]]; then printf 'OMP: Google Antigravity models were not configured: %s.\n' "${google_refusal}"; fi
   if [[ -n "${profile}" ]]; then printf '\nRun: omp --profile %s\n' "${profile}"; else printf '\nRun: omp\n'; fi
   printf 'Undo: rerun this setup and choose Disable (keeps the key), or Unset (removes it).\n'
 }
@@ -1938,6 +2145,17 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { object } = require('./config-io.cjs');
 
+const GOOGLE = 'google-antigravity';
+const EFFORTS = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
+const RAW_ID = /^[\x21-\x7e]{1,256}$/;
+// The gateway providers each client can use. Google Antigravity needs a native
+// Cloud Code Assist (google-gemini-cli) client: OMP ships one; Pi removed its own
+// in 0.71.0, and Claude Code, Codex and OpenCode have none.
+const CLIENT_PROVIDERS = {
+  'claude-code': ['anthropic'], codex: ['openai-codex'], opencode: ['anthropic', 'openai-codex'],
+  pi: ['anthropic', 'openai-codex'], omp: ['anthropic', 'openai-codex', GOOGLE],
+};
+
 function loadCatalog(file) {
   let value;
   try { value = JSON.parse(fs.readFileSync(file, 'utf8')); }
@@ -1946,17 +2164,32 @@ function loadCatalog(file) {
   return value;
 }
 function selected(harness, catalog) {
-  const wanted = harness === 'claude-code' ? ['anthropic'] : harness === 'codex' ? ['openai-codex'] : ['anthropic', 'openai-codex'];
-  return wanted.filter(provider => catalog.some(card => card.owned_by === provider));
+  return CLIENT_PROVIDERS[harness].filter(provider => catalog.some(card => card.owned_by === provider));
 }
-function normalize(harness, catalog, directory) {
-  const providers = selected(harness, catalog.data);
+// Google cards name one canonical model whose thinking levels are separate wire
+// SKUs (gemini-4-argon-low/-medium/-high): every level needs its own raw id.
+function googleRouting(card) {
+  const thinking = card.thinking;
+  const efforts = thinking?.efforts;
+  const routes = Array.isArray(efforts) && object(thinking.effortRouting) ? efforts.map(effort => thinking.effortRouting[effort]) : [];
+  if (typeof thinking?.mode !== 'string' || !routes.length || efforts.some(effort => !EFFORTS.includes(effort))
+    || new Set(efforts).size !== efforts.length || routes.some(id => typeof id !== 'string' || !RAW_ID.test(id))
+    || new Set(routes).size !== routes.length) {
+    throw new Error(`gateway Google model ${card.id} has no per-level wire routing`);
+  }
+  return routes;
+}
+// `only` restricts OMP to the providers it writes explicit models for: Google
+// once its client probe passed, the others on the standard protocol only.
+function normalize(harness, catalog, directory, only = null) {
+  const providers = selected(harness, catalog.data).filter(provider => only === null || only.includes(provider));
   if (!providers.length) throw new Error('gateway advertises no models for the selected client');
   if (!object(catalog.default_models)) throw new Error('gateway catalog is missing explicit provider defaults');
   const result = {};
   for (const provider of providers) {
     const defaultModel = catalog.default_models[provider];
-    if (typeof defaultModel !== 'string' || !defaultModel.startsWith(`${provider}/`)) {
+    // Google stays opt-in: it may be served before it has a reviewed ping default.
+    if ((provider !== GOOGLE || defaultModel !== undefined) && (typeof defaultModel !== 'string' || !defaultModel.startsWith(`${provider}/`))) {
       throw new Error(`gateway catalog has no qualified default model for ${provider}`);
     }
     const native = loadCatalog(path.join(directory, `${provider}-catalog.json`)).data;
@@ -1964,10 +2197,13 @@ function normalize(harness, catalog, directory) {
     let defaultIndex = -1;
     result[provider] = catalog.data.filter(card => card.owned_by === provider).map((card, index) => {
       if (card.id === defaultModel) defaultIndex = index;
-      const id = card.request_model_id ?? card.id?.replace(new RegExp(`^${provider}/`), '');
-      if (typeof id !== 'string' || !/^[\x21-\x7e]{1,256}$/.test(id) || seen.has(id)) throw new Error('invalid or duplicate raw gateway model ID');
-      seen.add(id);
-      if (!native.some(model => model.id === id && model.owned_by === provider)) throw new Error('native model catalog does not match gateway metadata');
+      const canonical = card.id?.replace(new RegExp(`^${provider}/`), '');
+      const requestId = card.request_model_id ?? canonical;
+      // A Google card also claims its canonical id and every wire SKU it routes to.
+      const ids = provider === GOOGLE ? [...new Set([requestId, canonical, ...googleRouting(card)])] : [requestId];
+      if (ids.some(id => typeof id !== 'string' || !RAW_ID.test(id) || seen.has(id))) throw new Error('invalid or duplicate raw gateway model ID');
+      for (const id of ids) seen.add(id);
+      if (!native.some(model => model.id === requestId && model.owned_by === provider)) throw new Error('native model catalog does not match gateway metadata');
       for (const key of ['context_length', 'max_output_tokens']) {
         if (!Number.isSafeInteger(card[key]) || card[key] <= 0) throw new Error('gateway model limits are missing or invalid');
       }
@@ -1976,9 +2212,12 @@ function normalize(harness, catalog, directory) {
       if (!object(card.cost) || ['input', 'output', 'cacheRead', 'cacheWrite'].some(key => !Number.isFinite(card.cost[key]) || card.cost[key] < 0)) {
         throw new Error('gateway model pricing is missing or invalid');
       }
-      return { ...card, id };
+      // OMP selects a Google model by its canonical id; its thinking levels pick
+      // the wire SKU. Every other client sends the raw request id.
+      return { ...card, id: provider === GOOGLE ? canonical : requestId };
     });
     if (native.length !== result[provider].length) throw new Error('native and authoritative catalog counts disagree');
+    if (defaultModel === undefined) continue;
     if (defaultIndex === -1) throw new Error(`gateway default model ${defaultModel} is not in its provider catalog`);
     if (defaultIndex > 0) result[provider].unshift(result[provider].splice(defaultIndex, 1)[0]);
   }
@@ -2013,16 +2252,29 @@ function newestHaiku(cards) {
   }
   return best;
 }
+// A Google model asked of a client without a Cloud Code Assist codec is refused
+// by name, before any probe or staging; it would otherwise read as unserved.
+function refuseGoogle(harness, catalog, requested) {
+  if (!requested || CLIENT_PROVIDERS[harness].includes(GOOGLE)) return;
+  for (const card of catalog.data) {
+    if (!object(card) || card.owned_by !== GOOGLE || typeof card.id !== 'string') continue;
+    const routing = object(card.thinking?.effortRouting) ? Object.values(card.thinking.effortRouting) : [];
+    if (![card.id.replace(`${GOOGLE}/`, ''), card.request_model_id, ...routing].includes(requested)) continue;
+    throw new Error(`model ${requested} is a Google Antigravity model, which ${harness} cannot use: Genesis serves Google models only to OMP's Cloud Code Assist client`);
+  }
+}
 if (require.main === module) {
   try {
-    const [action, harness, file, directory] = process.argv.slice(2);
+    const [action, harness, file, directory, ...rest] = process.argv.slice(2);
     const catalog = loadCatalog(file);
     if (action === 'providers') {
+      refuseGoogle(harness, catalog, rest[0]);
       const providers = selected(harness, catalog.data);
       if (!providers.length) throw new Error('gateway advertises no models for the selected client');
       process.stdout.write(providers.join('\n') + '\n');
-    } else if (action === 'normalize') process.stdout.write(JSON.stringify(normalize(harness, catalog, directory)) + '\n');
-    else throw new Error('unknown catalog action');
+    } else if (action === 'normalize') {
+      process.stdout.write(JSON.stringify(normalize(harness, catalog, directory, rest.length ? rest : null)) + '\n');
+    } else throw new Error('unknown catalog action');
   } catch (error) { console.error(`setup failed: ${error.message}`); process.exitCode = 1; }
 }
 module.exports = { normalize, select, newestHaiku };
@@ -2066,8 +2318,10 @@ try {
     // Every gateway model must be listed under its built-in provider id with the
     // gateway's limits; bundled rows keep their own limits, so a match proves the
     // staged definitions were applied. Prints bundled models the gateway lacks.
+    // Google models are checked by omp-google.
     const [catalogFile, modelsFile] = args;
     const catalog = JSON.parse(fs.readFileSync(catalogFile, 'utf8'));
+    delete catalog['google-antigravity'];
     let listing;
     try { listing = JSON.parse(fs.readFileSync(modelsFile, 'utf8')); } catch { throw new Error('OMP returned an unreadable model list'); }
     const rows = Array.isArray(listing?.models) ? listing.models : [];
@@ -2083,6 +2337,30 @@ try {
     }
     const extras = rows.filter(row => Object.hasOwn(catalog, row.provider) && !expected.has(row.selector)).map(row => row.selector);
     process.stdout.write(extras.join(', ') + '\n');
+  } else if (action === 'omp-google') {
+    // Each gateway Google model must be one canonical OMP model offering exactly
+    // the gateway's thinking levels, with its wire SKUs folded into it: OMP's
+    // reviewed variant families then send each level's exact SKU. Prints `none`
+    // when OMP lists no google-antigravity model at all, else what differs, else
+    // nothing.
+    const [catalogFile, modelsFile] = args;
+    const cards = JSON.parse(fs.readFileSync(catalogFile, 'utf8'))['google-antigravity'] ?? [];
+    let listing;
+    try { listing = JSON.parse(fs.readFileSync(modelsFile, 'utf8')); } catch { throw new Error('OMP returned an unreadable model list'); }
+    const rows = (Array.isArray(listing?.models) ? listing.models : []).filter(row => row?.provider === 'google-antigravity');
+    const problems = [];
+    for (const card of rows.length ? cards : []) {
+      const selector = `google-antigravity/${card.id}`;
+      const levels = card.thinking.efforts;
+      const row = rows.find(row => row.selector === selector);
+      const loose = rows.filter(row => row.id !== card.id && levels.some(level => card.thinking.effortRouting[level] === row.id));
+      if (!row) problems.push(`${selector} is not listed`);
+      else if (!isDeepStrictEqual(row.thinking, levels)) {
+        problems.push(`${selector} offers ${Array.isArray(row.thinking) && row.thinking.length ? row.thinking.join('/') : 'no thinking levels'}, not ${levels.join('/')}`);
+      }
+      if (loose.length) problems.push(`${loose.map(row => row.selector).join(', ')} stay separate models`);
+    }
+    process.stdout.write(rows.length ? problems.map(problem => problem + '\n').join('') : 'none\n');
   } else if (action === 'opencode-projection') {
     const [candidate, destination, dummyToken] = args;
     const config = load(candidate);
@@ -2386,11 +2664,13 @@ const fs = require('node:fs');
 // models by id, so existing selections such as anthropic/claude-... keep their
 // names while every request goes to the gateway. Codex uses OMP's generic
 // Responses codec: the Codex codec hardcodes a /codex/responses suffix that the
-// gateway's /openai-codex/v1/responses route does not have.
+// gateway's /openai-codex/v1/responses route does not have. Google Antigravity
+// uses OMP's own Cloud Code Assist codec on /google-antigravity: that codec sends
+// its own bearer from a JSON key, so it has no authHeader.
 const EFFORTS = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
 const THINKING_MODES = ['effort', 'budget', 'google-level', 'anthropic-adaptive', 'anthropic-budget-effort'];
-const PROVIDERS = ['anthropic', 'openai-codex'];
-const api = provider => (provider === 'anthropic' ? 'anthropic-messages' : 'openai-responses');
+const GOOGLE = 'google-antigravity';
+const api = provider => (provider === 'anthropic' ? 'anthropic-messages' : provider === GOOGLE ? 'google-gemini-cli' : 'openai-responses');
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 
 function model(card, provider) {
@@ -2409,26 +2689,39 @@ function model(card, provider) {
   if (provider === 'openai-codex') value.omitMaxOutputTokens = true;
   return value;
 }
+// One entry per wire SKU, each pinned to its own level: OMP's reviewed variant
+// families fold them back into the canonical model and route each level to its
+// exact SKU. A lone canonical entry would leave every level on its default SKU.
+function googleModels(card) {
+  return card.thinking.efforts.map(effort => ({
+    ...model({ ...card, id: card.thinking.effortRouting[effort], thinking: undefined }, GOOGLE),
+    name: `${card.display_name ?? card.id} (${effort})`,
+    thinking: { mode: card.thinking.mode, efforts: [effort], requiresEffort: true },
+  }));
+}
 function block(catalogFile, gateway) {
   const catalog = JSON.parse(fs.readFileSync(catalogFile, 'utf8'));
   const result = {};
   for (const [provider, cards] of Object.entries(catalog)) {
-    result[provider] = {
-      baseUrl: `${gateway}/${provider}${provider === 'openai-codex' ? '/v1' : ''}`,
-      api: api(provider), authHeader: true, models: cards.map(card => model(card, provider)),
-    };
+    result[provider] = provider === GOOGLE
+      ? { baseUrl: `${gateway}/${GOOGLE}`, api: api(provider), models: cards.flatMap(googleModels) }
+      : {
+        baseUrl: `${gateway}/${provider}${provider === 'openai-codex' ? '/v1' : ''}`,
+        api: api(provider), authHeader: true, models: cards.map(card => model(card, provider)),
+      };
   }
   return JSON.stringify(result) + '\n';
 }
 // Credential headers on a managed provider (any spelling, at the provider or on
 // a model override) would conflict with the gateway bearer; lease.mjs refuses
-// such requests. Prints one yq selector per header so the merge can drop them.
+// such requests, and the Cloud Code Assist codec lets them replace its bearer.
+// Prints one yq selector per header of the PROVIDERS being configured.
 const credentialHeader = key => ['x-api-key', 'authorization'].includes(key.toLowerCase());
 const selector = keys => '.' + keys.map(key => `[${JSON.stringify(key)}]`).join('');
-function credentials(configFile) {
+function credentials(configFile, providers) {
   const config = JSON.parse(fs.readFileSync(configFile, 'utf8'));
   const lines = [];
-  for (const id of PROVIDERS) {
+  for (const id of providers) {
     const provider = config?.providers?.[id];
     if (!object(provider)) continue;
     for (const key of Object.keys(object(provider.headers) ? provider.headers : {})) if (credentialHeader(key)) lines.push(selector(['providers', id, 'headers', key]));
@@ -2441,7 +2734,7 @@ function credentials(configFile) {
 try {
   const [action, ...args] = process.argv.slice(2);
   if (action === 'block') process.stdout.write(block(args[0], args[1]));
-  else if (action === 'credentials') process.stdout.write(credentials(args[0]));
+  else if (action === 'credentials') process.stdout.write(credentials(args[0], args.slice(1)));
   else throw new Error('unknown OMP configuration action');
 } catch (error) { console.error(`setup failed: ${error.message}`); process.exitCode = 1; }
 AGENT_AUTH_BD4D881668518F214714
@@ -2669,8 +2962,29 @@ function put(value, keys, cell) {
 const digest = file => createHash('sha256').update(fs.readFileSync(file)).digest('hex');
 const fieldKey = keys => JSON.stringify(keys);
 const providerIds = ['anthropic', 'openai-codex'];
+// OMP also routes Google Antigravity through the gateway (its Cloud Code Assist codec).
+const ompProviderIds = [...providerIds, 'google-antigravity'];
 // Legacy OMP installers (no switch state) wrote only these routing fields.
 const legacyOmpKeys = ['baseUrl', 'apiKey', 'transport', 'discovery'];
+const ompRouteKeys = [...legacyOmpKeys, 'authHeader', 'api', 'models'];
+// Google fields are owned only where a config names them (a configure that
+// routes Google, or the user's own provider), so a scope that never had Google
+// keeps the switch state an earlier installer wrote and can still read.
+const ompGooglePaths = ompRouteKeys.map(key => ['providers', 'google-antigravity', key]);
+// production/sandbox endpoint modes bypass the gateway base URL; a Google
+// configure owns auto even when the setting already holds it.
+const antigravityEndpointPath = ['providers', 'antigravityEndpoint'];
+function requireGoogleApi(value) {
+  const overrides = value?.providers?.['google-antigravity']?.modelOverrides;
+  for (const [model, override] of Object.entries(object(overrides) ? overrides : {})) {
+    if (override?.api != null && override.api !== 'google-gemini-cli') {
+      throw new Error(`google-antigravity modelOverrides.${model}.api overrides the gateway codec; remove that override or set it to google-gemini-cli before configuring or enabling`);
+    }
+    if (override?.thinking != null) {
+      throw new Error(`google-antigravity modelOverrides.${model}.thinking overrides the gateway's wire-model routing; remove that override before configuring or enabling`);
+    }
+  }
+}
 // Conflicting credential headers on a managed provider make the gateway refuse
 // the request (lease.mjs). Header names are matched case-insensitively at the
 // provider and at every model override; the exact spellings found in a config
@@ -2678,7 +2992,7 @@ const legacyOmpKeys = ['baseUrl', 'apiKey', 'transport', 'discovery'];
 const credentialHeader = key => ['x-api-key', 'authorization'].includes(String(key).toLowerCase());
 function credentialHeaderPaths(value) {
   const paths = [];
-  for (const id of providerIds) {
+  for (const id of ompProviderIds) {
     const provider = value?.providers?.[id];
     if (!object(provider)) continue;
     for (const key of Object.keys(object(provider.headers) ? provider.headers : {})) if (credentialHeader(key)) paths.push(['providers', id, 'headers', key]);
@@ -2688,7 +3002,7 @@ function credentialHeaderPaths(value) {
   }
   return paths;
 }
-const credentialHeaderPath = keys => keys.length >= 4 && keys[0] === 'providers' && providerIds.includes(keys[1]) && credentialHeader(keys.at(-1))
+const credentialHeaderPath = keys => keys.length >= 4 && keys[0] === 'providers' && ompProviderIds.includes(keys[1]) && credentialHeader(keys.at(-1))
   && (keys.length === 4 && keys[2] === 'headers' || keys.length === 6 && keys[2] === 'modelOverrides' && keys[4] === 'headers');
 const legacyTransport = provider => object(provider) && ['provider-wire', 'pi-native'].includes(provider.transport);
 // Direct credentials and cloud routes that outrank the gateway helper in
@@ -2698,11 +3012,14 @@ const legacyTransport = provider => object(provider) && ['provider-wire', 'pi-na
 const claudeCredentialKeys = ['ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_API_KEY', 'CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_AWS_API_KEY',
   'CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_USE_VERTEX', 'CLAUDE_CODE_USE_FOUNDRY', 'CLAUDE_CODE_USE_ANTHROPIC_AWS'];
 const claudeLive = value => value !== undefined && !['', '0', 'false', 0, false].includes(value);
-// Static owned paths plus the credential-header spellings present in VALUES.
+// Static owned paths plus the Google fields and credential-header spellings
+// present in VALUES.
 function ownedPaths(harness, role, ...values) {
   switch (harness) {
-    case 'omp': return role === 'settings' ? [['modelRoles', 'default'], ['enabledModels']] : [
-      ...providerIds.flatMap(id => [...legacyOmpKeys, 'authHeader', 'api', 'models'].map(key => ['providers', id, key])),
+    case 'omp': return role === 'settings' ? [['modelRoles', 'default'], ['enabledModels'],
+      ...(values.some(value => at(value, antigravityEndpointPath).present) ? [antigravityEndpointPath] : [])] : [
+      ...providerIds.flatMap(id => ompRouteKeys.map(key => ['providers', id, key])),
+      ...(values.some(value => own(value?.providers, 'google-antigravity')) ? ompGooglePaths : []),
       ...values.flatMap(credentialHeaderPaths).filter((keys, index, all) => all.findIndex(other => equal(other, keys)) === index),
     ];
     case 'claude-code': return [['apiKeyHelper'], ['model'], ...['ANTHROPIC_BASE_URL', 'ANTHROPIC_MODEL', 'ANTHROPIC_DEFAULT_HAIKU_MODEL',
@@ -2796,7 +3113,9 @@ function validateState(state, harness, tokenFile, files) {
       continue;
     }
     if (!Array.isArray(record.fields) || !Array.isArray(record.absentParents)) throw new Error('switch state has invalid owned fields');
-    const allowed = ownedPaths(harness, file.role);
+    // Every path ownedPaths can claim for some config, the value-dependent ones too.
+    const allowed = [...ownedPaths(harness, file.role),
+      ...(harness !== 'omp' ? [] : file.role === 'settings' ? [antigravityEndpointPath] : ompGooglePaths)];
     const owned = keys => allowed.some(full => keys.length <= full.length && keys.every((key, index) => key === full[index])) || harness === 'omp' && credentialHeaderPath(keys);
     const fieldNames = new Set();
     for (const field of record.fields) {
@@ -2860,6 +3179,9 @@ function main() {
   let state = stateFile.original ? load(stateFile.original, true) : undefined;
   if (state) validateState(state, harness, tokenFile, files);
   const previousState = state;
+  const googleConfigured = harness === 'omp' && action === 'configure' && files.some(file =>
+    file.kind === 'config' && file.role === 'models'
+      && readConfig(file.candidate, file.format, yq, strict(file)).providers?.['google-antigravity']?.baseUrl === `${gatewayUrl}/google-antigravity`);
   const hasGateway = files.some(file => file.kind === 'config' && marked(harness, file.role, current.get(file.path)));
   const operations = new Map(entries.map(file => [file.index, 'keep']));
   // A seed is a client state file configure writes once (no backup: one field
@@ -2891,6 +3213,7 @@ function main() {
       }
       const value = current.get(file.path);
       const gateway = action === 'configure' ? readConfig(file.candidate, file.format, yq, strict(file)) : value;
+      if (googleConfigured && file.role === 'models') requireGoogleApi(gateway);
       const legacy = !state && marked(harness, file.role, value);
       const baseline = legacy ? recoverBaseline(file, history, harness, yq, strict(file), value) :
         file.restoreSource ? readConfig(file.restoreSource, file.format, yq, strict(file)) : value;
@@ -2911,7 +3234,7 @@ function main() {
           before = { present: true, value: at(value, keys).value.filter(id => !old.members.includes(id)) };
         }
         const after = at(gateway, keys);
-        if (!equal(before, after) || !equal(now, before)) {
+        if (!equal(before, after) || !equal(now, before) || googleConfigured && equal(keys, antigravityEndpointPath)) {
           const field = { path: keys, before, gateway: after };
           // What the file holds right now (a legacy route, or the previous gateway
           // value) is what an interrupted cutover leaves behind; switching
@@ -2925,7 +3248,11 @@ function main() {
           fields.push(field);
         }
       }
-      const parents = previous && (state.mode === 'enabled' || recovering) ? previous.absentParents : absentParents(paths, baseline);
+      const retainParents = previous && (state.mode === 'enabled' || recovering);
+      const priorParents = retainParents ? previous.absentParents : [];
+      const newPaths = retainParents ? paths.filter(keys => !previous.fields.some(field => equal(field.path, keys))) : paths;
+      const parents = [...new Map([...priorParents, ...absentParents(newPaths, baseline)].map(keys => [fieldKey(keys), keys])).values()]
+        .sort((a, b) => b.length - a.length);
       records.push({ path: file.path, kind: file.kind, format: file.format, role: file.role, fields, absentParents: parents });
       // A config that gains no gateway field is left alone (not created, not rewritten).
       if (action === 'configure') operations.set(file.index, !fields.length ? 'keep' : previousState || legacy ? 'managed' : 'write');
@@ -2995,6 +3322,10 @@ function main() {
       if (harness === 'claude-code' && desiredMode === 'enabled') {
         const stray = claudeCredentialKeys.filter(key => claudeLive(expected.env?.[key]));
         if (stray.length) throw new Error(`direct credential env ${stray.join(', ')} in ${file.path} would outrank the gateway; remove it, or configure again so setup owns it (disable restores it)`);
+      }
+      if (harness === 'omp' && desiredMode === 'enabled' && file.role === 'models'
+          && expected.providers?.['google-antigravity']?.baseUrl === `${state.gateway}/google-antigravity`) {
+        requireGoogleApi(expected);
       }
       if (editConfig(file, changes, expected, yq, strict(file))) operations.set(file.index, 'managed');
     }

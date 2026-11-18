@@ -32,7 +32,7 @@ const LINK_STATUSES = new Set(['starting', 'awaiting-browser', 'exchanging', 'do
 const LINK_TERMINAL = new Set(['done', 'failed', 'cancelled']);
 const PROFILE = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 const MODEL_ID = /^[\x21-\x7e]{1,256}$/;
-const PROVIDER_LABELS = { anthropic: 'Anthropic', 'openai-codex': 'OpenAI' };
+const PROVIDER_LABELS = { anthropic: 'Anthropic', 'openai-codex': 'OpenAI', 'google-antigravity': 'Google' };
 const WINDOWS = ['today', '7d', '30d', 'all'];
 
 // Each environment owns its URL and personal key. Access is checked only by
@@ -49,8 +49,9 @@ function environmentId(value) {
 const environmentLabel = environment => ENVIRONMENTS[environment].label;
 // One row per supported client. `providers` are the gateway providers whose
 // models the client can use; `binary` is what the installer requires on PATH.
+// Google Antigravity needs a Cloud Code Assist client, which only OMP ships.
 export const CLIENTS = Object.freeze([
-  { id: 'omp', label: 'OMP', binary: 'omp', providers: ['anthropic', 'openai-codex'] },
+  { id: 'omp', label: 'OMP', binary: 'omp', providers: ['anthropic', 'openai-codex', 'google-antigravity'] },
   { id: 'claude-code', label: 'Claude Code', binary: 'claude', providers: ['anthropic'] },
   { id: 'codex', label: 'Codex', binary: 'codex', providers: ['openai-codex'] },
   { id: 'opencode', label: 'OpenCode', binary: 'opencode', providers: ['anthropic', 'openai-codex'] },
@@ -1200,6 +1201,10 @@ function setupNextStep(cause, client) {
   if (/^(Node\.js|Python|curl|env) .*is required|is required to verify/.test(cause)) return 'install the named prerequisite, then retry';
   if (/^no OMP protocol works/.test(cause)) return 'update OMP, then retry';
   if (/^direct credential env .* would outrank the gateway/.test(cause)) return `remove that setting, or run genesis configure ${client.id} --overwrite so the gateway owns it`;
+  // Google Antigravity: only OMP has the client; OMP's own pause is the user's call.
+  if (/^model \S+ is a Google Antigravity model/.test(cause)) return 'use OMP for Google models: genesis model omp';
+  if (/^model \S+ needs Google Antigravity.* pauses its google-antigravity provider/.test(cause)) return 'opt in to google-antigravity in OMP yourself (auth.unpausedProviders), or pick another model: genesis model omp';
+  if (/^model \S+ needs Google Antigravity/.test(cause)) return 'update OMP, or pick another model: genesis model omp';
   return null;
 }
 async function runSetup(session, client, action, args, withToken) {
@@ -1339,6 +1344,16 @@ export function servedModels(catalog, client) {
   }
   if (models.length === 0) throw new CliError(`the gateway serves no models for ${client.label}`);
   return models;
+}
+// A Google Antigravity model needs OMP's Cloud Code Assist client. Another
+// client asked for one by any of its ids (canonical, request or per-level wire
+// id) is told so by name instead of reading it as unserved; null otherwise.
+export function googleOnly(catalog, client, requested) {
+  if (client.providers.includes('google-antigravity') || !record(catalog) || !Array.isArray(catalog.data)) return null;
+  const card = catalog.data.find(card => record(card) && card.owned_by === 'google-antigravity' && typeof card.id === 'string'
+    && [rawModelId(card.id), card.request_model_id, ...Object.values(record(card.thinking?.effortRouting) ? card.thinking.effortRouting : {})].includes(requested));
+  return card === undefined ? null
+    : `${requested} is a Google Antigravity model, which only OMP can use through Genesis (it needs OMP's Cloud Code Assist client); ${client.label} cannot. Use genesis model omp ${rawModelId(card.id)}`;
 }
 export function renderModels(models, current) {
   return table(['model', 'provider', 'name', ''], models.map(model => [
@@ -1787,14 +1802,17 @@ async function model(session, client, requested, flags) {
   return runAction(`${client.label} Model`, async view => {
     if (view !== null) view.identity = sessionIdentity(session);
     const load = async () => {
-      const models = servedModels(await api(session, 'GET', '/v1/models'), client);
+      const catalog = await api(session, 'GET', '/v1/models');
+      const models = servedModels(catalog, client);
       let current = null;
       try { current = currentModelId(readState((await resolveScope(client, flags.profile)).stateFile, client.id)); } catch { current = null; }
-      return { models, current };
+      return { catalog, models, current };
     };
-    const { models, current } = await (view === null ? load() : runProgress(view, 'Loading models', load));
+    const { catalog, models, current } = await (view === null ? load() : runProgress(view, 'Loading models', load));
     if (requested !== undefined) {
-      if (!models.some(entry => entry.id === requested)) throw new CliError(`model ${requested} is not served for ${client.label}; served models: ${models.map(entry => entry.id).join(', ')}`);
+      if (!models.some(entry => entry.id === requested)) {
+        throw new CliError(googleOnly(catalog, client, requested) ?? `model ${requested} is not served for ${client.label}; served models: ${models.map(entry => entry.id).join(', ')}`);
+      }
       return configure(session, client, { ...flags, model: requested }, view);
     }
     if (view === null) { out(renderModels(models, current)); return true; }
@@ -1895,17 +1913,25 @@ const CLIPBOARD_TOOLS = [['pbcopy', []], ['wl-copy', []], ['xclip', ['-selection
 async function connectGuide(session) {
   const endpoint = new URL(session.endpoint).origin;
   let served = { anthropic: [], 'openai-codex': [] };
+  // Google Antigravity is opt-in and has no SDK route: it is named, with the
+  // per-thinking-level wire ids its Cloud Code Assist route takes, only when served.
+  const google = [];
   try {
     const catalog = await api(session, 'GET', '/v1/models');
     if (record(catalog) && Array.isArray(catalog.data)) {
       for (const card of catalog.data) {
-        if (!record(card) || typeof card.id !== 'string' || !(card.owned_by in served)) continue;
-        served[card.owned_by].push(rawModelId(card.id));
+        if (!record(card) || typeof card.id !== 'string') continue;
+        if (card.owned_by === 'google-antigravity') {
+          const routing = record(card.thinking?.effortRouting) ? card.thinking.effortRouting : {};
+          const levels = Array.isArray(card.thinking?.efforts) ? card.thinking.efforts.map(level => routing[level]).filter(id => typeof id === 'string') : [];
+          google.push(...(levels.length > 0 ? levels : [card.request_model_id ?? rawModelId(card.id)]));
+        } else if (card.owned_by in served) served[card.owned_by].push(rawModelId(card.id));
       }
     }
   } catch { served = null; }
   const models = served === null ? '(catalog unavailable; GET /v1/models lists them)'
-    : `anthropic: ${served.anthropic.join(', ') || 'none'}\n  openai-codex: ${served['openai-codex'].join(', ') || 'none'}`;
+    : `anthropic: ${served.anthropic.join(', ') || 'none'}\n  openai-codex: ${served['openai-codex'].join(', ') || 'none'}${google.length === 0 ? ''
+      : `\n  google-antigravity: ${google.join(', ')}\n    Cloud Code Assist only (OMP's google-antigravity codec): POST /google-antigravity/v1internal:streamGenerateContent?alt=sse with {"model","request"}; Genesis supplies the project`}`;
   const example = served?.anthropic[0] ?? served?.['openai-codex'][0] ?? 'claude-haiku-4-5';
   return `# Genesis API · ${endpoint}
 Account: ${session.name} · ${session.role} · ${session.identityClass ?? 'internal'}
@@ -1996,8 +2022,16 @@ async function setIssuer(session, action, name) {
   done(payload.issuerAccess ? 'Granted' : 'Removed', `Issuer ${payload.issuerAccess ? 'on' : 'from'} ${name} ${glyph.dot} ${environmentLabel(session.environment)}`);
 }
 const SMOKE_PROMPT = 'Reply with exactly: pong';
-const SMOKE_ROUTES = { anthropic: '/anthropic/v1/messages', 'openai-codex': '/openai-codex/v1/responses' };
-const SMOKE_TERMINAL = { anthropic: 'message_stop', 'openai-codex': 'response.completed' };
+const SMOKE_ROUTES = {
+  anthropic: '/anthropic/v1/messages', 'openai-codex': '/openai-codex/v1/responses',
+  'google-antigravity': '/google-antigravity/v1internal:streamGenerateContent?alt=sse',
+};
+// Cloud Code Assist has no terminal event: its last wrapped chunk carries the
+// candidate's finishReason, and only STOP is a completed answer.
+const SMOKE_TERMINAL = { anthropic: 'message_stop', 'openai-codex': 'response.completed', 'google-antigravity': 'STOP' };
+// Google Antigravity is opt-in: smoked whenever the catalog serves it, never
+// reported missing when it does not.
+const SMOKE_OPTIONAL = new Set(['google-antigravity']);
 function smokeSse(text) {
   return String(text).split(/\r?\n\r?\n/).flatMap(block => {
     let event = null;
@@ -2043,7 +2077,8 @@ function smokeModels(catalog) {
   const served = catalog.data.filter(card => record(card) && typeof card.id === 'string');
   if (served.length === 0) throw new CliError('no models are served');
   const count = provider => served.filter(card => card.owned_by === provider).length;
-  return `${served.length} served ${glyph.dot} anthropic ${count('anthropic')} ${glyph.dot} openai-codex ${count('openai-codex')}`;
+  const google = count('google-antigravity');
+  return `${served.length} served ${glyph.dot} anthropic ${count('anthropic')} ${glyph.dot} openai-codex ${count('openai-codex')}${google > 0 ? ` ${glyph.dot} google-antigravity ${google}` : ''}`;
 }
 // A refusal's reason, in either JSON form the doors send ({error: "…"} or
 // {error: {message}}) or a stream's error/response.failed payload; redacted
@@ -2057,12 +2092,26 @@ const smokeReason = (...values) => {
   }
   return null;
 };
+// A wrapped Cloud Code Assist chunk's visible text (thought parts are not the
+// reply), and the usage of the last chunk that reports one.
+function googleText(value) {
+  const parts = value?.response?.candidates?.[0]?.content?.parts;
+  return Array.isArray(parts) ? parts.filter(part => typeof part?.text === 'string' && part.thought !== true).map(part => part.text).join('') : undefined;
+}
+function googleUsage(events) {
+  const usage = events.map(entry => entry.value?.response?.usageMetadata).filter(record).at(-1);
+  const output = [usage?.candidatesTokenCount, usage?.thoughtsTokenCount].filter(Number.isFinite);
+  return { input: usage?.promptTokenCount ?? null, output: Number.isFinite(usage?.candidatesTokenCount) ? output.reduce((sum, value) => sum + value, 0) : null };
+}
 async function smokeCall(session, provider, model) {
   const endpoint = session.endpoint;
   const headers = { Accept: 'text/event-stream', Authorization: `Bearer ${session.token}`, 'Content-Type': 'application/json' };
   const body = provider === 'anthropic'
     ? { model, max_tokens: 8, stream: true, messages: [{ role: 'user', content: SMOKE_PROMPT }] }
-    : { model, stream: true, store: false, instructions: SMOKE_PROMPT, input: [{ role: 'user', content: [{ type: 'input_text', text: SMOKE_PROMPT }] }] };
+    : provider === 'openai-codex'
+      ? { model, stream: true, store: false, instructions: SMOKE_PROMPT, input: [{ role: 'user', content: [{ type: 'input_text', text: SMOKE_PROMPT }] }] }
+      // Stock Cloud Code Assist shape; the gateway binds its own account's project.
+      : { model, project: 'genesis', request: { contents: [{ role: 'user', parts: [{ text: SMOKE_PROMPT }] }], generationConfig: { maxOutputTokens: 1024 } } };
   const deadline = requestDeadline(HTTP_TIMEOUT_MS);
   const started = performance.now();
   let response;
@@ -2078,7 +2127,9 @@ async function smokeCall(session, provider, model) {
     // stream arrives, not the end of the body.
     const textOf = entry => (provider === 'anthropic'
       ? (entry.event === 'content_block_delta' ? entry.value?.delta?.text : undefined)
-      : (entry.event === 'response.output_text.delta' ? entry.value?.delta : undefined));
+      : provider === 'openai-codex'
+        ? (entry.event === 'response.output_text.delta' ? entry.value?.delta : undefined)
+        : googleText(entry.value));
     const isText = entry => typeof textOf(entry) === 'string' && textOf(entry) !== '';
     let text = '';
     let firstAt = null;
@@ -2093,24 +2144,34 @@ async function smokeCall(session, provider, model) {
     const events = smokeSse(text);
     let errorBody = null;
     try { errorBody = JSON.parse(text || '{}'); } catch { errorBody = null; }
-    const failure = events.find(entry => entry.event === 'error' || entry.event === 'response.failed')?.value;
+    const failure = events.find(entry => entry.event === 'error' || entry.event === 'response.failed'
+      || (provider === 'google-antigravity' && record(entry.value?.error)))?.value;
     const reason = smokeReason(errorBody, failure, failure?.response);
     if (!response.ok) throw new CliError(`HTTP ${response.status}: ${reason ?? 'request failed'}`);
-    const terminalEvent = events.at(-1)?.event;
+    const lastValue = events.at(-1)?.value;
+    let terminalEvent = events.at(-1)?.event;
+    if (provider === 'google-antigravity') {
+      // An in-band error is a failed call even when a chunk before it finished.
+      if (failure !== undefined) throw new CliError(`stream reported an error${reason === null ? '' : `: ${reason}`}`);
+      const blocked = lastValue?.response?.promptFeedback?.blockReason;
+      terminalEvent = lastValue?.response?.candidates?.[0]?.finishReason
+        ?? (typeof blocked === 'string' ? `blocked prompt (${blocked})` : events.length > 0 ? 'no finish reason' : undefined);
+    }
     if (terminalEvent !== SMOKE_TERMINAL[provider]) {
       throw new CliError(`stream ended with ${terminalEvent ?? 'no event'}, not ${SMOKE_TERMINAL[provider]}${reason === null ? '' : `: ${reason}`}`);
     }
     const reply = events.map(entry => (typeof textOf(entry) === 'string' ? textOf(entry) : '')).join('');
-    const lastValue = events.at(-1)?.value;
     const usage = provider === 'anthropic'
       ? {
         input: events.find(entry => entry.event === 'message_start')?.value?.message?.usage?.input_tokens ?? null,
         output: events.find(entry => entry.event === 'message_delta')?.value?.usage?.output_tokens ?? null,
       }
-      : {
-        input: lastValue?.response?.usage?.input_tokens ?? null,
-        output: lastValue?.response?.usage?.output_tokens ?? null,
-      };
+      : provider === 'openai-codex'
+        ? {
+          input: lastValue?.response?.usage?.input_tokens ?? null,
+          output: lastValue?.response?.usage?.output_tokens ?? null,
+        }
+        : googleUsage(events);
     if (provider === 'openai-codex' && lastValue?.response?.status !== 'completed') throw new CliError('response.completed did not report completed');
     const total = performance.now() - started;
     const first = firstAt === null ? null : firstAt - started;
@@ -2123,9 +2184,10 @@ async function smokeCall(session, provider, model) {
 }
 const smokeSeconds = value => value === null ? '—' : `${(value / 1000).toFixed(1)}s`;
 const smokeTokens = value => Number.isFinite(value) ? String(value) : '—';
-// Health, login, the catalog, then one real streamed call per provider. A
-// provider the catalog does not serve is a failed check, never a missing
-// one: an all-green smoke always made both calls.
+// Health, login, the catalog, then one real streamed call per provider. An
+// unserved Anthropic or OpenAI is a failed check, never a missing one: an
+// all-green smoke always made both calls. Google Antigravity is opt-in: it is
+// called whenever the catalog serves it and must end in its real STOP.
 async function smoke(session, flags, view = null) {
   const execute = async () => {
     const checks = [];
@@ -2157,6 +2219,7 @@ async function smoke(session, flags, view = null) {
     }, value => value);
     for (const provider of Object.keys(SMOKE_ROUTES)) {
       const model = models.ok ? smokeModel(catalog, provider) : null;
+      if (model === null && SMOKE_OPTIONAL.has(provider)) continue;
       await add(provider, () => {
         if (model === null) throw new CliError(models.ok ? 'no served model' : 'no model catalog');
         return smokeCall(session, provider, model);
@@ -2178,8 +2241,8 @@ async function smoke(session, flags, view = null) {
 // this process serves one page on 127.0.0.1 that picks the provider and
 // worker, starts the link, shows the authorization URL or device code and
 // reflects the link as it settles; it relays the browser's callback
-// (Anthropic) and reports every settled link in the terminal. It never opens
-// a browser: the user opens the printed URL in one of their choice, and
+// (Anthropic, Google) and reports every settled link in the terminal. It never
+// opens a browser: the user opens the printed URL in one of their choice, and
 // nothing starts without a click on the page.
 function validateLink(value) {
   if (!record(value) || typeof value.attemptId !== 'string' || !ATTEMPT_ID.test(value.attemptId)
@@ -2225,17 +2288,27 @@ function listen(server, host, port) {
     server.listen(port, host, () => { server.off('error', reject); resolve(); });
   });
 }
-// Anthropic redirects the browser to http://localhost:<port>/callback; the
-// worker's authorization URL names the port and a 32-hex state. The code is
-// forwarded to link/input once; the servers close after that answer is sent.
-// A request line the handler cannot parse gets the failure page; anything
-// else that goes wrong in it is reported, never thrown at the server.
-async function anthropicCallback(session, link, onLink, onError) {
+// Where each relayed provider redirects the browser: Anthropic to
+// http://localhost:<port>/callback, Google Antigravity to
+// http://127.0.0.1:<port>/oauth-callback. The worker's authorization URL names
+// the port and a 32-hex state. The code is forwarded to link/input once; the
+// servers close after that answer is sent. A request line the handler cannot
+// parse gets the failure page; anything else that goes wrong in it is
+// reported, never thrown at the server.
+const LINK_CALLBACKS = {
+  anthropic: { hostname: 'localhost', path: '/callback' },
+  'google-antigravity': { hostname: '127.0.0.1', path: '/oauth-callback' },
+};
+async function linkCallback(session, link, onLink, onError) {
+  const rule = LINK_CALLBACKS[link.provider];
+  const label = PROVIDER_LABELS[link.provider] ?? link.provider;
   const authorize = new URL(link.url);
   const redirect = authorize.searchParams.get('redirect_uri');
   const expectedState = authorize.searchParams.get('state');
-  if (redirect === null || expectedState === null || !/^[0-9a-f]{32}$/.test(expectedState)) throw new CliError('the worker returned an invalid Anthropic authorization URL');
-  const callbackUrl = new URL(redirect);
+  let callbackUrl = null;
+  try { callbackUrl = redirect === null ? null : new URL(redirect); } catch { callbackUrl = null; }
+  if (callbackUrl === null || callbackUrl.protocol !== 'http:' || callbackUrl.hostname !== rule.hostname || callbackUrl.pathname !== rule.path
+    || expectedState === null || !/^[0-9a-f]{32}$/.test(expectedState)) throw new CliError(`the worker returned an invalid ${label} authorization URL`);
   const port = Number(callbackUrl.port || 80);
   const servers = [];
   let consumed = false;
@@ -2245,7 +2318,7 @@ async function anthropicCallback(session, link, onLink, onError) {
     try { callback = new URL(req.url ?? '/', callbackUrl.origin); } catch { /* the failure page */ }
     const local = ['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(req.socket.remoteAddress);
     let page = callbackPage(false);
-    if (callback !== null && req.method === 'GET' && local && callback.pathname === '/callback' && callback.searchParams.get('state') === expectedState
+    if (callback !== null && req.method === 'GET' && local && callback.pathname === rule.path && callback.searchParams.get('state') === expectedState
       && callback.searchParams.get('code') !== null && !consumed) {
       consumed = true;
       try { onLink(validateLink(await api(session, 'POST', '/admin/api/cli/link/input', linkBody(link, { input: callback.toString() })))); page = callbackPage(true); }
@@ -2258,12 +2331,15 @@ async function anthropicCallback(session, link, onLink, onError) {
   const ipv4 = serve();
   try { await listen(ipv4, '127.0.0.1', port); } catch (error) {
     ipv4.close();
-    if (error?.code === 'EADDRINUSE' || error?.code === 'EACCES') throw new CliError(`port ${port} on 127.0.0.1 is ${error.code === 'EACCES' ? 'not permitted' : 'in use'}; the Anthropic callback needs it, so free it and try again`);
+    if (error?.code === 'EADDRINUSE' || error?.code === 'EACCES') throw new CliError(`port ${port} on 127.0.0.1 is ${error.code === 'EACCES' ? 'not permitted' : 'in use'}; the ${label} callback needs it, so free it and try again`);
     throw error;
   }
   servers.push(ipv4);
-  const ipv6 = serve();
-  try { await listen(ipv6, '::1', port); servers.push(ipv6); } catch { ipv6.close(); }
+  // A localhost redirect may resolve to ::1 in the browser; 127.0.0.1 never does.
+  if (rule.hostname === 'localhost') {
+    const ipv6 = serve();
+    try { await listen(ipv6, '::1', port); servers.push(ipv6); } catch { ipv6.close(); }
+  }
   return close;
 }
 // The page: the signed-in identity, the current connections, the provider and
@@ -2456,7 +2532,7 @@ async function addConnection(session, flags, view = null) {
   const busy = () => link !== null && !LINK_TERMINAL.has(link.status);
   // Every link answer lands here. A status change is reported in the
   // terminal (a settled link as Connected or a failure, otherwise the new
-  // state) and a settled link releases Anthropic's callback port.
+  // state) and a settled link releases its callback port.
   const settle = next => {
     const changed = link === null || next.attemptId !== link.attemptId || next.status !== link.status;
     link = next;
@@ -2486,12 +2562,12 @@ async function addConnection(session, flags, view = null) {
     await cancelling;
     return link;
   };
-  // Anthropic's callback port is bound before the URL leaves this process,
-  // so a browser can never race an unbound port; when it cannot be bound the
-  // link is cancelled and kept without its URL.
+  // A relayed provider's callback port is bound before the URL leaves this
+  // process, so a browser can never race an unbound port; when it cannot be
+  // bound the link is cancelled and kept without its URL.
   const bindCallback = async () => {
-    if (closing || !busy() || link.provider !== 'anthropic' || link.url === null || closeCallback !== null) return;
-    try { closeCallback = await anthropicCallback(session, link, adopt, text => report(text, true)); }
+    if (closing || !busy() || !Object.hasOwn(LINK_CALLBACKS, link.provider) || link.url === null || closeCallback !== null) return;
+    try { closeCallback = await linkCallback(session, link, adopt, text => report(text, true)); }
     catch (error) { await cancel(); settle({ ...link, url: null, error: error.message }); throw error; }
   };
   const refresh = async () => {
@@ -3185,7 +3261,7 @@ const HELP = `Usage: genesis [command] [options]
   --version | --help
 
 Environment override: --environment prod | staging (does not change the saved selection)
-Clients: ${CLIENTS.map(client => client.id).join(', ')}
+Clients: ${CLIENTS.map(client => client.id).join(', ')} (Google Antigravity models: omp only)
 Exit codes: 0 ok, 1 failure, 2 usage`;
 const VALUE_FLAGS = new Set(['environment', 'url', 'model', 'profile', 'provider', 'worker', 'port', 'period', 'monthly', 'limit']);
 const SWITCH_FLAGS = new Set(['overwrite', 'yes', 'version', 'help', 'update', 'json', 'copy']);
