@@ -32,7 +32,7 @@ const LINK_STATUSES = new Set(['starting', 'awaiting-browser', 'exchanging', 'do
 const LINK_TERMINAL = new Set(['done', 'failed', 'cancelled']);
 const PROFILE = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 const MODEL_ID = /^[\x21-\x7e]{1,256}$/;
-const PROVIDER_LABELS = { anthropic: 'Anthropic', 'openai-codex': 'OpenAI', 'google-antigravity': 'Google' };
+const PROVIDER_LABELS = { anthropic: 'Anthropic', 'openai-codex': 'OpenAI', 'google-antigravity': 'Gemini' };
 const WINDOWS = ['today', '7d', '30d', 'all'];
 
 // Each environment owns its URL and personal key. Access is checked only by
@@ -2241,20 +2241,52 @@ async function smoke(session, flags, view = null) {
 // this process serves one page on 127.0.0.1 that picks the provider and
 // worker, starts the link, shows the authorization URL or device code and
 // reflects the link as it settles; it relays the browser's callback
-// (Anthropic, Google) and reports every settled link in the terminal. It never
+// (Anthropic, Gemini) or the address or code pasted on the page, one answer
+// per attempt, and reports every settled link in the terminal. It never
 // opens a browser: the user opens the printed URL in one of their choice, and
-// nothing starts without a click on the page.
+// nothing starts without a click on the page. A link takes a pasted answer
+// when the gateway says so (acceptsInput); from a gateway that does not say,
+// exactly when this process relays its provider's callback, since both
+// answers reach the worker through the same link/input.
 function validateLink(value) {
   if (!record(value) || typeof value.attemptId !== 'string' || !ATTEMPT_ID.test(value.attemptId)
     || typeof value.provider !== 'string' || typeof value.workerId !== 'string' || !LINK_STATUSES.has(value.status)
     || (value.url !== null && (typeof value.url !== 'string' || !value.url.startsWith('https://')))
     || (value.userCode !== null && typeof value.userCode !== 'string')
+    || (value.acceptsInput !== undefined && typeof value.acceptsInput !== 'boolean')
     || (value.error !== null && typeof value.error !== 'string')) {
     throw new CliError('the gateway returned an invalid OAuth link');
   }
-  return { attemptId: value.attemptId, provider: value.provider, workerId: value.workerId, status: value.status, url: value.url, userCode: value.userCode, error: value.error };
+  return {
+    attemptId: value.attemptId, provider: value.provider, workerId: value.workerId, status: value.status, url: value.url, userCode: value.userCode,
+    acceptsInput: value.acceptsInput ?? Object.hasOwn(LINK_CALLBACKS, value.provider), error: value.error,
+  };
 }
 const linkBody = (link, extra = {}) => ({ workerId: link.workerId, attemptId: link.attemptId, provider: link.provider, ...extra });
+// A pasted answer, read the way the login core reads it (parseCallbackInput,
+// OMP auth core): a redirect URL, a query string with code=, or a raw code
+// with an optional #state. It must carry a code, and a state it carries must
+// be the authorization URL's; the core would otherwise quietly ask again and
+// the attempt would wait out its timeout. Returns the code. A refusal never
+// quotes the text, only the error a provider put in its redirect.
+function authorizationCode(link, input) {
+  if (input.length < 1 || input.length > 4096 || /[\u0000-\u001f\u007f\s]/.test(input)) {
+    throw new HttpError(400, 'paste one address or code: 1-4096 characters without spaces');
+  }
+  let params = null;
+  try { params = new URL(input).searchParams; } catch { if (input.includes('code=')) params = new URLSearchParams(input.replace(/^[?#]/, '')); }
+  const [code, state] = params === null ? input.split('#', 2) : [params.get('code'), params.get('state')];
+  if (!code) {
+    const error = params?.get('error');
+    throw new HttpError(400, error
+      ? `${PROVIDER_LABELS[link.provider] ?? link.provider} refused the sign-in (${error.replace(/[^\x20-\x7e]/g, '?').slice(0, 100)}); open the link and sign in again`
+      : 'that holds no authorization code; paste the whole address the browser landed on, or the code the page shows');
+  }
+  let expected = null;
+  try { expected = new URL(link.url).searchParams.get('state'); } catch { /* no URL, no state to match */ }
+  if (state && expected && state !== expected) throw new HttpError(400, 'this is from an earlier sign-in; open the current link again and paste what it ends on');
+  return code;
+}
 // Every local response is uncacheable and sized; JSON passes through redact()
 // like the terminal does, since a gateway error may quote the key.
 function send(res, status, type, body, sent) {
@@ -2289,17 +2321,19 @@ function listen(server, host, port) {
   });
 }
 // Where each relayed provider redirects the browser: Anthropic to
-// http://localhost:<port>/callback, Google Antigravity to
+// http://localhost:<port>/callback, Gemini (Google Antigravity) to
 // http://127.0.0.1:<port>/oauth-callback. The worker's authorization URL names
-// the port and a 32-hex state. The code is forwarded to link/input once; the
-// servers close after that answer is sent. A request line the handler cannot
+// the port and a 32-hex state. A callback with that state and a code is
+// offered to the attempt's one answer (addConnection's claim): once this
+// callback has claimed it, the servers close after its page is sent; any
+// other request gets the failure page. A request line the handler cannot
 // parse gets the failure page; anything else that goes wrong in it is
 // reported, never thrown at the server.
 const LINK_CALLBACKS = {
   anthropic: { hostname: 'localhost', path: '/callback' },
   'google-antigravity': { hostname: '127.0.0.1', path: '/oauth-callback' },
 };
-async function linkCallback(session, link, onLink, onError) {
+async function linkCallback(link, claim, onError) {
   const rule = LINK_CALLBACKS[link.provider];
   const label = PROVIDER_LABELS[link.provider] ?? link.provider;
   const authorize = new URL(link.url);
@@ -2319,10 +2353,13 @@ async function linkCallback(session, link, onLink, onError) {
     const local = ['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(req.socket.remoteAddress);
     let page = callbackPage(false);
     if (callback !== null && req.method === 'GET' && local && callback.pathname === rule.path && callback.searchParams.get('state') === expectedState
-      && callback.searchParams.get('code') !== null && !consumed) {
-      consumed = true;
-      try { onLink(validateLink(await api(session, 'POST', '/admin/api/cli/link/input', linkBody(link, { input: callback.toString() })))); page = callbackPage(true); }
-      catch (error) { onError(error.message); }
+      && callback.searchParams.get('code') !== null) {
+      let forward = null;
+      try { forward = claim(callback.toString()); } catch { /* answered already or no longer waiting: the failure page */ }
+      if (forward !== null) {
+        consumed = true;
+        try { await forward(); page = callbackPage(true); } catch { /* reported where it was sent */ }
+      }
     }
     res.setHeader('Connection', 'close');
     send(res, page.status, 'text/html', page.body, () => { if (consumed) close(); });
@@ -2344,8 +2381,9 @@ async function linkCallback(session, link, onLink, onError) {
 }
 // The page: the signed-in identity, the current connections, the provider and
 // worker picks, one link at a time with its Open provider link or device code
-// (copied with one click), and the state poll every LINK_POLL_MS. Every
-// /api/* request carries the per-process nonce in X-S99-Local.
+// (copied with one click) and, while a link that takes one waits for it, a
+// field for the address or code its sign-in ends on; and the state poll every
+// LINK_POLL_MS. Every /api/* request carries the per-process nonce in X-S99-Local.
 function launcherPage(session, nonce, preset) {
   return redact(`<!doctype html>
 <meta charset="utf-8">
@@ -2354,11 +2392,12 @@ function launcherPage(session, nonce, preset) {
 <style>
   :root { color-scheme: dark; }
   body { background:#101014; color:#d6d6dc; font:14px/1.6 ui-monospace,monospace; margin:2rem auto; max-width:64rem; padding:0 1rem; }
-  button,select { background:#17171d; color:#d6d6dc; border:1px solid #33465e; padding:.35rem .6rem; font:inherit; }
+  button,select,input { background:#17171d; color:#d6d6dc; border:1px solid #33465e; padding:.35rem .6rem; font:inherit; }
   a { color:#9ecfff; } .muted { color:#7a7a85; } .bad { color:#f0917f; }
   ul { list-style:none; padding:0; } li { border-top:1px solid #24242d; padding:.4rem 0; }
   #authCodeRow { margin:.5rem 0; }
   #authCode { cursor:pointer; user-select:all; overflow-wrap:anywhere; }
+  #answer { margin:.5rem 0; } #answerInput { width:min(40rem, 100%); }
 </style>
 <div id="session" class="muted"></div>
 <ul id="connections"></ul>
@@ -2372,6 +2411,11 @@ function launcherPage(session, nonce, preset) {
   <button id="copyCode" type="button">Copy</button>
   <span id="copyStatus" role="status"></span>
 </div>
+<form id="answer" hidden>
+  <label for="answerInput">Address or code</label>
+  <input id="answerInput" autocomplete="off" spellcheck="false" autocapitalize="off">
+  <button id="answerSubmit" type="submit">Submit</button>
+</form>
 <div id="error" class="bad" role="alert"></div>
 <script>
 const localNonce = ${inline(nonce)};
@@ -2394,6 +2438,7 @@ let provisioning = null;
 let link = null;
 let wantedWorker = null;
 let refreshFailed = false;
+let answering = false;
 const busy = () => link !== null && !['done', 'failed', 'cancelled'].includes(link.status);
 function paintLink() {
   const target = $('#link');
@@ -2407,6 +2452,10 @@ function paintLink() {
   const codeButton = $('#authCode');
   $('#authCodeRow').hidden = !code;
   if (codeButton.textContent !== code) { codeButton.textContent = code; $('#copyStatus').textContent = ''; }
+  const answerable = busy() && link.acceptsInput === true && link.status === 'awaiting-browser' && !link.answered;
+  $('#answer').hidden = !answerable;
+  $('#answerInput').disabled = answering;
+  $('#answerSubmit').disabled = answering;
   $('#cancel').disabled = !busy();
 }
 async function copyAuthCode() {
@@ -2488,6 +2537,18 @@ $('#cancel').onclick = () => {
   $('#cancel').disabled = true;
   api('/api/link/cancel', {}).then(result => { link = result.link; paintDestination(); }).catch(paintError);
 };
+$('#answer').onsubmit = event => {
+  event.preventDefault();
+  const field = $('#answerInput');
+  const input = field.value;
+  field.value = '';
+  if (link === null || answering) return;
+  clearError();
+  answering = true;
+  paintLink();
+  api('/api/link/input', { attemptId: link.attemptId, input }).then(result => { link = result.link; }, paintError)
+    .finally(() => { answering = false; paintDestination(); });
+};
 refresh();
 </script>`);
 }
@@ -2562,12 +2623,53 @@ async function addConnection(session, flags, view = null) {
     await cancelling;
     return link;
   };
+  // One answer per attempt, pasted on the page or relayed from a provider's
+  // callback. claim() refuses all but a well-formed answer for the link now
+  // waiting for one, so a stale page or callback never reaches a later
+  // attempt; it then closes the gate for that attempt before anything is
+  // sent, never to reopen it whatever the outcome, and returns the send. A
+  // pasted answer releases the callback port, which has nothing left to wait
+  // for (a relayed one closes it once its page is sent). The text goes to
+  // link/input exactly as given, trimmed, and nowhere else: an error that
+  // quotes it names <code> instead.
+  const answered = new Set();
+  const forward = async (target, input, code) => {
+    const secrets = [...new Set([input, code, encodeURIComponent(code)])].sort((left, right) => right.length - left.length);
+    const hide = text => secrets.reduce((value, secret) => value.split(secret).join('<code>'), String(text));
+    let next;
+    try { next = validateLink(await api(session, 'POST', '/admin/api/cli/link/input', linkBody(target, { input }))); }
+    catch (error) {
+      const message = hide(error?.message ?? error);
+      report(`${PROVIDER_LABELS[target.provider] ?? target.provider} ${glyph.dot} ${target.workerId} ${glyph.dot} answer failed: ${message}`, true);
+      throw error instanceof HttpError ? new HttpError(error.status, message) : new CliError(message);
+    }
+    adopt(next.error === null ? next : { ...next, error: hide(next.error) });
+    return link;
+  };
+  const claim = (attemptId, text, relayed) => {
+    if (closing) throw new HttpError(503, 'shutting down');
+    if (link === null) throw new HttpError(409, 'no sign-in is in progress; start one first');
+    if (attemptId !== link.attemptId) throw new HttpError(409, 'that sign-in is no longer the current one; use the current link');
+    if (cancelling !== null || link.status !== 'awaiting-browser') throw new HttpError(409, `this sign-in is ${cancelling !== null ? 'being cancelled' : link.status} and takes no code now`);
+    if (!relayed && link.acceptsInput !== true) throw new HttpError(409, `${PROVIDER_LABELS[link.provider] ?? link.provider} sign-in takes no pasted code`);
+    if (answered.has(attemptId)) throw new HttpError(409, 'this sign-in has its answer already; start a new one if it does not finish');
+    const input = text.trim();
+    const code = authorizationCode(link, input);
+    const target = link;
+    answered.add(attemptId);
+    if (!relayed && closeCallback !== null) { closeCallback(); closeCallback = null; }
+    return () => forward(target, input, code);
+  };
+  // What the page sees of a link: whether its answer was sent, never what.
+  const pageLink = value => (value === null ? null : { ...value, answered: answered.has(value.attemptId) });
   // A relayed provider's callback port is bound before the URL leaves this
   // process, so a browser can never race an unbound port; when it cannot be
-  // bound the link is cancelled and kept without its URL.
+  // bound the link is cancelled and kept without its URL. An answered attempt
+  // needs no port.
   const bindCallback = async () => {
-    if (closing || !busy() || !Object.hasOwn(LINK_CALLBACKS, link.provider) || link.url === null || closeCallback !== null) return;
-    try { closeCallback = await linkCallback(session, link, adopt, text => report(text, true)); }
+    if (closing || !busy() || !Object.hasOwn(LINK_CALLBACKS, link.provider) || link.url === null || closeCallback !== null || answered.has(link.attemptId)) return;
+    const { attemptId } = link;
+    try { closeCallback = await linkCallback(link, text => claim(attemptId, text, true), text => report(text, true)); }
     catch (error) { await cancel(); settle({ ...link, url: null, error: error.message }); throw error; }
   };
   const refresh = async () => {
@@ -2622,17 +2724,26 @@ async function addConnection(session, flags, view = null) {
     if (req.method === 'GET' && url.pathname === '/') { send(res, 200, 'text/html', page); return; }
     if (req.method === 'GET' && url.pathname === '/api/state') {
       const [workers, connections] = await Promise.all([api(session, 'GET', '/admin/api/cli/workers'), api(session, 'GET', '/admin/api/cli/connections'), refresh()]);
-      sendJson(res, 200, { workers, connections, link });
+      sendJson(res, 200, { workers, connections, link: pageLink(link) });
       return;
     }
     if (req.method === 'POST' && url.pathname === '/api/link/start') {
       const body = JSON.parse(await readBody(req));
       if (!record(body) || typeof body.provider !== 'string' || (body.workerId !== null && typeof body.workerId !== 'string')) throw new CliError('invalid link request');
       const result = await start(body.provider, body.workerId);
-      sendJson(res, result.provisioning ? 202 : 200, result);
+      sendJson(res, result.provisioning ? 202 : 200, { ...result, link: pageLink(result.link) });
       return;
     }
-    if (req.method === 'POST' && url.pathname === '/api/link/cancel') { await readBody(req); sendJson(res, 200, { link: await cancel() }); return; }
+    // A malformed body is refused without quoting it back.
+    if (req.method === 'POST' && url.pathname === '/api/link/input') {
+      let body;
+      try { body = JSON.parse(await readBody(req)); } catch (error) { throw error instanceof CliError ? error : new CliError('invalid input request'); }
+      if (!record(body) || typeof body.attemptId !== 'string' || typeof body.input !== 'string') throw new CliError('invalid input request');
+      const answer = claim(body.attemptId, body.input, false);
+      sendJson(res, 200, { link: pageLink(await answer()) });
+      return;
+    }
+    if (req.method === 'POST' && url.pathname === '/api/link/cancel') { await readBody(req); sendJson(res, 200, { link: pageLink(await cancel()) }); return; }
     sendJson(res, 404, { error: 'not found' });
   };
   server.on('request', (req, res) => { serve(req, res).catch(error => sendJson(res, error instanceof HttpError ? error.status : 400, { error: String(error?.message ?? error) })); });
