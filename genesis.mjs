@@ -470,6 +470,8 @@ function closeTerminal() {
   terminal = null;
 }
 function readChunk() {
+  const signal = workContext.getStore()?.signal;
+  signal?.throwIfAborted();
   const { input } = tty();
   input.setRawMode(true);
   terminal.raw = true;
@@ -479,13 +481,16 @@ function readChunk() {
       input.off('data', data);
       input.off('end', interrupt);
       for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.off(signal, interrupt);
+      signal?.removeEventListener('abort', aborted);
       restoreTerminal();
     };
     const data = chunk => { cleanup(); resolve(chunk.toString('utf8')); };
     const interrupt = () => { cleanup(); reject(new Interrupt()); };
+    const aborted = () => { cleanup(); reject(signal.reason); };
     input.once('data', data);
     input.once('end', interrupt);
     for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(signal, interrupt);
+    signal?.addEventListener('abort', aborted, { once: true });
   });
 }
 const PROMPT_CANCEL = Symbol('prompt cancel');
@@ -546,15 +551,21 @@ async function ask(label, validate, summaryLabel = label, fallback = null, cance
     term(`${tint('33', '!')} ${result.error}\n`);
   }
 }
-async function secret(label, summaryLabel) {
+// secret(label): one hidden line, never echoed, judged by `validate` as
+// ask() judges its line and summarized as received. A cancellable prompt
+// returns PROMPT_CANCEL on Escape.
+const oneWord = line => (/\s/.test(line) ? { error: 'a key is one word with no spaces' } : { value: line });
+async function secret(label, summaryLabel, validate = oneWord, cancellable = false) {
   for (;;) {
     term(`${tint('36', '?')} ${tint('1', label)} ${tint('2', '(hidden)')} ${glyph.step} `);
-    const line = await readLine(true);
+    const line = await readLine(true, cancellable);
+    if (line === PROMPT_CANCEL) return PROMPT_CANCEL;
     if (line === '') { term(`${tint('33', '!')} nothing was entered\n`); continue; }
-    if (/\s/.test(line)) { term(`${tint('33', '!')} a key is one word with no spaces\n`); continue; }
+    const result = validate(line);
+    if (result.error !== undefined) { term(`${tint('33', '!')} ${result.error}\n`); continue; }
     if (ansi()) term('\x1b[1A\x1b[J');
     summary(summaryLabel, 'received');
-    return line;
+    return result.value;
   }
 }
 async function confirm(question, defaultYes = false) {
@@ -2241,13 +2252,17 @@ async function smoke(session, flags, view = null) {
 // this process serves one page on 127.0.0.1 that picks the provider and
 // worker, starts the link, shows the authorization URL or device code and
 // reflects the link as it settles; it relays the browser's callback
-// (Anthropic, Gemini) or the address or code pasted on the page, one answer
-// per attempt, and reports every settled link in the terminal. It never
-// opens a browser: the user opens the printed URL in one of their choice, and
-// nothing starts without a click on the page. A link takes a pasted answer
+// (Anthropic) or the address or code pasted on the page, one answer per
+// attempt, and reports every settled link in the terminal. It never opens a
+// browser: the user opens the printed URL in one of their choice, and
+// nothing starts without a click on the page. Gemini never uses the page:
+// it signs in in this terminal (terminalLink). A link takes a pasted answer
 // when the gateway says so (acceptsInput); from a gateway that does not say,
-// exactly when this process relays its provider's callback, since both
-// answers reach the worker through the same link/input.
+// exactly when this process relays its provider's callback or its provider
+// signs in in the terminal, since every answer reaches the worker through
+// the same link/input.
+// Gemini (Google Antigravity) signs in here: its hosted page shows a code.
+const TERMINAL_LINKS = new Set(['google-antigravity']);
 function validateLink(value) {
   if (!record(value) || typeof value.attemptId !== 'string' || !ATTEMPT_ID.test(value.attemptId)
     || typeof value.provider !== 'string' || typeof value.workerId !== 'string' || !LINK_STATUSES.has(value.status)
@@ -2259,34 +2274,48 @@ function validateLink(value) {
   }
   return {
     attemptId: value.attemptId, provider: value.provider, workerId: value.workerId, status: value.status, url: value.url, userCode: value.userCode,
-    acceptsInput: value.acceptsInput ?? Object.hasOwn(LINK_CALLBACKS, value.provider), error: value.error,
+    acceptsInput: value.acceptsInput ?? (Object.hasOwn(LINK_CALLBACKS, value.provider) || TERMINAL_LINKS.has(value.provider)), error: value.error,
   };
 }
 const linkBody = (link, extra = {}) => ({ workerId: link.workerId, attemptId: link.attemptId, provider: link.provider, ...extra });
-// A pasted answer, read the way the login core reads it (parseCallbackInput,
-// OMP auth core): a redirect URL, a query string with code=, or a raw code
-// with an optional #state. It must carry a code, and a state it carries must
-// be the authorization URL's; the core would otherwise quietly ask again and
-// the attempt would wait out its timeout. Returns the code. A refusal never
-// quotes the text, only the error a provider put in its redirect.
+// A raw code may include #state. Redirect URLs and query strings must carry
+// the current state; a full URL must also match this attempt's callback.
+// Validation never quotes any part of the pasted answer.
 function authorizationCode(link, input) {
   if (input.length < 1 || input.length > 4096 || /[\u0000-\u001f\u007f\s]/.test(input)) {
     throw new HttpError(400, 'paste one address or code: 1-4096 characters without spaces');
   }
-  let params = null;
-  try { params = new URL(input).searchParams; } catch { if (input.includes('code=')) params = new URLSearchParams(input.replace(/^[?#]/, '')); }
+  let params = null, callback = null;
+  try { callback = new URL(input); params = callback.searchParams; }
+  catch { if (input.includes('code=')) params = new URLSearchParams(input.replace(/^[?#]/, '')); }
   const [code, state] = params === null ? input.split('#', 2) : [params.get('code'), params.get('state')];
   if (!code) {
-    const error = params?.get('error');
-    throw new HttpError(400, error
-      ? `${PROVIDER_LABELS[link.provider] ?? link.provider} refused the sign-in (${error.replace(/[^\x20-\x7e]/g, '?').slice(0, 100)}); open the link and sign in again`
-      : 'that holds no authorization code; paste the whole address the browser landed on, or the code the page shows');
+    throw new HttpError(400, params?.has('error')
+      ? 'the provider refused the sign-in; open the link and sign in again'
+      : 'that holds no authorization code; paste the code the page shows, or the whole address the browser landed on');
   }
-  let expected = null;
-  try { expected = new URL(link.url).searchParams.get('state'); } catch { /* no URL, no state to match */ }
-  if (state && expected && state !== expected) throw new HttpError(400, 'this is from an earlier sign-in; open the current link again and paste what it ends on');
+  let authorize = null;
+  try { authorize = new URL(link.url); } catch { /* no URL, no state to match */ }
+  const expected = authorize?.searchParams.get('state');
+  if ((params !== null && (!expected || !state)) || (state && state !== expected)) {
+    throw new HttpError(400, 'this is from an earlier sign-in; open the current link again and paste what it ends on');
+  }
+  if (callback !== null) {
+    let redirect = null;
+    try { redirect = new URL(authorize?.searchParams.get('redirect_uri')); } catch { /* no callback to match */ }
+    if (redirect === null || callback.origin !== redirect.origin || callback.pathname !== redirect.pathname
+      || callback.username || callback.password) {
+      throw new HttpError(400, 'this is not the current callback address; paste the code the page shows');
+    }
+  }
   return code;
 }
+// An answer is never quoted back: an error that quotes its text or its code
+// names <code> instead.
+const answerHider = (input, code) => {
+  const hidden = [...new Set([input, code, encodeURIComponent(code)])].sort((left, right) => right.length - left.length);
+  return text => hidden.reduce((value, secret) => value.split(secret).join('<code>'), String(text));
+};
 // Every local response is uncacheable and sized; JSON passes through redact()
 // like the terminal does, since a gateway error may quote the key.
 function send(res, status, type, body, sent) {
@@ -2320,9 +2349,8 @@ function listen(server, host, port) {
     server.listen(port, host, () => { server.off('error', reject); resolve(); });
   });
 }
-// Where each relayed provider redirects the browser: Anthropic to
-// http://localhost:<port>/callback, Gemini (Google Antigravity) to
-// http://127.0.0.1:<port>/oauth-callback. The worker's authorization URL names
+// Where a relayed provider redirects the browser: Anthropic to
+// http://localhost:<port>/callback. The worker's authorization URL names
 // the port and a 32-hex state. A callback with that state and a code is
 // offered to the attempt's one answer (addConnection's claim): once this
 // callback has claimed it, the servers close after its page is sent; any
@@ -2331,7 +2359,6 @@ function listen(server, host, port) {
 // reported, never thrown at the server.
 const LINK_CALLBACKS = {
   anthropic: { hostname: 'localhost', path: '/callback' },
-  'google-antigravity': { hostname: '127.0.0.1', path: '/oauth-callback' },
 };
 async function linkCallback(link, claim, onError) {
   const rule = LINK_CALLBACKS[link.provider];
@@ -2552,9 +2579,113 @@ $('#answer').onsubmit = event => {
 refresh();
 </script>`);
 }
+// Gemini (Google Antigravity) signs in in this terminal, as its own CLI does:
+// the worker's authorization URL is printed whole on a line of its own, the
+// hosted page Google returns to shows a one-time code, and that code (or the
+// address the page was opened at) is pasted at a hidden prompt. It must
+// belong to this attempt (authorizationCode); it is sent to the attempt once
+// and never printed or kept, and Connected waits for the worker's done.
+// Every call names this attempt on the gateway it was started on. An attempt
+// that has not settled is cancelled once: behind the menu when the prompt is
+// left with Escape (`cleanup` resolves to a failed cancellation's message or
+// null), and before an interrupt or a failure is reported.
+async function terminalLink(session, provider, workerId, view) {
+  const label = PROVIDER_LABELS[provider] ?? provider;
+  let link = null;
+  let cancelling = null;
+  let hide = text => String(text);
+  const busy = () => link !== null && !LINK_TERMINAL.has(link.status);
+  const adopt = next => { if (next.attemptId === link.attemptId) link = next; };
+  const failure = () => hide(link.status === 'failed' ? `connection failed${link.error ? `: ${link.error}` : ''}`
+    : link.status === 'cancelled' ? `the ${label} sign-in was cancelled` : `the worker offered no ${label} sign-in link`);
+  const connected = () => {
+    view.body = `Connected ${glyph.dot} ${label} on ${link.workerId}`;
+    return { cleanup: Promise.resolve(null), connected: () => 1 };
+  };
+  // Polls while `waiting` holds; a stopped operation ends the pause at once.
+  const follow = async waiting => {
+    while (waiting()) {
+      const signal = workContext.getStore()?.signal;
+      if (signal?.aborted) throw new Interrupt();
+      await new Promise(resolve => {
+        const stop = () => { clearTimeout(timer); resolve(); };
+        const timer = setTimeout(() => { signal?.removeEventListener('abort', stop); resolve(); }, LINK_POLL_MS);
+        signal?.addEventListener('abort', stop, { once: true });
+      });
+      adopt(validateLink(await api(session, 'POST', '/admin/api/cli/link/status', linkBody(link), HTTP_TIMEOUT_MS, true)));
+    }
+  };
+  const cancel = () => (cancelling ??= (async () => {
+    try { adopt(validateLink(await api(session, 'POST', '/admin/api/cli/link/cancel', linkBody(link)))); return null; }
+    catch (error) { return error.message; }
+  })());
+  try {
+    await runProgress(view, `Starting ${label} sign-in`, async () => {
+      const started = await api(session, 'POST', '/admin/api/cli/link/start', { provider, workerId }, 60_000);
+      if (record(started) && record(started.provisioning) && started.workerId === null) {
+        throw new CliError(`no worker has a free ${label} slot yet (${started.provisioning.state} ${glyph.dot} ${started.provisioning.workerId ?? 'worker'}); try again once it is ready`);
+      }
+      link = validateLink(started);
+      await follow(() => link.status === 'starting');
+    });
+    if (link.status !== 'awaiting-browser' || link.url === null) throw new CliError(failure());
+    renderScreen({
+      ...view, prompt: true, options: [],
+      body: `${label} ${glyph.dot} ${link.workerId}\nOpen the link below in a browser and sign in with Google; its page then shows the code to paste here.`,
+    });
+    term(`${link.url}\n\n`);
+    const prompt = new AbortController();
+    activeWork = prompt;
+    const observation = workContext.run(prompt, async () => {
+      try {
+        await follow(busy);
+        prompt.abort(new CliError(failure()));
+      } catch (error) {
+        if (!prompt.signal.aborted) prompt.abort(error);
+      }
+    });
+    let input;
+    try {
+      input = await workContext.run(prompt, () => secret(`${label} code`, 'Code', line => {
+        try { authorizationCode(link, line.trim()); return { value: line.trim() }; } catch (error) { return { error: error.message }; }
+      }, true));
+    } catch (error) {
+      if (link.status === 'done') return connected();
+      throw error;
+    } finally {
+      prompt.abort();
+      await observation;
+      activeWork = null;
+    }
+    if (link.status === 'done') return connected();
+    if (!busy()) throw new CliError(failure());
+    if (input === PROMPT_CANCEL) return { cleanup: cancel(), connected: () => 0 };
+    hide = answerHider(input, authorizationCode(link, input));
+    await runProgress(view, `Finishing ${label} sign-in`, async () => {
+      let next;
+      try { next = validateLink(await api(session, 'POST', '/admin/api/cli/link/input', linkBody(link, { input }))); }
+      catch (error) {
+        if (error instanceof Interrupt) throw error;
+        throw new CliError(`could not confirm code delivery: ${hide(error.message)}`);
+      }
+      adopt(next);
+      await follow(busy);
+    });
+    if (link.status !== 'done') throw new CliError(failure());
+    return connected();
+  } catch (error) {
+    if (!busy()) throw error;
+    const problem = await cancel();
+    if (error instanceof Interrupt) throw error;
+    // An answer whose reply was lost may still have finished the login.
+    if (link.status === 'done') return connected();
+    throw new CliError([error.message, problem && `the ${label} sign-in could not be cancelled: ${hide(problem)}`].filter(Boolean).join('\n'));
+  }
+}
 async function addConnection(session, flags, view = null) {
   let port = 0;
   if (flags.port !== undefined) {
+    if (TERMINAL_LINKS.has(flags.provider)) throw usage(`--port is for the local page; ${PROVIDER_LABELS[flags.provider]} signs in in the terminal`);
     port = /^[0-9]{1,5}$/.test(flags.port) ? Number(flags.port) : 0;
     if (port < 1 || port > 65_535) throw usage('--port takes a number from 1 to 65535; the page is only ever served on 127.0.0.1');
   }
@@ -2563,11 +2694,43 @@ async function addConnection(session, flags, view = null) {
   const topology = await (view === null ? workersRequest() : runProgress(view, 'Loading connection workers', workersRequest));
   const placement = record(topology) && Array.isArray(topology.placement) ? topology.placement.filter(record) : [];
   if (placement.length === 0) throw new CliError('worker topology is unavailable; try again shortly');
-  // --provider and --worker only preselect on the page; each must name what the topology offers.
+  // --provider and --worker preselect; each must name what the topology offers.
   const slots = flags.provider === undefined ? placement : placement.filter(entry => entry.provider === flags.provider);
   if (slots.length === 0) throw usage(`unknown provider ${flags.provider}; use ${placement.map(entry => entry.provider).join(', ')}`);
   const workers = [...new Set(slots.flatMap(entry => [entry.workerId, ...(Array.isArray(entry.availableWorkerIds) ? entry.availableWorkerIds : [])]).filter(id => typeof id === 'string'))];
   if (flags.worker !== undefined && !workers.includes(flags.worker)) throw usage(`unknown worker ${flags.worker}${workers.length === 0 ? '' : `; use ${workers.join(', ')}`}`);
+  // The dashboard picks the provider in the terminal; a command without
+  // --provider leaves the pick to the page.
+  let provider = flags.provider ?? null;
+  if (provider === null && view !== null) {
+    view.options = [...placement.map(entry => ({
+      value: entry.provider, label: PROVIDER_LABELS[entry.provider] ?? entry.provider,
+      hint: TERMINAL_LINKS.has(entry.provider) ? 'sign in here' : 'sign in on a local page',
+    })), backOption];
+    provider = await selectScreen(view);
+    if (provider === BACK) return { cleanup: Promise.resolve(null), connected: () => 0 };
+  }
+  if (TERMINAL_LINKS.has(provider)) {
+    const label = PROVIDER_LABELS[provider];
+    if (view !== null) {
+      const outcome = await terminalLink(session, provider, flags.worker ?? null, view);
+      if (outcome.connected() > 0) {
+        showResult(view, `Complete ${glyph.dot} Add connection`);
+        await selectScreen(view);
+      }
+      return outcome;
+    }
+    if (!interactive()) throw usage(`${label} signs in with a code pasted in a terminal; run genesis connections add --provider ${provider} in one`);
+    await runAction(`Add ${label} connection`, async actionView => {
+      actionView.identity = sessionIdentity(session);
+      const outcome = await terminalLink(session, provider, flags.worker ?? null, actionView);
+      if (outcome.connected() > 0) return true;
+      const problem = await outcome.cleanup;
+      if (problem !== null) throw new CliError(problem);
+      return false;
+    }, true);
+    return { cleanup: Promise.resolve(null), connected: () => 0 };
+  }
   const nonce = crypto.randomBytes(32).toString('base64url');
   const nonceMatches = value => {
     if (typeof value !== 'string') return false;
@@ -2575,7 +2738,7 @@ async function addConnection(session, flags, view = null) {
     const expected = Buffer.from(nonce);
     return supplied.length === expected.length && crypto.timingSafeEqual(supplied, expected);
   };
-  const page = launcherPage(session, nonce, { provider: flags.provider ?? null, workerId: flags.worker ?? null });
+  const page = launcherPage(session, nonce, { provider, workerId: flags.worker ?? null });
   let link = null;
   let closeCallback = null;
   let starting = null;
@@ -2634,8 +2797,7 @@ async function addConnection(session, flags, view = null) {
   // quotes it names <code> instead.
   const answered = new Set();
   const forward = async (target, input, code) => {
-    const secrets = [...new Set([input, code, encodeURIComponent(code)])].sort((left, right) => right.length - left.length);
-    const hide = text => secrets.reduce((value, secret) => value.split(secret).join('<code>'), String(text));
+    const hide = answerHider(input, code);
     let next;
     try { next = validateLink(await api(session, 'POST', '/admin/api/cli/link/input', linkBody(target, { input }))); }
     catch (error) {
@@ -2722,14 +2884,18 @@ async function addConnection(session, flags, view = null) {
     }
     if (closing) { res.setHeader('Connection', 'close'); sendJson(res, 503, { error: 'shutting down' }); return; }
     if (req.method === 'GET' && url.pathname === '/') { send(res, 200, 'text/html', page); return; }
+    // The page offers, and starts, only the providers it signs in.
     if (req.method === 'GET' && url.pathname === '/api/state') {
       const [workers, connections] = await Promise.all([api(session, 'GET', '/admin/api/cli/workers'), api(session, 'GET', '/admin/api/cli/connections'), refresh()]);
-      sendJson(res, 200, { workers, connections, link: pageLink(link) });
+      const offered = record(workers) && Array.isArray(workers.placement)
+        ? { ...workers, placement: workers.placement.filter(entry => !TERMINAL_LINKS.has(entry?.provider)) } : workers;
+      sendJson(res, 200, { workers: offered, connections, link: pageLink(link) });
       return;
     }
     if (req.method === 'POST' && url.pathname === '/api/link/start') {
       const body = JSON.parse(await readBody(req));
       if (!record(body) || typeof body.provider !== 'string' || (body.workerId !== null && typeof body.workerId !== 'string')) throw new CliError('invalid link request');
+      if (TERMINAL_LINKS.has(body.provider)) throw new HttpError(409, `${PROVIDER_LABELS[body.provider]} signs in in the terminal: genesis connections add --provider ${body.provider}`);
       const result = await start(body.provider, body.workerId);
       sendJson(res, result.provisioning ? 202 : 200, { ...result, link: pageLink(result.link) });
       return;
@@ -3364,7 +3530,7 @@ const HELP = `Usage: genesis [command] [options]
   console                                   one-time browser login link
   connect [--copy]                          API integration guide for this gateway (endpoints, keys, SDK setup); --copy puts it on the clipboard
   capacity                                  owner/admin
-  connections [list | add]                  owner/admin; add serves a local page [--provider P] [--worker ID] [--port N]
+  connections [list | add]                  owner/admin; add serves a local page [--provider P] [--worker ID] [--port N]; Gemini signs in in the terminal (--provider google-antigravity)
   smoke [--json] [--environment E]          gateway health, login, models and one real call per provider
   token rotate [--yes]                      owner
   issuer grant | remove <key>               owner: whether the key may issue organization keys
