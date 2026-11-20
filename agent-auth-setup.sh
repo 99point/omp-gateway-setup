@@ -185,7 +185,7 @@ Usage: agent-auth-setup.sh [--harness NAME] [--unattended] [--url URL]
                            [--model ID] [--transport auto|provider-wire|standard|pi-native]
                            [--action configure|disable|enable|unset]
 
-  --harness NAME  omp (default), claude-code, codex, opencode, or pi
+  --harness NAME  omp (default), claude-code, codex, opencode, pi, or agy
   --unattended    Never prompt; default to OMP unless --harness is given
   --action        Configure (default), disable locally, re-enable, or remove setup
   --url URL       Gateway host or URL (or AGENT_AUTH_URL); otherwise asked on /dev/tty.
@@ -197,14 +197,16 @@ Usage: agent-auth-setup.sh [--harness NAME] [--unattended] [--url URL]
   --model ID      Make the gateway model with this raw provider id (for example
                   claude-fable-5-1) the client's default; it must be one the
                   gateway serves for the selected client (Google Antigravity
-                  models are OMP-only)
+                  models are for OMP, and for agy by their per-level ids)
   --transport     OMP protocol: auto (default) picks what the gateway and the
                   installed OMP both support; provider-wire (native-capable OMP),
                   standard (stock OMP codecs on the gateway's provider routes),
                   or pi-native (legacy /v1/pi/stream gateways)
 
 Other scopes use the client's own environment: CLAUDE_CONFIG_DIR, CODEX_HOME,
-OPENCODE_CONFIG (explicit file), XDG_CONFIG_HOME, or PI_CODING_AGENT_DIR.
+OPENCODE_CONFIG (explicit file), XDG_CONFIG_HOME, or PI_CODING_AGENT_DIR. agy
+keeps its key and session settings in ~/.gemini/antigravity-cli/agent-auth,
+used only by `genesis run agy`; its own settings.json is never changed.
 Disable/enable/unset need no endpoint or new key and never contact the gateway.
 Only configure requires the selected client (OMP also resolves switch scopes).
 All actions need Node.js >=18. Native configure additionally needs Python >=3.10;
@@ -261,11 +263,11 @@ parse_options() {
   if [[ -z "${harness}" ]]; then
     harness='omp'
     if (( has_tty == 1 )); then
-      ui_select 'Client' 0 'omp|OMP|default' 'claude-code|Claude Code' 'codex|Codex' 'opencode|OpenCode' 'pi|Pi'
+      ui_select 'Client' 0 'omp|OMP|default' 'claude-code|Claude Code' 'codex|Codex' 'opencode|OpenCode' 'pi|Pi' 'agy|Antigravity CLI|Gemini models through genesis run agy'
       harness="${ui_reply}"
     fi
   fi
-  case "${harness}" in omp|claude-code|codex|opencode|pi) ;; *) fail 'harness must be omp, claude-code, codex, opencode, or pi';; esac
+  case "${harness}" in omp|claude-code|codex|opencode|pi|agy) ;; *) fail 'harness must be omp, claude-code, codex, opencode, pi, or agy';; esac
   if [[ -z "${action}" ]]; then
     action='configure'
     if (( has_tty == 1 )); then
@@ -585,18 +587,19 @@ require_native_tools() {
   ui_done 'Python' "${python_bin}"
 }
 # Python >=3.10 runs the client probes; Claude/Codex/OpenCode schema validation
-# also imports jsonschema >=4.18. The first python3 on PATH is often a bare
-# distribution build (Homebrew, /usr/bin) while jsonschema lives in another
-# interpreter (conda, pyenv, a venv), so every python3 on PATH is tried in
-# order; AGENT_AUTH_PYTHON_BIN names one explicitly.
+# also imports jsonschema >=4.18 (Pi and agy validate with the client itself).
+# The first python3 on PATH is often a bare distribution build (Homebrew,
+# /usr/bin) while jsonschema lives in another interpreter (conda, pyenv, a
+# venv), so every python3 on PATH is tried in order; AGENT_AUTH_PYTHON_BIN
+# names one explicitly.
 python_qualifies() {
   "$1" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' >/dev/null 2>&1 || return 1
-  [[ "${harness}" != pi ]] || return 0
+  [[ "${harness}" != pi && "${harness}" != agy ]] || return 0
   "$1" -c 'from jsonschema import Draft7Validator; from referencing import Registry' >/dev/null 2>&1
 }
 resolve_python() {
   local need='Python >=3.10' remedy='set AGENT_AUTH_PYTHON_BIN to a python3 >=3.10' candidate tried='' seen=''
-  if [[ "${harness}" != pi ]]; then
+  if [[ "${harness}" != pi && "${harness}" != agy ]]; then
     need='Python >=3.10 with jsonschema >=4.18'
     remedy="install jsonschema into one of them (python3 -m pip install 'jsonschema>=4.18') or set AGENT_AUTH_PYTHON_BIN to a python3 that has it"
   fi
@@ -796,6 +799,8 @@ quote_shell_word() {
 # --- setup/gateway.sh ---
 # Catalog GETs and nonexecutable OMP protocol probes never submit a model request.
 # Enforce both a transfer limit and a filesystem limit, including chunked replies.
+# The key travels in a private header file: Authorization: Bearer, or the
+# x-goog-api-key header agy sends when a caller names request_header_file.
 gateway_request() {
   local url="$1" destination="$2" status
   shift 2
@@ -803,7 +808,7 @@ gateway_request() {
     ulimit -f 4096
     curl --silent --show-error --retry 0 --max-filesize 2097152 \
       --output "${destination}" --write-out '%{http_code}' \
-      --header "@${header_file}" --connect-timeout 10 --max-time 30 "$@" "${url}" \
+      --header "@${request_header_file:-${header_file}}" --connect-timeout 10 --max-time 30 "$@" "${url}" \
       2> "${scratch_dir}/curl.stderr"
   )"; then fail "could not reach ${url}: $(curl_reason)"; fi
   [[ "$(wc -c < "${destination}")" -le 2097152 ]] || fail 'gateway validation response is too large'
@@ -848,8 +853,10 @@ confirm_gateway_reachable() {
 }
 write_header_file() {
   header_file="${scratch_dir}/authorization-header"
+  gemini_header_file="${scratch_dir}/gemini-key-header"
   printf 'Authorization: Bearer %s\n' "${token}" > "${header_file}"
-  chmod 0600 "${header_file}"
+  printf 'x-goog-api-key: %s\n' "${token}" > "${gemini_header_file}"
+  chmod 0600 "${header_file}" "${gemini_header_file}"
 }
 refusal_text() {
   local status="$1" host="${gateway_url#*://}" text
@@ -948,6 +955,23 @@ probe_google_route() {
     *) fail "gateway route ${path} returned HTTP ${probe_status}; expected its 400 body validation" ;;
   esac
 }
+# agy's native Gemini route, reached as agy reaches it: the key in
+# x-goog-api-key alone and a served wire id in the path. An empty body names no
+# contents and is refused at intake (400) before any provider is contacted;
+# 404 = the gateway does not serve it.
+probe_agy_route() {
+  local request_header_file="${gemini_header_file}" model path probe_status
+  model="$("${node_bin}" "${scratch_dir}/native/agy.cjs" probe-model "${scratch_dir}/google-antigravity-catalog.json")" || exit 1
+  path="/google-antigravity/v1beta/models/${model}:streamGenerateContent"
+  probe_status="$(gateway_request "${gateway_url}${path}?alt=sse" "${scratch_dir}/probe-response" \
+    --request POST --header 'Content-Type: application/json' --data-binary "@${scratch_dir}/probe.json")" || exit 1
+  case "${probe_status}" in
+    400) probe_result=present ;;
+    404) probe_result=absent ;;
+    401|403) catalog_only_bearer "${probe_status}" "${path}" ;;
+    *) fail "gateway route ${path} returned HTTP ${probe_status}; expected its 400 body validation" ;;
+  esac
+}
 probe_pi_native_route() {
   local probe_status
   probe_status="$(gateway_request "${gateway_url}/v1/pi/stream" "${scratch_dir}/probe-response" \
@@ -968,13 +992,14 @@ validate_gateway() {
   if [[ "${harness}" != omp ]]; then
     # Catalog metadata and raw request IDs must agree before any config is staged,
     # and the key must be allowed on the model route (the gateway root is not).
-    # A Google model asked of a client without a Cloud Code Assist codec is refused here.
+    # A Google model asked of a client without a native Google client (OMP's
+    # Cloud Code Assist codec, agy's Gemini API mode) is refused here.
     "${node_bin}" "${scratch_dir}/native/catalog.cjs" providers "${harness}" "${catalog_file}" '' "${requested_model}" > "${scratch_dir}/native-providers"
     while IFS= read -r provider; do
       if ! gateway_catalog "/${provider}/v1/models" "${scratch_dir}/${provider}-catalog.json" 1; then
         fail "${gateway_url} has no ${provider} model catalog (/${provider}/v1/models is HTTP 404); this catalog is required to validate model metadata"
       fi
-      probe_standard_route "${provider}"
+      if [[ "${harness}" == agy ]]; then probe_agy_route; else probe_standard_route "${provider}"; fi
       [[ "${probe_result}" == present ]] || fail "${gateway_url} serves the ${provider} catalog but not the selected client's model route"
     done < "${scratch_dir}/native-providers"
     "${node_bin}" "${scratch_dir}/native/catalog.cjs" normalize "${harness}" "${catalog_file}" "${scratch_dir}" > "${scratch_dir}/native-catalog.json"
@@ -1007,7 +1032,7 @@ validate_gateway() {
     omp_normalize_catalog
     omp_validate_client
   fi
-  rm -f "${header_file}"
+  rm -f "${header_file}" "${gemini_header_file}"
 }
 
 # --- setup/native.sh ---
@@ -1072,6 +1097,10 @@ native_report() {
       printf 'Run: PI_CODING_AGENT_DIR=%s pi\n' "$(quote_shell_word "${client_dir}")"
       printf 'Pi uses generic Responses, not the JWT-only Codex API. Extra caller sampling controls are not removed.\n'
       printf 'Empty Codex instructions with native system input, and generic Anthropic OAuth shaping, require independent wire proof.\n' ;;
+    agy)
+      printf 'Run: genesis run agy\n'
+      printf 'agy takes its key and endpoint only from its environment; genesis run agy gives them, with these session settings, to agy alone.\n'
+      printf 'Plain agy keeps your own sign-in and settings; its settings.json is not changed.\n' ;;
   esac
 }
 
@@ -2134,11 +2163,134 @@ pi_stage() {
   "${node_bin}" "${scratch_dir}/native/check.cjs" json "${settings_candidate}" "${scratch_dir}/settings-validated.json"
 }
 
+# --- setup/adapters/agy.sh ---
+agy_prepare() {
+  native_prepare agy
+  # agy keeps its settings, sign-in and data under ~/.gemini/antigravity-cli and
+  # has no scope variable. Setup writes none of agy's own files: the key and a
+  # private session-settings file live beside them in agent-auth, read only by
+  # `genesis run agy` (agy applies --settings to that one session and never
+  # saves them), so plain agy keeps the person's own sign-in and settings.
+  token_dir="$(resolve_token_directory "${HOME}/.gemini/antigravity-cli/agent-auth")"
+  token_file="${token_dir}/token"
+  overlay_target="${token_dir}/settings.json"
+  setup_targets=("${overlay_target}" "${token_file}")
+  switch_configs=(); switch_formats=(); switch_roles=(); switch_references=()
+  switch_assets=("${overlay_target}")
+}
+agy_stage() {
+  local overlay env_bin
+  printf '' > "${scratch_dir}/agy-empty"
+  if [[ -f "${overlay_target}" ]]; then register_file "${overlay_target}" "${overlay_target}" asset
+  else register_file "${overlay_target}" "${scratch_dir}/agy-empty" asset; fi
+  overlay="${tx_candidates[tx_count-1]}"
+  # A served default chosen earlier stays unless --model names another.
+  "${node_bin}" "${scratch_dir}/native/agy.cjs" settings "${scratch_dir}/native-catalog.json" "${requested_model}" \
+    "${tx_originals[tx_count-1]}" "${overlay}"
+  # The installed agy must accept these exact settings: in an empty home, Gemini
+  # API mode with a placeholder key lists every gateway model. `agy models`
+  # submits no model request, and its endpoint is a closed loopback port.
+  cp "${overlay}" "${scratch_dir}/agy-settings.json"
+  env_bin="$(require_executable env)"
+  "${python_bin}" "${scratch_dir}/native/run-client.py" "${validation_home}" "${scratch_dir}/agy.stdout" "${scratch_dir}/agy.stderr" \
+    "${env_bin}" GEMINI_API_KEY=agent-auth-validation-only GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:9 \
+    "${client_bin}" --settings "${scratch_dir}/agy-settings.json" models
+  "${node_bin}" "${scratch_dir}/native/agy.cjs" listed "${scratch_dir}/agy-settings.json" "${scratch_dir}/agy.stdout"
+}
+
 unpack_native_payload() {
   mkdir -p "${scratch_dir}/native"
   mkdir -p "${scratch_dir}/schemas"
   mkdir -p "${scratch_dir}/vendor/jsonc-parser"
   mkdir -p "${scratch_dir}/vendor/jsonc-parser/impl"
+  "${cat_bin}" > "${scratch_dir}/native/agy.cjs" <<'AGENT_AUTH_266A9A18C3F88BDF6610'
+'use strict';
+const fs = require('node:fs');
+const { save } = require('./config-io.cjs');
+
+// agy (Antigravity CLI) 1.5.13 takes its key and endpoint only from its
+// environment (GEMINI_API_KEY, GOOGLE_GEMINI_BASE_URL), so setup never edits
+// its settings.json. These settings are for `genesis run agy` alone, which
+// passes them with --settings: agy applies them to that one session and never
+// saves them. They select Gemini API mode and add one custom model per served
+// Google wire id; agy requests gemini-api://<id> as <endpoint>/v1beta/models/<id>.
+// agy lists each thinking level as a model of its own, and the gateway routes
+// each level to its own wire id, so every level is one model here. The key
+// prefix keeps them apart from agy's built-in ids and the person's own custom
+// models; the label suffix from agy's built-in labels for the same models.
+const PREFIX = 'agent-auth-';
+const LEVELS = { minimal: 'Minimal', low: 'Low', medium: 'Medium', high: 'High', xhigh: 'XHigh', max: 'Max' };
+// A wire id is one URL path segment.
+const WIRE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$/;
+
+// Every served wire id of the normalized Google cards (catalog.cjs), the
+// default card first, levels in the gateway's order; labels are unique. The
+// gateway serves a card by its request id too (request_model_id, else its
+// canonical id): a card without levels, or whose levels route elsewhere.
+function models(catalog) {
+  const cards = catalog['google-antigravity'];
+  if (!Array.isArray(cards) || !cards.length) throw new Error('gateway serves no Google Antigravity (Gemini) models, the only ones agy can use');
+  const entries = [];
+  for (const card of cards) {
+    const name = card.display_name ?? card.id;
+    const routing = card.thinking?.effortRouting;
+    const routes = routing === undefined ? [] : card.thinking.efforts.map(level => ({ id: routing[level], label: `${name} (${LEVELS[level]})` }));
+    const request = card.request_model_id ?? card.id;
+    entries.push(...routes, ...(routes.some(route => route.id === request) ? [] : [{ id: request, label: name }]));
+  }
+  if (entries.some(entry => typeof entry.id !== 'string' || !WIRE_ID.test(entry.id))) throw new Error('a gateway Google model id is not a valid agy model name');
+  const counts = new Map();
+  for (const entry of entries) counts.set(entry.label, (counts.get(entry.label) ?? 0) + 1);
+  return entries.map(entry => ({ id: entry.id, label: `${counts.get(entry.label) > 1 ? entry.id : entry.label} via Genesis` }));
+}
+function settings([catalogFile, requested, previousFile, destination]) {
+  const catalog = JSON.parse(fs.readFileSync(catalogFile, 'utf8'));
+  const entries = models(catalog);
+  const ids = entries.map(entry => entry.id);
+  // The default these settings held before, when it is still served.
+  let previous;
+  if (previousFile) {
+    try { previous = JSON.parse(fs.readFileSync(previousFile, 'utf8'))?.model; } catch { previous = undefined; }
+  }
+  const before = typeof previous === 'string' && previous.startsWith(PREFIX) ? previous.slice(PREFIX.length) : undefined;
+  const first = catalog['google-antigravity'][0];
+  const gatewayDefault = first.request_model_id ?? first.id;
+  if (requested && !ids.includes(requested)) throw new Error(`model ${requested} is not served by this gateway for agy; served models: ${ids.join(', ')}`);
+  const chosen = requested || (ids.includes(before) ? before : ids.includes(gatewayDefault) ? gatewayDefault : ids[0]);
+  if (!requested && before !== undefined && before !== chosen) console.error(`Antigravity CLI: replacing unsupported model ${before} with ${chosen}.`);
+  save(destination, {
+    modelProvider: 'gemini',
+    model: PREFIX + chosen,
+    customModelsConfig: { customModels: Object.fromEntries(entries.map(entry => [PREFIX + entry.id, { modelName: `gemini-api://${entry.id}`, label: entry.label }])) },
+  });
+}
+// `agy models` prints one row per model, a custom model as label<TAB>label;
+// settings agy rejects make it fail or list its built-in models alone.
+function listed([settingsFile, stdoutFile]) {
+  const custom = JSON.parse(fs.readFileSync(settingsFile, 'utf8')).customModelsConfig.customModels;
+  const rows = fs.readFileSync(stdoutFile, 'utf8').split('\n').map(line => line.split('\t'));
+  for (const [key, model] of Object.entries(custom)) {
+    if (!rows.some(row => row.length === 2 && row[1] === model.label && (row[0] === model.label || row[0] === key))) {
+      throw new Error(`agy did not list the gateway model ${model.label}; it did not take the staged settings`);
+    }
+  }
+}
+// One served wire id for the route probe, from the provider's own catalog.
+function probeModel([nativeFile]) {
+  let value;
+  try { value = JSON.parse(fs.readFileSync(nativeFile, 'utf8')); } catch { throw new Error('native model catalog is not valid JSON'); }
+  const id = (Array.isArray(value?.data) ? value.data : []).map(card => card?.id).find(id => typeof id === 'string' && WIRE_ID.test(id));
+  if (id === undefined) throw new Error('the native Google model catalog names no model agy can request');
+  process.stdout.write(id + '\n');
+}
+try {
+  const [mode, ...args] = process.argv.slice(2);
+  if (mode === 'settings') settings(args);
+  else if (mode === 'listed') listed(args);
+  else if (mode === 'probe-model') probeModel(args);
+  else throw new Error('unknown agy staging mode');
+} catch (error) { console.error(`setup failed: ${error.message}`); process.exitCode = 1; }
+AGENT_AUTH_266A9A18C3F88BDF6610
   "${cat_bin}" > "${scratch_dir}/native/catalog.cjs" <<'AGENT_AUTH_3E314562121AA341A6CD'
 'use strict';
 const fs = require('node:fs');
@@ -2149,11 +2301,12 @@ const GOOGLE = 'google-antigravity';
 const EFFORTS = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
 const RAW_ID = /^[\x21-\x7e]{1,256}$/;
 // The gateway providers each client can use. Google Antigravity needs a native
-// Cloud Code Assist (google-gemini-cli) client: OMP ships one; Pi removed its own
-// in 0.71.0, and Claude Code, Codex and OpenCode have none.
+// Google client: OMP's Cloud Code Assist (google-gemini-cli) codec, or agy's
+// Gemini API mode (agy.cjs). Pi removed its own in 0.71.0, and Claude Code,
+// Codex and OpenCode have none.
 const CLIENT_PROVIDERS = {
   'claude-code': ['anthropic'], codex: ['openai-codex'], opencode: ['anthropic', 'openai-codex'],
-  pi: ['anthropic', 'openai-codex'], omp: ['anthropic', 'openai-codex', GOOGLE],
+  pi: ['anthropic', 'openai-codex'], omp: ['anthropic', 'openai-codex', GOOGLE], agy: [GOOGLE],
 };
 
 function loadCatalog(file) {
@@ -2199,8 +2352,10 @@ function normalize(harness, catalog, directory, only = null) {
       if (card.id === defaultModel) defaultIndex = index;
       const canonical = card.id?.replace(new RegExp(`^${provider}/`), '');
       const requestId = card.request_model_id ?? canonical;
-      // A Google card also claims its canonical id and every wire SKU it routes to.
-      const ids = provider === GOOGLE ? [...new Set([requestId, canonical, ...googleRouting(card)])] : [requestId];
+      // A Google card also claims its canonical id and every wire SKU it routes
+      // to. agy can also use one without per-level routing, by its request id.
+      const levels = provider === GOOGLE && (harness !== 'agy' || card.thinking?.effortRouting !== undefined);
+      const ids = provider === GOOGLE ? [...new Set([requestId, canonical, ...(levels ? googleRouting(card) : [])])] : [requestId];
       if (ids.some(id => typeof id !== 'string' || !RAW_ID.test(id) || seen.has(id))) throw new Error('invalid or duplicate raw gateway model ID');
       for (const id of ids) seen.add(id);
       if (!native.some(model => model.id === requestId && model.owned_by === provider)) throw new Error('native model catalog does not match gateway metadata');
@@ -2213,7 +2368,8 @@ function normalize(harness, catalog, directory, only = null) {
         throw new Error('gateway model pricing is missing or invalid');
       }
       // OMP selects a Google model by its canonical id; its thinking levels pick
-      // the wire SKU. Every other client sends the raw request id.
+      // the wire SKU, and agy.cjs makes each level's wire id a model of its own.
+      // Every other client sends the raw request id.
       return { ...card, id: provider === GOOGLE ? canonical : requestId };
     });
     if (native.length !== result[provider].length) throw new Error('native and authoritative catalog counts disagree');
@@ -2252,7 +2408,7 @@ function newestHaiku(cards) {
   }
   return best;
 }
-// A Google model asked of a client without a Cloud Code Assist codec is refused
+// A Google model asked of a client without a native Google client is refused
 // by name, before any probe or staging; it would otherwise read as unserved.
 function refuseGoogle(harness, catalog, requested) {
   if (!requested || CLIENT_PROVIDERS[harness].includes(GOOGLE)) return;
@@ -2260,7 +2416,7 @@ function refuseGoogle(harness, catalog, requested) {
     if (!object(card) || card.owned_by !== GOOGLE || typeof card.id !== 'string') continue;
     const routing = object(card.thinking?.effortRouting) ? Object.values(card.thinking.effortRouting) : [];
     if (![card.id.replace(`${GOOGLE}/`, ''), card.request_model_id, ...routing].includes(requested)) continue;
-    throw new Error(`model ${requested} is a Google Antigravity model, which ${harness} cannot use: Genesis serves Google models only to OMP's Cloud Code Assist client`);
+    throw new Error(`model ${requested} is a Google Antigravity model, which ${harness} cannot use: Genesis serves Google models only to OMP's Cloud Code Assist client and agy's Gemini API mode`);
   }
 }
 if (require.main === module) {
@@ -2270,7 +2426,10 @@ if (require.main === module) {
     if (action === 'providers') {
       refuseGoogle(harness, catalog, rest[0]);
       const providers = selected(harness, catalog.data);
-      if (!providers.length) throw new Error('gateway advertises no models for the selected client');
+      if (!providers.length) {
+        throw new Error(harness === 'agy' ? 'gateway serves no Google Antigravity (Gemini) models, the only ones agy can use'
+          : 'gateway advertises no models for the selected client');
+      }
       process.stdout.write(providers.join('\n') + '\n');
     } else if (action === 'normalize') {
       process.stdout.write(JSON.stringify(normalize(harness, catalog, directory, rest.length ? rest : null)) + '\n');
@@ -2290,7 +2449,9 @@ try {
     const [harness, output] = args;
     const text = fs.readFileSync(output, 'utf8');
     const found = text.match(/(?:^|\s)(\d+)\.(\d+)\.(\d+)(?:\s|$|[-+])/);
-    const required = { 'claude-code': [2, 1, 258], codex: [0, 144, 4], opencode: [1, 18, 29], pi: [0, 85, 1] }[harness];
+    // agy 1.5.13: the release whose --settings session overlay and Gemini API
+    // wire (GEMINI_API_KEY, GOOGLE_GEMINI_BASE_URL) were verified.
+    const required = { 'claude-code': [2, 1, 258], codex: [0, 144, 4], opencode: [1, 18, 29], pi: [0, 85, 1], agy: [1, 5, 13] }[harness];
     if (!found || !required) throw new Error('could not identify the installed client version');
     const actual = found.slice(1, 4).map(Number);
     let compared = 0;
@@ -2900,6 +3061,8 @@ environment = {
     'DISABLE_TELEMETRY': '1', 'DISABLE_ERROR_REPORTING': '1',
     'OPENCODE_CONFIG': str(root / 'opencode.json'), 'OPENCODE_DISABLE_AUTOUPDATE': '1',
     'OPENCODE_DISABLE_MODELS_FETCH': '1', 'OPENCODE_DISABLE_PROJECT_CONFIG': '1', 'OPENCODE_PURE': '1',
+    # agy 1.5.13 starts its own updater from any run unless this is exactly true.
+    'AGY_CLI_DISABLE_AUTO_UPDATE': 'true',
 }
 # Applies to the subprocess as well. Bounds accidental diagnostic output and
 # client scratch files, not only HTTP downloads. No credential appears in argv.

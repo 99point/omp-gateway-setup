@@ -49,13 +49,15 @@ function environmentId(value) {
 const environmentLabel = environment => ENVIRONMENTS[environment].label;
 // One row per supported client. `providers` are the gateway providers whose
 // models the client can use; `binary` is what the installer requires on PATH.
-// Google Antigravity needs a Cloud Code Assist client, which only OMP ships.
+// Google Antigravity needs a native Google client: OMP's Cloud Code Assist
+// codec, or agy's Gemini API mode, which genesis run agy starts.
 export const CLIENTS = Object.freeze([
   { id: 'omp', label: 'OMP', binary: 'omp', providers: ['anthropic', 'openai-codex', 'google-antigravity'] },
   { id: 'claude-code', label: 'Claude Code', binary: 'claude', providers: ['anthropic'] },
   { id: 'codex', label: 'Codex', binary: 'codex', providers: ['openai-codex'] },
   { id: 'opencode', label: 'OpenCode', binary: 'opencode', providers: ['anthropic', 'openai-codex'] },
   { id: 'pi', label: 'Pi', binary: 'pi', providers: ['anthropic', 'openai-codex'] },
+  { id: 'agy', label: 'Antigravity CLI', binary: 'agy', providers: ['google-antigravity'] },
 ]);
 
 // ── errors ──────────────────────────────────────────────────────────────────
@@ -963,13 +965,18 @@ function clientById(id) {
   if (client === undefined) throw usage(`unknown client ${id}; use ${CLIENTS.map(entry => entry.id).join(', ')}`);
   return client;
 }
-function installed(binary) {
+// The first executable regular file named BINARY in an absolute PATH entry,
+// as the installer's require_executable finds it; null when there is none.
+function executable(binary) {
   for (const directory of (process.env.PATH ?? '').split(path.delimiter)) {
-    if (directory === '') continue;
+    if (!path.isAbsolute(directory)) continue;
     const candidate = path.join(directory, binary);
-    try { fs.accessSync(candidate, fs.constants.X_OK); if (fs.statSync(candidate).isFile()) return true; } catch { /* next entry */ }
+    try { fs.accessSync(candidate, fs.constants.X_OK); if (fs.statSync(candidate).isFile()) return candidate; } catch { /* next entry */ }
   }
-  return false;
+  return null;
+}
+function installed(binary) {
+  return executable(binary) !== null;
 }
 const homeDir = (name, fallback) => {
   const value = process.env[name];
@@ -1048,6 +1055,12 @@ async function resolveScope(client, profile) {
     const tokenDir = path.join(path.dirname(config), 'agent-auth');
     return { stateFile: path.join(tokenDir, 'switch.json'), targets: [config, path.join(tokenDir, 'token')] };
   }
+  if (client.id === 'agy') {
+    // adapters/agy.sh: agy's own files under ~/.gemini/antigravity-cli are never
+    // changed; the key, its session settings and the state live in agent-auth.
+    const tokenDir = realDirectory(path.join(os.homedir(), '.gemini', 'antigravity-cli', 'agent-auth'));
+    return { stateFile: path.join(tokenDir, 'switch.json'), targets: [path.join(tokenDir, 'settings.json'), path.join(tokenDir, 'token')] };
+  }
   const directory = homeDir('PI_CODING_AGENT_DIR', '.pi/agent');
   return { stateFile: path.join(directory, 'agent-auth/switch.json'), targets: [path.join(directory, 'models.json'), path.join(directory, 'settings.json'), path.join(directory, 'agent-auth/token')] };
 }
@@ -1067,8 +1080,34 @@ const fieldAt = (state, role, keys) => {
   }
   return null;
 };
+// A file the installer wrote into a scope: opened without following a link
+// and without blocking (a FIFO in its place is refused, never waited on), a
+// regular file; null when absent.
+function readScopeFile(file) {
+  let fd;
+  try { fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK); } catch (error) {
+    if (error.code === 'ENOENT') return null;
+    if (error.code === 'ELOOP') throw new CliError(`${file} must not be a symlink`);
+    throw error;
+  }
+  try {
+    if (!fs.fstatSync(fd).isFile()) throw new CliError(`${file} is not a regular file`);
+    return fs.readFileSync(fd);
+  } finally { fs.closeSync(fd); }
+}
+// agy's default is the custom model its session settings name, keyed by
+// prefix and wire id (setup/native/agy.cjs); unreadable settings name none.
+const AGY_MODEL_PREFIX = 'agent-auth-';
+function agyDefault(file) {
+  try {
+    const model = JSON.parse(readScopeFile(file)?.toString('utf8') ?? 'null')?.model;
+    const id = typeof model === 'string' && model.startsWith(AGY_MODEL_PREFIX) ? model.slice(AGY_MODEL_PREFIX.length) : '';
+    return MODEL_ID.test(id) ? id : null;
+  } catch { return null; }
+}
 // The switch state the installer writes beside the key: mode, issuing gateway,
-// and the gateway-owned fields (the client's default model among them).
+// and the gateway-owned fields (the client's default model among them; agy's
+// is in its session settings).
 export function readState(file, clientId) {
   const text = readPrivate(file);
   if (text === null) return null;
@@ -1081,7 +1120,8 @@ export function readState(file, clientId) {
     const id = fieldAt(state, 'settings', ['defaultModel']);
     const provider = fieldAt(state, 'settings', ['defaultProvider']);
     model = id === null ? null : provider === null ? id : `${provider.replace(/^agent-auth-/, '')}/${id}`;
-  } else model = fieldAt(state, 'config', ['model'])?.replace(/^agent-auth-/, '') ?? null;
+  } else if (clientId === 'agy') model = agyDefault(path.join(path.dirname(file), 'settings.json'));
+  else model = fieldAt(state, 'config', ['model'])?.replace(/^agent-auth-/, '') ?? null;
   return { mode: state.mode, gateway: typeof state.gateway === 'string' ? state.gateway : null, model };
 }
 // connected | disabled | not configured | foreign gateway | not installed
@@ -1212,8 +1252,8 @@ function setupNextStep(cause, client) {
   if (/^(Node\.js|Python|curl|env) .*is required|is required to verify/.test(cause)) return 'install the named prerequisite, then retry';
   if (/^no OMP protocol works/.test(cause)) return 'update OMP, then retry';
   if (/^direct credential env .* would outrank the gateway/.test(cause)) return `remove that setting, or run genesis configure ${client.id} --overwrite so the gateway owns it`;
-  // Google Antigravity: only OMP has the client; OMP's own pause is the user's call.
-  if (/^model \S+ is a Google Antigravity model/.test(cause)) return 'use OMP for Google models: genesis model omp';
+  // Google Antigravity: only OMP and agy have a client; OMP's own pause is the user's call.
+  if (/^model \S+ is a Google Antigravity model/.test(cause)) return 'use OMP or agy for Google models: genesis model omp, or genesis model agy';
   if (/^model \S+ needs Google Antigravity.* pauses its google-antigravity provider/.test(cause)) return 'opt in to google-antigravity in OMP yourself (auth.unpausedProviders), or pick another model: genesis model omp';
   if (/^model \S+ needs Google Antigravity/.test(cause)) return 'update OMP, or pick another model: genesis model omp';
   return null;
@@ -1270,10 +1310,13 @@ function clientVersion(client) {
 const profileArgs = profile => (profile ? ['--profile', profile] : []);
 // The command that starts the client in the scope just configured: the
 // profile for OMP and Codex, and the directory override when one is in
-// force (the installer wrote the config where that variable points).
+// force (the installer wrote the config where that variable points). agy
+// takes its key and endpoint only from its environment, so the launcher
+// starts it (runAgy).
 const SCOPE_VARIABLES = { 'claude-code': 'CLAUDE_CONFIG_DIR', codex: 'CODEX_HOME', opencode: 'OPENCODE_CONFIG', pi: 'PI_CODING_AGENT_DIR' };
 const shellWord = value => (/^[A-Za-z0-9_./=:@%+,-]+$/.test(value) ? value : `'${value.replace(/'/g, "'\\''")}'`);
 function runCommand(client, profile) {
+  if (client.id === 'agy') return 'genesis run agy';
   const variable = SCOPE_VARIABLES[client.id];
   const scope = variable !== undefined && process.env[variable] ? `${variable}=${shellWord(process.env[variable])} ` : '';
   return `${scope}${client.binary}${['omp', 'codex'].includes(client.id) && profile ? ` --profile ${shellWord(profile)}` : ''}`;
@@ -1327,6 +1370,7 @@ async function configure(session, client, flags, view = null) {
     }
     done('Key', 'staged');
     done('Run', runCommand(client, flags.profile));
+    if (client.id === 'agy') note('plain agy keeps your own sign-in and settings; only genesis run agy uses this gateway');
     return true;
   };
   const label = `Configure ${client.label}`;
@@ -1340,31 +1384,122 @@ async function switchScope(session, client, action, flags) {
   });
 }
 
+// ── agy launcher ────────────────────────────────────────────────────────────
+// agy reads its key and endpoint only from its environment, so its gateway
+// scope is started here: the unchanged native agy with the scope's private
+// session settings (--settings: agy applies them to that session alone and
+// never saves them), the saved default model unless the arguments choose one,
+// and GEMINI_API_KEY and GOOGLE_GEMINI_BASE_URL in the child's environment
+// alone. The switch state, key and settings the installer wrote are the whole
+// input, the files checked against the digests the state recorded, as enable
+// checks them: no login, no network lookup, nothing printed but a refusal.
+// AGY_ADC_AUTH would make agy sign in with Application Default Credentials
+// instead of the key, so the child does not inherit it. Plain agy keeps the
+// person's own sign-in and settings.
+async function runAgy(args) {
+  const client = clientById('agy');
+  const fix = 'run genesis configure agy';
+  refuseSymlink(path.join(os.homedir(), '.gemini', 'antigravity-cli', 'agent-auth'));
+  const { stateFile } = await resolveScope(client);
+  const tokenFile = path.join(path.dirname(stateFile), 'token');
+  const settingsFile = path.join(path.dirname(stateFile), 'settings.json');
+  const text = readScopeFile(stateFile);
+  if (text === null) throw new CliError(`${client.label} is not configured here; ${fix}`);
+  let state = null;
+  try { state = JSON.parse(text.toString('utf8')); } catch { /* refused below */ }
+  if (!record(state) || state.version !== 1 || state.harness !== 'agy' || state.tokenFile !== tokenFile
+    || !['enabled', 'disabled'].includes(state.mode) || !Array.isArray(state.files)) {
+    throw new CliError(`${stateFile} is not an agy gateway scope this CLI understands; ${fix}`);
+  }
+  if (state.mode !== 'enabled') throw new CliError(`${client.label} is disabled here; run genesis enable agy, or plain agy for your own sign-in`);
+  if (typeof state.gateway !== 'string' || normalizeEndpoint(state.gateway).value !== state.gateway) throw new CliError(`${stateFile} names no gateway; ${fix}`);
+  const saved = (file, kind) => {
+    const entry = state.files.find(item => record(item) && item.path === file && item.kind === kind);
+    const bytes = readScopeFile(file);
+    if (entry === undefined || bytes === null) throw new CliError(`the saved agy gateway ${kind === 'token' ? 'key' : 'settings'} ${file} is missing; ${fix}`);
+    if (crypto.createHash('sha256').update(bytes).digest('hex') !== entry.sha256) throw new CliError(`${file} changed outside setup; ${fix}`);
+    return bytes.toString('utf8');
+  };
+  const key = saved(tokenFile, 'token').replace(/\n$/, '');
+  if (key === '' || /[\0\r\n]/.test(key)) throw new CliError(`${tokenFile} does not hold one gateway key; ${fix}`);
+  acceptKey(key);
+  let settings = null;
+  try { settings = JSON.parse(saved(settingsFile, 'asset')); } catch (error) { if (error instanceof CliError) throw error; }
+  const models = settings?.customModelsConfig?.customModels;
+  if (typeof settings?.model !== 'string' || !record(models) || !Object.hasOwn(models, settings.model)) throw new CliError(`${settingsFile} names no default model; ${fix}`);
+  // agy's own options end at its --; a model chosen there replaces the saved default.
+  const options = args.includes('--') ? args.slice(0, args.indexOf('--')) : args;
+  if (options.some(arg => /^--?settings(=|$)/.test(arg))) {
+    throw usage('genesis run agy gives agy the gateway --settings itself; keep your own in ~/.gemini/antigravity-cli/settings.json');
+  }
+  const model = options.some(arg => /^--?model(=|$)/.test(arg)) ? [] : ['--model', settings.model];
+  const binary = executable(client.binary);
+  if (binary === null) throw new CliError('agy is not installed here: no agy executable on PATH');
+  const env = { ...process.env, GEMINI_API_KEY: key, GOOGLE_GEMINI_BASE_URL: `${state.gateway}/google-antigravity` };
+  delete env.AGY_ADC_AUTH;
+  const child = spawn(binary, ['--settings', settingsFile, ...model, ...args], { env, stdio: 'inherit' });
+  // Forward signals sent to this launcher alone as well as terminal signals.
+  // agy's raw terminal mode delivers Ctrl-C as input, not a process signal.
+  const forward = signal => () => { child.kill(signal); };
+  const handlers = Object.fromEntries(['SIGINT', 'SIGQUIT', 'SIGTERM', 'SIGHUP'].map(signal => [signal, forward(signal)]));
+  for (const [name, handler] of Object.entries(handlers)) process.on(name, handler);
+  let code, signal;
+  try {
+    [code, signal] = await new Promise((resolve, reject) => {
+      child.once('error', reject);
+      child.once('exit', (...result) => resolve(result));
+    });
+  } catch (error) {
+    throw new CliError(`could not start ${binary}: ${error.code ?? error.message}`);
+  } finally {
+    for (const [name, handler] of Object.entries(handlers)) process.off(name, handler);
+  }
+  if (signal !== null) throw new CliError('', 128 + (os.constants.signals[signal] ?? 0));
+  if (code !== 0) throw new CliError('', code);
+}
+
 // ── served models ───────────────────────────────────────────────────────────
 // /v1/models lists provider-qualified ids; clients take the raw provider id
 // (request_model_id when the gateway names one), OMP its own provider/id selector.
-export function servedModels(catalog, client) {
+// Empty when the gateway serves the client nothing.
+function catalogModels(catalog, client) {
   if (!record(catalog) || !Array.isArray(catalog.data)) throw new CliError('the gateway model catalog is not in the expected shape');
   const models = [];
   for (const card of catalog.data) {
     if (!record(card) || typeof card.id !== 'string' || !client.providers.includes(card.owned_by)) continue;
     const suffix = card.id.startsWith(`${card.owned_by}/`) ? card.id.slice(card.owned_by.length + 1) : card.id;
     const id = client.id !== 'omp' && typeof card.request_model_id === 'string' ? card.request_model_id : suffix;
-    if (!MODEL_ID.test(id)) continue;
-    models.push({ id, provider: card.owned_by, name: typeof card.display_name === 'string' ? card.display_name : id });
+    const entries = client.id === 'agy' ? agyLevels(card, id, typeof card.display_name === 'string' ? card.display_name : suffix)
+      : [{ id, name: typeof card.display_name === 'string' ? card.display_name : id }];
+    for (const entry of entries) if (MODEL_ID.test(entry.id)) models.push({ id: entry.id, provider: card.owned_by, name: entry.name });
   }
+  return models;
+}
+// agy takes each thinking level of a Google model as a model of its own,
+// requested by that level's wire id (setup/native/agy.cjs); the request id
+// joins them when no level routes to it.
+const LEVEL_NAMES = { minimal: 'Minimal', low: 'Low', medium: 'Medium', high: 'High', xhigh: 'XHigh', max: 'Max' };
+function agyLevels(card, request, name) {
+  const routing = record(card.thinking?.effortRouting) ? card.thinking.effortRouting : {};
+  const levels = (Array.isArray(card.thinking?.efforts) ? card.thinking.efforts : []).filter(level => typeof routing[level] === 'string');
+  const entries = levels.map(level => ({ id: routing[level], name: `${name} (${LEVEL_NAMES[level] ?? level})` }));
+  return entries.some(entry => entry.id === request) ? entries : [...entries, { id: request, name }];
+}
+export function servedModels(catalog, client) {
+  const models = catalogModels(catalog, client);
   if (models.length === 0) throw new CliError(`the gateway serves no models for ${client.label}`);
   return models;
 }
-// A Google Antigravity model needs OMP's Cloud Code Assist client. Another
-// client asked for one by any of its ids (canonical, request or per-level wire
-// id) is told so by name instead of reading it as unserved; null otherwise.
+// A Google Antigravity model needs a native Google client: OMP's Cloud Code
+// Assist codec or agy's Gemini API mode. Another client asked for one by any
+// of its ids (canonical, request or per-level wire id) is told so by name
+// instead of reading it as unserved; null otherwise.
 export function googleOnly(catalog, client, requested) {
   if (client.providers.includes('google-antigravity') || !record(catalog) || !Array.isArray(catalog.data)) return null;
   const card = catalog.data.find(card => record(card) && card.owned_by === 'google-antigravity' && typeof card.id === 'string'
     && [rawModelId(card.id), card.request_model_id, ...Object.values(record(card.thinking?.effortRouting) ? card.thinking.effortRouting : {})].includes(requested));
   return card === undefined ? null
-    : `${requested} is a Google Antigravity model, which only OMP can use through Genesis (it needs OMP's Cloud Code Assist client); ${client.label} cannot. Use genesis model omp ${rawModelId(card.id)}`;
+    : `${requested} is a Google Antigravity model, which only OMP and agy can use through Genesis; ${client.label} cannot. Use genesis model omp ${rawModelId(card.id)}, or pick one of its levels with genesis model agy`;
 }
 export function renderModels(models, current) {
   return table(['model', 'provider', 'name', ''], models.map(model => [
@@ -1728,7 +1863,9 @@ function logout(flags) {
 // Point every discoverable scope of an installed client at the selected
 // environment: each is configured with that gateway and key (a foreign scope
 // is retargeted, a connected one re-staged), keeps its saved model when this
-// gateway serves it, and is disabled again when it was disabled.
+// gateway serves it, and is disabled again when it was disabled. A client the
+// gateway serves no models for (agy while no Google model is served) is
+// skipped and left as it is, since its installer would refuse it.
 async function applyEnvironment(session, flags, view = null) {
   // Consent comes before scope discovery: OMP's scope lookup may initialize
   // its state, so only the installed binaries are named here.
@@ -1748,16 +1885,15 @@ async function applyEnvironment(session, flags, view = null) {
     const rows = (await statusRows(session)).filter(row => row.installed);
     const catalog = await api(session, 'GET', '/v1/models');
     const failed = [];
+    const skipped = [];
     for (const row of rows) {
       if (row.problem !== null) { warn(`${row.label} was not checked: ${row.problem}`); failed.push(row); continue; }
+      let served = null;
+      try { served = catalogModels(catalog, row.client); } catch { /* the installer judges a malformed catalog */ }
+      if (served?.length === 0) { note(`${row.label} skipped: ${hostOf(session.endpoint)} serves no models it can use`); skipped.push(row); continue; }
       const profile = profileArgs(row.profile || undefined);
-      let model = [];
-      try {
-        const current = currentModelId(row.state);
-        if (current !== null && servedModels(catalog, row.client).some(entry => entry.id === current)) model = ['--model', current];
-      } catch (error) {
-        if (error instanceof Interrupt) throw error;
-      }
+      const current = currentModelId(row.state);
+      const model = current !== null && served?.some(entry => entry.id === current) ? ['--model', current] : [];
       try {
         await runSetup(session, row.client, 'configure', ['--new-key', '--overwrite', ...model, ...profile], true);
         if (row.state?.mode === 'disabled') await runSetup(session, row.client, 'disable', profile, false);
@@ -1768,12 +1904,15 @@ async function applyEnvironment(session, flags, view = null) {
         failed.push(row);
       }
     }
+    const attempted = rows.filter(row => !skipped.includes(row));
     if (failed.length > 0) {
-      throw new CliError(`${failed.length} of ${rows.length} clients not configured: ${failed.map(row => row.label).join(', ')}`
-        + `${rows.length > failed.length ? `\n  Configured: ${rows.filter(row => !failed.includes(row)).map(row => row.label).join(', ')}` : ''}`);
+      throw new CliError(`${failed.length} of ${attempted.length} clients not configured: ${failed.map(row => row.label).join(', ')}`
+        + `${attempted.length > failed.length ? `\n  Configured: ${attempted.filter(row => !failed.includes(row)).map(row => row.label).join(', ')}` : ''}`);
     }
-    done('Gateway', session.endpoint);
-    done('Key', 'staged');
+    if (attempted.length > 0) {
+      done('Gateway', session.endpoint);
+      done('Key', 'staged');
+    }
     return true;
   };
   return view === null ? runAction(`Apply ${label}`, work) : runProgress(view, `Apply ${label}`, work);
@@ -2255,14 +2394,9 @@ async function smoke(session, flags, view = null) {
 // (Anthropic) or the address or code pasted on the page, one answer per
 // attempt, and reports every settled link in the terminal. It never opens a
 // browser: the user opens the printed URL in one of their choice, and
-// nothing starts without a click on the page. Gemini never uses the page:
-// it signs in in this terminal (terminalLink). A link takes a pasted answer
-// when the gateway says so (acceptsInput); from a gateway that does not say,
-// exactly when this process relays its provider's callback or its provider
-// signs in in the terminal, since every answer reaches the worker through
-// the same link/input.
-// Gemini (Google Antigravity) signs in here: its hosted page shows a code.
-const TERMINAL_LINKS = new Set(['google-antigravity']);
+// nothing starts without a click on the page. Gemini's hosted callback shows
+// the code to paste on this page. A link takes a pasted answer when the
+// gateway says so, or when its provider uses a callback or pasted code.
 function validateLink(value) {
   if (!record(value) || typeof value.attemptId !== 'string' || !ATTEMPT_ID.test(value.attemptId)
     || typeof value.provider !== 'string' || typeof value.workerId !== 'string' || !LINK_STATUSES.has(value.status)
@@ -2274,7 +2408,7 @@ function validateLink(value) {
   }
   return {
     attemptId: value.attemptId, provider: value.provider, workerId: value.workerId, status: value.status, url: value.url, userCode: value.userCode,
-    acceptsInput: value.acceptsInput ?? (Object.hasOwn(LINK_CALLBACKS, value.provider) || TERMINAL_LINKS.has(value.provider)), error: value.error,
+    acceptsInput: value.acceptsInput ?? (Object.hasOwn(LINK_CALLBACKS, value.provider) || value.provider === 'google-antigravity'), error: value.error,
   };
 }
 const linkBody = (link, extra = {}) => ({ workerId: link.workerId, attemptId: link.attemptId, provider: link.provider, ...extra });
@@ -2579,113 +2713,9 @@ $('#answer').onsubmit = event => {
 refresh();
 </script>`);
 }
-// Gemini (Google Antigravity) signs in in this terminal, as its own CLI does:
-// the worker's authorization URL is printed whole on a line of its own, the
-// hosted page Google returns to shows a one-time code, and that code (or the
-// address the page was opened at) is pasted at a hidden prompt. It must
-// belong to this attempt (authorizationCode); it is sent to the attempt once
-// and never printed or kept, and Connected waits for the worker's done.
-// Every call names this attempt on the gateway it was started on. An attempt
-// that has not settled is cancelled once: behind the menu when the prompt is
-// left with Escape (`cleanup` resolves to a failed cancellation's message or
-// null), and before an interrupt or a failure is reported.
-async function terminalLink(session, provider, workerId, view) {
-  const label = PROVIDER_LABELS[provider] ?? provider;
-  let link = null;
-  let cancelling = null;
-  let hide = text => String(text);
-  const busy = () => link !== null && !LINK_TERMINAL.has(link.status);
-  const adopt = next => { if (next.attemptId === link.attemptId) link = next; };
-  const failure = () => hide(link.status === 'failed' ? `connection failed${link.error ? `: ${link.error}` : ''}`
-    : link.status === 'cancelled' ? `the ${label} sign-in was cancelled` : `the worker offered no ${label} sign-in link`);
-  const connected = () => {
-    view.body = `Connected ${glyph.dot} ${label} on ${link.workerId}`;
-    return { cleanup: Promise.resolve(null), connected: () => 1 };
-  };
-  // Polls while `waiting` holds; a stopped operation ends the pause at once.
-  const follow = async waiting => {
-    while (waiting()) {
-      const signal = workContext.getStore()?.signal;
-      if (signal?.aborted) throw new Interrupt();
-      await new Promise(resolve => {
-        const stop = () => { clearTimeout(timer); resolve(); };
-        const timer = setTimeout(() => { signal?.removeEventListener('abort', stop); resolve(); }, LINK_POLL_MS);
-        signal?.addEventListener('abort', stop, { once: true });
-      });
-      adopt(validateLink(await api(session, 'POST', '/admin/api/cli/link/status', linkBody(link), HTTP_TIMEOUT_MS, true)));
-    }
-  };
-  const cancel = () => (cancelling ??= (async () => {
-    try { adopt(validateLink(await api(session, 'POST', '/admin/api/cli/link/cancel', linkBody(link)))); return null; }
-    catch (error) { return error.message; }
-  })());
-  try {
-    await runProgress(view, `Starting ${label} sign-in`, async () => {
-      const started = await api(session, 'POST', '/admin/api/cli/link/start', { provider, workerId }, 60_000);
-      if (record(started) && record(started.provisioning) && started.workerId === null) {
-        throw new CliError(`no worker has a free ${label} slot yet (${started.provisioning.state} ${glyph.dot} ${started.provisioning.workerId ?? 'worker'}); try again once it is ready`);
-      }
-      link = validateLink(started);
-      await follow(() => link.status === 'starting');
-    });
-    if (link.status !== 'awaiting-browser' || link.url === null) throw new CliError(failure());
-    renderScreen({
-      ...view, prompt: true, options: [],
-      body: `${label} ${glyph.dot} ${link.workerId}\nOpen the link below in a browser and sign in with Google; its page then shows the code to paste here.`,
-    });
-    term(`${link.url}\n\n`);
-    const prompt = new AbortController();
-    activeWork = prompt;
-    const observation = workContext.run(prompt, async () => {
-      try {
-        await follow(busy);
-        prompt.abort(new CliError(failure()));
-      } catch (error) {
-        if (!prompt.signal.aborted) prompt.abort(error);
-      }
-    });
-    let input;
-    try {
-      input = await workContext.run(prompt, () => secret(`${label} code`, 'Code', line => {
-        try { authorizationCode(link, line.trim()); return { value: line.trim() }; } catch (error) { return { error: error.message }; }
-      }, true));
-    } catch (error) {
-      if (link.status === 'done') return connected();
-      throw error;
-    } finally {
-      prompt.abort();
-      await observation;
-      activeWork = null;
-    }
-    if (link.status === 'done') return connected();
-    if (!busy()) throw new CliError(failure());
-    if (input === PROMPT_CANCEL) return { cleanup: cancel(), connected: () => 0 };
-    hide = answerHider(input, authorizationCode(link, input));
-    await runProgress(view, `Finishing ${label} sign-in`, async () => {
-      let next;
-      try { next = validateLink(await api(session, 'POST', '/admin/api/cli/link/input', linkBody(link, { input }))); }
-      catch (error) {
-        if (error instanceof Interrupt) throw error;
-        throw new CliError(`could not confirm code delivery: ${hide(error.message)}`);
-      }
-      adopt(next);
-      await follow(busy);
-    });
-    if (link.status !== 'done') throw new CliError(failure());
-    return connected();
-  } catch (error) {
-    if (!busy()) throw error;
-    const problem = await cancel();
-    if (error instanceof Interrupt) throw error;
-    // An answer whose reply was lost may still have finished the login.
-    if (link.status === 'done') return connected();
-    throw new CliError([error.message, problem && `the ${label} sign-in could not be cancelled: ${hide(problem)}`].filter(Boolean).join('\n'));
-  }
-}
 async function addConnection(session, flags, view = null) {
   let port = 0;
   if (flags.port !== undefined) {
-    if (TERMINAL_LINKS.has(flags.provider)) throw usage(`--port is for the local page; ${PROVIDER_LABELS[flags.provider]} signs in in the terminal`);
     port = /^[0-9]{1,5}$/.test(flags.port) ? Number(flags.port) : 0;
     if (port < 1 || port > 65_535) throw usage('--port takes a number from 1 to 65535; the page is only ever served on 127.0.0.1');
   }
@@ -2699,38 +2729,6 @@ async function addConnection(session, flags, view = null) {
   if (slots.length === 0) throw usage(`unknown provider ${flags.provider}; use ${placement.map(entry => entry.provider).join(', ')}`);
   const workers = [...new Set(slots.flatMap(entry => [entry.workerId, ...(Array.isArray(entry.availableWorkerIds) ? entry.availableWorkerIds : [])]).filter(id => typeof id === 'string'))];
   if (flags.worker !== undefined && !workers.includes(flags.worker)) throw usage(`unknown worker ${flags.worker}${workers.length === 0 ? '' : `; use ${workers.join(', ')}`}`);
-  // The dashboard picks the provider in the terminal; a command without
-  // --provider leaves the pick to the page.
-  let provider = flags.provider ?? null;
-  if (provider === null && view !== null) {
-    view.options = [...placement.map(entry => ({
-      value: entry.provider, label: PROVIDER_LABELS[entry.provider] ?? entry.provider,
-      hint: TERMINAL_LINKS.has(entry.provider) ? 'sign in here' : 'sign in on a local page',
-    })), backOption];
-    provider = await selectScreen(view);
-    if (provider === BACK) return { cleanup: Promise.resolve(null), connected: () => 0 };
-  }
-  if (TERMINAL_LINKS.has(provider)) {
-    const label = PROVIDER_LABELS[provider];
-    if (view !== null) {
-      const outcome = await terminalLink(session, provider, flags.worker ?? null, view);
-      if (outcome.connected() > 0) {
-        showResult(view, `Complete ${glyph.dot} Add connection`);
-        await selectScreen(view);
-      }
-      return outcome;
-    }
-    if (!interactive()) throw usage(`${label} signs in with a code pasted in a terminal; run genesis connections add --provider ${provider} in one`);
-    await runAction(`Add ${label} connection`, async actionView => {
-      actionView.identity = sessionIdentity(session);
-      const outcome = await terminalLink(session, provider, flags.worker ?? null, actionView);
-      if (outcome.connected() > 0) return true;
-      const problem = await outcome.cleanup;
-      if (problem !== null) throw new CliError(problem);
-      return false;
-    }, true);
-    return { cleanup: Promise.resolve(null), connected: () => 0 };
-  }
   const nonce = crypto.randomBytes(32).toString('base64url');
   const nonceMatches = value => {
     if (typeof value !== 'string') return false;
@@ -2738,7 +2736,7 @@ async function addConnection(session, flags, view = null) {
     const expected = Buffer.from(nonce);
     return supplied.length === expected.length && crypto.timingSafeEqual(supplied, expected);
   };
-  const page = launcherPage(session, nonce, { provider, workerId: flags.worker ?? null });
+  const page = launcherPage(session, nonce, { provider: flags.provider ?? null, workerId: flags.worker ?? null });
   let link = null;
   let closeCallback = null;
   let starting = null;
@@ -2887,15 +2885,12 @@ async function addConnection(session, flags, view = null) {
     // The page offers, and starts, only the providers it signs in.
     if (req.method === 'GET' && url.pathname === '/api/state') {
       const [workers, connections] = await Promise.all([api(session, 'GET', '/admin/api/cli/workers'), api(session, 'GET', '/admin/api/cli/connections'), refresh()]);
-      const offered = record(workers) && Array.isArray(workers.placement)
-        ? { ...workers, placement: workers.placement.filter(entry => !TERMINAL_LINKS.has(entry?.provider)) } : workers;
-      sendJson(res, 200, { workers: offered, connections, link: pageLink(link) });
+      sendJson(res, 200, { workers, connections, link: pageLink(link) });
       return;
     }
     if (req.method === 'POST' && url.pathname === '/api/link/start') {
       const body = JSON.parse(await readBody(req));
       if (!record(body) || typeof body.provider !== 'string' || (body.workerId !== null && typeof body.workerId !== 'string')) throw new CliError('invalid link request');
-      if (TERMINAL_LINKS.has(body.provider)) throw new HttpError(409, `${PROVIDER_LABELS[body.provider]} signs in in the terminal: genesis connections add --provider ${body.provider}`);
       const result = await start(body.provider, body.workerId);
       sendJson(res, result.provisioning ? 202 : 200, { ...result, link: pageLink(result.link) });
       return;
@@ -3522,6 +3517,7 @@ const HELP = `Usage: genesis [command] [options]
   disable <client> [--profile P]            local; no login required
   enable | unset <client> [--profile P]
   model <client> [ID] [--profile P]         list or pick the client's default model
+  run agy [-- ARGS]                         start agy through its configured gateway; ARGS go to agy
   usage [--json] [--period month|all|YYYY-MM]   tokens and charges; on a terminal, the Usage/Stats/Limits/Pricing panel
   stats [--json] [--period month|all|YYYY-MM]   calls and token shares
   billing [--json] [--period month|all|YYYY-MM]
@@ -3530,7 +3526,7 @@ const HELP = `Usage: genesis [command] [options]
   console                                   one-time browser login link
   connect [--copy]                          API integration guide for this gateway (endpoints, keys, SDK setup); --copy puts it on the clipboard
   capacity                                  owner/admin
-  connections [list | add]                  owner/admin; add serves a local page [--provider P] [--worker ID] [--port N]; Gemini signs in in the terminal (--provider google-antigravity)
+  connections [list | add]                  owner/admin; add serves a local page [--provider P] [--worker ID] [--port N]
   smoke [--json] [--environment E]          gateway health, login, models and one real call per provider
   token rotate [--yes]                      owner
   issuer grant | remove <key>               owner: whether the key may issue organization keys
@@ -3538,15 +3534,18 @@ const HELP = `Usage: genesis [command] [options]
   --version | --help
 
 Environment override: --environment prod | staging (does not change the saved selection)
-Clients: ${CLIENTS.map(client => client.id).join(', ')} (Google Antigravity models: omp only)
+Clients: ${CLIENTS.map(client => client.id).join(', ')} (Google Antigravity models: omp and agy)
 Exit codes: 0 ok, 1 failure, 2 usage`;
 const VALUE_FLAGS = new Set(['environment', 'url', 'model', 'profile', 'provider', 'worker', 'port', 'period', 'monthly', 'limit']);
 const SWITCH_FLAGS = new Set(['overwrite', 'yes', 'version', 'help', 'update', 'json', 'copy']);
 export function parseArgs(argv) {
   const positionals = [];
   const flags = {};
+  // Everything after -- belongs to the client genesis run starts.
+  let passthrough = null;
   for (let index = 0; index < argv.length; index++) {
     const argument = argv[index];
+    if (argument === '--') { passthrough = argv.slice(index + 1); break; }
     if (argument === '-h') { flags.help = true; continue; }
     if (!argument.startsWith('--')) { positionals.push(argument); continue; }
     const equals = argument.indexOf('=');
@@ -3558,16 +3557,17 @@ export function parseArgs(argv) {
     } else if (SWITCH_FLAGS.has(name) && equals === -1) flags[name] = true;
     else throw usage(`unknown option ${argument}; see genesis --help`);
   }
-  return { positionals, flags };
+  return { positionals, flags, passthrough };
 }
 async function main(argv) {
   primeSecrets();
-  const { positionals, flags } = parseArgs(argv);
+  const { positionals, flags, passthrough } = parseArgs(argv);
   const [command, ...rest] = positionals;
   if (flags.environment !== undefined) environmentId(flags.environment);
   if (flags.help || command === 'help') { out(HELP); return; }
   if (flags.version) { out(`genesis ${releaseInfo()?.commit ?? 'source'}`); return; }
   if (flags.url !== undefined && !['login', 'setup'].includes(command)) throw usage('--url is only accepted by login and setup; it never retargets a stored key');
+  if (passthrough !== null && command !== 'run') throw usage('-- is only accepted by run: genesis run agy -- ARGS');
   if (flags.json && !['usage', 'stats', 'smoke', 'billing', 'pricing', 'limits'].includes(command)) throw usage('--json is only accepted by usage, stats, smoke, billing, pricing and limits');
   if (flags.period !== undefined && (!['usage', 'stats', 'billing'].includes(command) || billingPeriod(flags.period).error)) throw usage('--period needs month, all or YYYY-MM on usage, stats or billing');
   if ((flags.monthly !== undefined || flags.limit !== undefined) && command !== 'limits') throw usage('--monthly and --limit are only accepted by limits');
@@ -3603,6 +3603,13 @@ async function main(argv) {
       if (rest.length < 1 || rest.length > 2) throw usage('model takes a client and an optional model id; see genesis --help');
       await model(await requireSession(flags), clientById(rest[0]), rest[1], flags);
       return;
+    case 'run': {
+      if (rest.length !== 1 || Object.keys(flags).length > 0) throw usage('run takes one client and no genesis options; its own arguments go after --: genesis run agy -- ARGS');
+      const client = clientById(rest[0]);
+      if (client.id !== 'agy') throw usage(`run starts agy only; ${client.label} reads its gateway settings itself (genesis configure prints how to start it)`);
+      await runAgy(passthrough ?? []);
+      return;
+    }
     case 'usage': case 'stats': case 'billing': case 'pricing': case 'limits': expect(0); await account(command, flags); return;
     case 'console': expect(0); out(await consoleLink(await requireSession(flags))); return;
     case 'connect': expect(0); await connect(await requireSession(flags), flags); return;
