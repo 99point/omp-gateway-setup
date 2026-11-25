@@ -926,8 +926,29 @@ probe_provider_wire_route() {
     *) fail "gateway provider-wire route for ${provider} returned HTTP ${probe_status}; expected its 400 metadata validation" ;;
   esac
 }
-# standard provider route: an empty body is refused at intake (400, no model
-# named) before any provider is contacted; 404 = the provider's API is not served.
+# A hold precedes native body validation. It proves the authenticated route is
+# present, not that model calls can run. Other 422 responses still stop setup.
+native_probe_result() {
+  local probe_status="$1" path="$2"
+  case "${probe_status}" in
+    400) probe_result=present; return ;;
+    404) probe_result=absent; return ;;
+    401|403) catalog_only_bearer "${probe_status}" "${path}" ;;
+    422)
+      if "${node_bin}" -e '
+        try {
+          const {error} = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8"));
+          process.exit(error?.code === "admission_held" && error.type === "admission_held" && error.retryable === false ? 0 : 1);
+        } catch { process.exit(1); }
+      ' "${scratch_dir}/probe-response"; then
+        probe_result=present
+        ui_warn 'Genesis admission is held; setup can continue, but model calls cannot run until admission opens'
+        return
+      fi ;;
+  esac
+  fail "gateway route ${path} returned HTTP ${probe_status}; expected body validation or an explicit admission hold"
+}
+# An empty body names no model and cannot reach a provider.
 probe_standard_route() {
   local provider="$1" path probe_status
   if [[ "${provider}" == anthropic ]]; then path='/anthropic/v1/messages'
@@ -935,12 +956,7 @@ probe_standard_route() {
   else path="/${provider}/v1/responses"; fi
   probe_status="$(gateway_request "${gateway_url}${path}" "${scratch_dir}/probe-response" \
     --request POST --header 'Content-Type: application/json' --data-binary "@${scratch_dir}/probe.json")" || exit 1
-  case "${probe_status}" in
-    400) probe_result=present ;;
-    404) probe_result=absent ;;
-    401|403) catalog_only_bearer "${probe_status}" "${path}" ;;
-    *) fail "gateway route ${path} returned HTTP ${probe_status}; expected its 400 body validation" ;;
-  esac
+  native_probe_result "${probe_status}" "${path}"
 }
 # Google route: an empty body is refused at intake (400, no model named) before
 # any provider is contacted; 404 = the gateway does not serve it.
@@ -948,12 +964,7 @@ probe_google_route() {
   local path='/google-antigravity/v1internal:streamGenerateContent' probe_status
   probe_status="$(gateway_request "${gateway_url}${path}?alt=sse" "${scratch_dir}/probe-response" \
     --request POST --header 'Content-Type: application/json' --data-binary "@${scratch_dir}/probe.json")" || exit 1
-  case "${probe_status}" in
-    400) probe_result=present ;;
-    404) probe_result=absent ;;
-    401|403) catalog_only_bearer "${probe_status}" "${path}" ;;
-    *) fail "gateway route ${path} returned HTTP ${probe_status}; expected its 400 body validation" ;;
-  esac
+  native_probe_result "${probe_status}" "${path}"
 }
 # agy's native Gemini route, reached as agy reaches it: the key in
 # x-goog-api-key alone and a served wire id in the path. An empty body names no
@@ -965,12 +976,7 @@ probe_agy_route() {
   path="/google-antigravity/v1beta/models/${model}:streamGenerateContent"
   probe_status="$(gateway_request "${gateway_url}${path}?alt=sse" "${scratch_dir}/probe-response" \
     --request POST --header 'Content-Type: application/json' --data-binary "@${scratch_dir}/probe.json")" || exit 1
-  case "${probe_status}" in
-    400) probe_result=present ;;
-    404) probe_result=absent ;;
-    401|403) catalog_only_bearer "${probe_status}" "${path}" ;;
-    *) fail "gateway route ${path} returned HTTP ${probe_status}; expected its 400 body validation" ;;
-  esac
+  native_probe_result "${probe_status}" "${path}"
 }
 probe_pi_native_route() {
   local probe_status
